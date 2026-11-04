@@ -1,0 +1,475 @@
+[
+  {
+    "key": "setting",
+    "name": "后台设置",
+    "menus": [
+      {
+        "group_key": "setting",
+        "name": "全局设置",
+        "path": "/setting/system"
+      },
+      {
+        "group_key": "setting",
+        "name": "内容设置",
+        "path": "/setting/content"
+      },
+      {
+        "group_key": "setting",
+        "name": "内容安全设置",
+        "path": "/setting/safe"
+      },
+      {
+        "group_key": "setting",
+        "name": "敏感词设置",
+        "path": "/setting/sensitive"
+      },
+      {
+        "group_key": "setting",
+        "name": "联系方式设置",
+        "path": "/setting/contact"
+      },
+      {
+        "group_key": "setting",
+        "name": "首页TDK设置",
+        "path": "/setting/tdk"
+      },
+      {
+        "group_key": "setting",
+        "name": "首页幻灯片",
+        "path": "/setting/banner"
+      },
+      {
+        "group_key": "setting",
+        "name": "导航设置",
+        "path": "/setting/nav"
+      },
+      {
+        "group_key": "setting",
+        "name": "自定义字段",
+        "path": "/setting/diyfield"
+      },
+      {
+        "group_key": "setting",
+        "name": "AI统一配置",
+        "path": "/setting/ai"
+      }
+    ]
+  },
+  {
+    "key": "archive",
+    "name": "内容管理",
+    "menus": [
+      {
+        "group_key": "archive",
+        "name": "文档列表",
+        "path": "/archive/list"
+      },
+      {
+        "group_key": "archive",
+        "name": "文档回收站",
+        "path": "/archive/recycle"
+      },
+      {
+        "group_key": "archive",
+        "name": "文档编辑",
+        "path": "/archive/detail"
+      },
+      {
+        "group_key": "archive",
+        "name": "文档分类",
+        "path": "/archive/category"
+      },
+      {
+        "group_key": "archive",
+        "name": "文档分类详情",
+        "path": "/archive/category/detail"
+      },
+      {
+        "group_key": "archive",
+        "name": "文档标签",
+        "path": "/archive/tag"
+      },
+      {
+        "group_key": "archive",
+        "name": "单页面管理",
+        "path": "/archive/page"
+      },
+      {
+        "group_key": "archive",
+        "name": "单页面详情",
+        "path": "/archive/page/detail"
+      },
+      {
+        "group_key": "archive",
+        "name": "内容模型",
+        "path": "/archive/module"
+      },
+      {
+        "group_key": "archive",
+        "name": "图片资源管理",
+        "path": "/archive/attachment"
+      },
+      {
+        "group_key": "archive",
+        "name": "城市分站管理",
+        "path": "/archive/place"
+      }
+    ]
+  },
+  {
+    "key": "plugin",
+    "name": "功能资源",
+    "menus": [
+      {
+        "group_key": "plugin",
+        "name": "功能列表",
+        "path": "/plugin/index"
+      },
+      {
+        "group_key": "plugin",
+        "name": "伪静态规则管理",
+        "path": "/plugin/seo/rewrite"
+      },
+      {
+        "group_key": "plugin",
+        "name": "链接推送管理",
+        "path": "/plugin/seo/push"
+      },
+      {
+        "group_key": "plugin",
+        "name": "Sitemap管理",
+        "path": "/plugin/seo/sitemap"
+      },
+      {
+        "group_key": "plugin",
+        "name": "Robots管理",
+        "path": "/plugin/seo/robots"
+      },
+      {
+        "group_key": "plugin",
+        "name": "友情链接管理",
+        "path": "/plugin/system/friendlink"
+      },
+      {
+        "group_key": "plugin",
+        "name": "内容评论管理",
+        "path": "/plugin/interaction/comment"
+      },
+      {
+        "group_key": "plugin",
+        "name": "锚文本管理",
+        "path": "/plugin/contentops/anchor"
+      },
+      {
+        "group_key": "plugin",
+        "name": "网站留言管理",
+        "path": "/plugin/interaction/guestbook"
+      },
+      {
+        "group_key": "plugin",
+        "name": "关键词库管理",
+        "path": "/plugin/contentops/keyword"
+      },
+      {
+        "group_key": "plugin",
+        "name": "内容素材管理",
+        "path": "/plugin/contentops/material"
+      },
+      {
+        "group_key": "plugin",
+        "name": "验证文件上传",
+        "path": "/plugin/system/fileupload"
+      },
+      {
+        "group_key": "plugin",
+        "name": "邮件提醒",
+        "path": "/plugin/channel/sendmail"
+      },
+      {
+        "group_key": "plugin",
+        "name": "邮件订阅",
+        "path": "/plugin/channel/subscription"
+      },
+      {
+        "group_key": "plugin",
+        "name": "内容采集管理",
+        "path": "/plugin/contentops/collector"
+      },
+      {
+        "group_key": "plugin",
+        "name": "内容导入接口",
+        "path": "/plugin/contentops/importapi"
+      },
+      {
+        "group_key": "plugin",
+        "name": "301跳转管理",
+        "path": "/plugin/system/redirect"
+      },
+      {
+        "group_key": "plugin",
+        "name": "网站内容迁移",
+        "path": "/plugin/contentops/transfer"
+      },
+      {
+        "group_key": "plugin",
+        "name": "资源存储配置",
+        "path": "/plugin/system/storage"
+      },
+      {
+        "group_key": "plugin",
+        "name": "用户管理",
+        "path": "/plugin/commerce/user"
+      },
+      {
+        "group_key": "plugin",
+        "name": "用户组VIP",
+        "path": "/plugin/commerce/group"
+      },
+      {
+        "group_key": "plugin",
+        "name": "微信公众号",
+        "path": "/plugin/channel/wechat"
+      },
+      {
+        "group_key": "plugin",
+        "name": "小程序配置",
+        "path": "/plugin/channel/weapp"
+      },
+      {
+        "group_key": "plugin",
+        "name": "订单管理",
+        "path": "/plugin/commerce/order"
+      },
+      {
+        "group_key": "plugin",
+        "name": "支付配置",
+        "path": "/plugin/commerce/pay"
+      },
+      {
+        "group_key": "plugin",
+        "name": "财务管理",
+        "path": "/plugin/commerce/finance"
+      },
+      {
+        "group_key": "plugin",
+        "name": "分销管理",
+        "path": "/plugin/commerce/retailer"
+      },
+      {
+        "group_key": "plugin",
+        "name": "提现管理",
+        "path": "/plugin/withdraw"
+      },
+      {
+        "group_key": "plugin",
+        "name": "提现管理",
+        "path": "/plugin/佣金管理"
+      },
+      {
+        "group_key": "plugin",
+        "name": "全文搜索",
+        "path": "/plugin/system/fulltext"
+      },
+      {
+        "group_key": "plugin",
+        "name": "备份与恢复",
+        "path": "/plugin/system/backup"
+      },
+      {
+        "group_key": "plugin",
+        "name": "全站替换",
+        "path": "/plugin/system/replace"
+      },
+      {
+        "group_key": "plugin",
+        "name": "标题自动配图",
+        "path": "/plugin/contentops/titleimage"
+      },
+      {
+        "group_key": "plugin",
+        "name": "静态页面缓存",
+        "path": "/plugin/system/htmlcache"
+      },
+      {
+        "group_key": "plugin",
+        "name": "AI自动写作",
+        "path": "/plugin/contentops/aigenerate"
+      },
+      {
+        "group_key": "plugin",
+        "name": "时间因子-定时发布",
+        "path": "/plugin/contentops/timefactor"
+      },
+      {
+        "group_key": "plugin",
+        "name": "防采集干扰码",
+        "path": "/plugin/system/interference"
+      },
+      {
+        "group_key": "plugin",
+        "name": "水印管理",
+        "path": "/plugin/system/watermark"
+      },
+      {
+        "group_key": "plugin",
+        "name": "限流器",
+        "path": "/plugin/system/limiter"
+      },
+      {
+        "group_key": "plugin",
+        "name": "翻译功能",
+        "path": "/plugin/system/translate"
+      },
+      {
+        "group_key": "plugin",
+        "name": "结构化数据标记",
+        "path": "/plugin/seo/jsonld"
+      },
+      {
+        "group_key": "plugin",
+        "name": "Akismet/reCAPTCHA",
+        "path": "/plugin/channel/akismet"
+      },
+      {
+        "group_key": "plugin",
+        "name": "谷歌授权",
+        "path": "/plugin/channel/google"
+      },
+      {
+        "group_key": "plugin",
+        "name": "LLMs 配置",
+        "path": "/plugin/seo/llms"
+      },
+      {
+        "group_key": "plugin",
+        "name": "邮件订阅",
+        "path": "/plugin/subscriber"
+      }
+    ]
+  },
+  {
+    "key": "design",
+    "name": "模板设计",
+    "menus": [
+      {
+        "group_key": "design",
+        "name": "我的模板",
+        "path": "/design/index"
+      },
+      {
+        "group_key": "design",
+        "name": "修改代码",
+        "path": "/design/editor"
+      },
+      {
+        "group_key": "design",
+        "name": "模板管理",
+        "path": "/design/detail"
+      },
+      {
+        "group_key": "design",
+        "name": "开发文档",
+        "path": "/design/doc"
+      },
+      {
+        "group_key": "design",
+        "name": "设计市场",
+        "path": "/design/market"
+      }
+    ]
+  },
+  {
+    "key": "statistic",
+    "name": "数据统计",
+    "menus": [
+      {
+        "group_key": "statistic",
+        "name": "蜘蛛统计",
+        "path": "/statistic/spider"
+      },
+      {
+        "group_key": "statistic",
+        "name": "流量统计",
+        "path": "/statistic/traffic"
+      },
+      {
+        "group_key": "statistic",
+        "name": "访问详细记录",
+        "path": "/statistic/detail"
+      },
+      {
+        "group_key": "statistic",
+        "name": "收录统计",
+        "path": "/statistic/includes"
+      },
+      {
+        "group_key": "statistic",
+        "name": "收录详细记录",
+        "path": "/statistic/include/detail"
+      }
+    ]
+  },
+  {
+    "key": "account",
+    "name": "管理员",
+    "menus": [
+      {
+        "group_key": "account",
+        "name": "管理员列表",
+        "path": "/account/list"
+      },
+      {
+        "group_key": "account",
+        "name": "管理员分组列表",
+        "path": "/account/group/list"
+      },
+      {
+        "group_key": "account",
+        "name": "管理员分组信息",
+        "path": "/account/group/detail"
+      },
+      {
+        "group_key": "account",
+        "name": "登录记录",
+        "path": "/account/logs/login"
+      },
+      {
+        "group_key": "account",
+        "name": "操作记录",
+        "path": "/account/logs/action"
+      }
+    ]
+  },
+  {
+    "key": "website",
+    "name": "多站点",
+    "menus": [
+      {
+        "group_key": "tool",
+        "name": "多站点管理",
+        "path": "/website/list"
+      },
+      {
+        "group_key": "tool",
+        "name": "多语言站点",
+        "path": "/website/multilang"
+      }
+    ]
+  },
+  {
+    "key": "tool",
+    "name": "系统功能",
+    "menus": [
+      {
+        "group_key": "tool",
+        "name": "系统升级",
+        "path": "/tool/upgrade"
+      },
+      {
+        "group_key": "tool",
+        "name": "更新缓存",
+        "path": "/tool/cache"
+      }
+    ]
+  }
+]

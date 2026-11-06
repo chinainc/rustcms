@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/ext"]
+resolver = "2"
+
 [package]
 name = "rustcms"
 version = "0.1.0"
@@ -36,6 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 percent-encoding = "2"
 md-5 = "0.10"
+# 外部能力层（HTTP / SMTP / ZIP / 限流 / 表结构同步），不引入新依赖
+rustcms-ext = { path = "crates/ext" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

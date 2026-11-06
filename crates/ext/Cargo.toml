@@ -1,0 +1,21 @@
+[package]
+name = "rustcms-ext"
+version = "0.1.0"
+edition = "2021"
+description = "rustcms 的外部能力层：HTTP / SMTP / ZIP / 限流器 / 自动迁移"
+license = "AGPL-3.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.7", default-features = false, features = [
+    "mysql",
+    "runtime-tokio-rustls",
+    "chrono",
+    "json",
+    "macros",
+] }
+tracing = "0.1"

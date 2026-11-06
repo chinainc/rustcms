@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ModelError;
 
+pub mod market;
+
 /// 模板里的一个文件。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DesignFile {

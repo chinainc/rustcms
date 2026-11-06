@@ -675,6 +675,28 @@ pub async fn limiter_save(pool: &MySqlPool, patch: &Value) -> anyhow::Result<Val
     limiter_get(pool).await
 }
 
+/// 进程内限流封禁器。
+///
+/// 对齐 Go `Website.Limiter`：只在内存里记录，重启即清空。
+/// 目前尚无请求中间件向它投递访问计数，接入后封禁列表才会有数据；
+/// 这里先提供解除封禁能力，保证 `blockedip/remove` 语义与 Go 一致。
+fn limiter_blocker() -> &'static rustcms_ext::ratelimit::IpBlocker {
+    static BLOCKER: std::sync::OnceLock<rustcms_ext::ratelimit::IpBlocker> =
+        std::sync::OnceLock::new();
+    BLOCKER.get_or_init(|| {
+        rustcms_ext::ratelimit::IpBlocker::new(Default::default())
+    })
+}
+
+/// 解除某个 IP 的临时封禁，返回它原本是否处于封禁状态。
+pub fn limiter_unblock(ip: &str) -> bool {
+    let ip = ip.trim();
+    if ip.is_empty() {
+        return false;
+    }
+    limiter_blocker().unblock(ip)
+}
+
 /// 读防采集干扰码配置。
 pub async fn interference_get(pool: &MySqlPool) -> anyhow::Result<Value> {
     let mut value = site_setting::get_section(pool, INTERFERENCE).await?;

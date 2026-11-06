@@ -13,21 +13,27 @@
 //!   因为它是「还没登录的后台管理员」用来重置账号密码的，所以这里也不鉴权；
 //! - 其余端点一律先 `require_admin`，失败直接返回那个错误响应。
 //!
-//! 未实现项按项目既有口径「接口保留 + 参数校验 + 明确未实现提示」处理：
-//! - `archive/import`（zip / xlsx 解析）
-//! - `setting/convert/webp`（图片转码）
-//! - `password/verify` 的 DNS 方式（TXT 解析需要 DNS 客户端）
+//! 实现口径：
+//! - `archive/import`：zip 取文本条目、xlsx 读首个工作表（不处理图片与分片上传）；
+//! - `setting/convert/webp`：依赖外置 `cwebp` 工具，缺失时明确提示替代方案；
+//! - `password/verify` 的 DNS 方式依赖系统解析器（`nslookup -type=TXT`）。
 
 use axum::extract::{ConnectInfo, Multipart, State};
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
-use crate::models::{admin, admin_gap, anchor, archive_admin, category, module, plugin, site_setting};
+use crate::models::archive_write::{self, ArchiveInput};
+use crate::models::{
+    admin, admin_gap, anchor, archive_admin, attachment, category, module, plugin, site_setting,
+};
 use crate::routes::{fail, failed, model_error, ok, ok_msg, require_admin, NO_DB};
 use crate::state::AppState;
 
@@ -109,7 +115,7 @@ async fn password_choose(
 ///
 /// 校验找回密码的验证结果（Go：`FindPasswordVerify`）。
 /// - 文件方式：读 `<public>/<token>.txt`，内容必须等于令牌；
-/// - DNS 方式：需要 TXT 解析，Rust 侧暂未接入，明确提示改用文件方式。
+/// - DNS 方式：用系统 `nslookup` 查询 `_rustcms.<域名>` 的 TXT 记录并比对令牌。
 async fn password_verify(State(state): State<AppState>) -> Response {
     if !state.has_db() {
         return fail(NO_DB);
@@ -126,7 +132,11 @@ async fn password_verify(State(state): State<AppState>) -> Response {
             return fail("文件不存在或内容不正确");
         }
     } else {
-        return fail("DNS 解析验证尚未实现，请改用文件验证方式");
+        match admin_gap::dns_txt_matches(&info.host, &info.token).await {
+            Ok(true) => {}
+            Ok(false) => return fail("DNS 解析不存在或内容不正确"),
+            Err(msg) => return fail(msg),
+        }
     }
 
     admin_gap::find_password_mark_verified().await;
@@ -207,9 +217,12 @@ async fn password_reset(
 
 /// `POST /system/api/archive/import`
 ///
-/// 上传 zip / xlsx 批量导入文档（Go：`QuickImportArchive`）。
-/// 文件解析依赖 zip / xlsx 解析组件，Rust 侧暂未接入：
-/// 这里保留接口、校验参数，并返回明确的未实现提示。
+/// 上传 zip / xlsx 批量导入文档（对齐 Go：`QuickImportArchive`）。
+/// - zip：逐个读取 `.html/.htm/.txt/.md` 文本条目，文件名作标题（`title_type=1`
+///   时改用 `<title>` / 首行），正文原样写入；
+/// - xlsx：读取第一个工作表，首行为表头（支持中文 / 英文字段名），逐行建文档。
+///
+/// 说明：zip 里的图片与分片上传暂不处理；导入同步执行并返回成功条数。
 async fn archive_import(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -225,7 +238,10 @@ async fn archive_import(
     let mut file_name = String::new();
     let mut file_size = 0i64;
     let mut category_id = 0u32;
+    let mut title_type = 0u32;
+    let mut chunks = 0u32;
     let mut has_file = false;
+    let mut bytes: Option<Vec<u8>> = None;
 
     loop {
         let field = match multipart.next_field().await {
@@ -238,15 +254,32 @@ async fn archive_import(
             "file" | "file1" | "upfile" => {
                 file_name = field.file_name().unwrap_or_default().to_string();
                 match field.bytes().await {
-                    Ok(bytes) => {
-                        file_size = bytes.len() as i64;
+                    Ok(value) => {
+                        file_size = value.len() as i64;
                         has_file = true;
+                        bytes = Some(value.to_vec());
                     }
                     Err(err) => return failed(err.into()),
                 }
             }
             "category_id" => {
                 category_id = field
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+            }
+            "title_type" => {
+                title_type = field
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+            }
+            "chunks" => {
+                chunks = field
                     .text()
                     .await
                     .ok()
@@ -268,6 +301,9 @@ async fn archive_import(
     if file_name.is_empty() {
         return fail("无法获取上传文件名");
     }
+    if chunks > 0 {
+        return fail("暂不支持分片上传，请关闭分片后重新导入");
+    }
     if category_id == 0 {
         return fail("请选择导入的分类");
     }
@@ -277,18 +313,296 @@ async fn archive_import(
         Err(err) => return failed(err),
     }
 
-    fail("批量导入文档需要 zip/xlsx 解析组件，尚未实现")
+    let Some(bytes) = bytes else {
+        return fail("无法获取上传文件");
+    };
+    let ext = Path::new(&file_name)
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let inputs = match ext.as_str() {
+        "xlsx" => match xlsx_inputs(&bytes, category_id) {
+            Some(inputs) => inputs,
+            None => return fail("无法解析上传的 xlsx 文件（需包含「标题」列）"),
+        },
+        _ => match zip_inputs(&bytes, category_id, title_type) {
+            Some(inputs) => inputs,
+            None => return fail("无法解析上传的压缩包（仅支持 zip / xlsx）"),
+        },
+    };
+
+    let mut succeed = 0u32;
+    let mut failed_rows = 0u32;
+    for input in inputs {
+        let title = input.title.clone();
+        match archive_write::create(pool, &input).await {
+            Ok(_) => succeed += 1,
+            Err(err) => {
+                failed_rows += 1;
+                tracing::warn!("导入文档失败（{title}）：{err}");
+            }
+        }
+    }
+
+    ok(json!({
+        "total": succeed + failed_rows,
+        "succeed": succeed,
+        "failed": failed_rows,
+    }))
+}
+
+/// 从 zip 中取出文本条目（支持 html / htm / txt / md）并转成文档参数。
+fn zip_inputs(data: &[u8], category_id: u32, title_type: u32) -> Option<Vec<ArchiveInput>> {
+    let archive = rustcms_ext::packer::ZipArchive::open(data.to_vec()).ok()?;
+    let mut inputs = Vec::new();
+    for entry in archive.entries() {
+        if entry.is_dir {
+            continue;
+        }
+        let name = entry.name.replace('\\', "/");
+        if name.starts_with('.') || name.split('/').any(|segment| segment == "..") {
+            continue;
+        }
+        let ext = Path::new(&name)
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "html" | "htm" | "txt" | "md") {
+            continue;
+        }
+        if let Ok(content) = archive.read_entry(entry) {
+            if let Some(input) = build_import_input(&name, &content, category_id, title_type) {
+                inputs.push(input);
+            }
+        }
+    }
+    Some(inputs)
+}
+
+/// 文件名 / 正文 → 文档写入参数；正文为空时返回 `None`。
+fn build_import_input(
+    name: &str,
+    content: &[u8],
+    category_id: u32,
+    title_type: u32,
+) -> Option<ArchiveInput> {
+    let text = String::from_utf8(content.to_vec()).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let ext = Path::new(name)
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+
+    let mut title = stem;
+    let mut body = text;
+    if matches!(ext.as_str(), "html" | "htm") {
+        if title_type == 1 {
+            if let Some(found) = html_title(&body) {
+                title = found;
+            }
+        }
+    } else if body.starts_with('#') || title_type == 1 {
+        if let Some((first, rest)) = body.split_once('\n') {
+            let first = first.trim().trim_matches(|ch| ch == '#' || ch == '*' || ch == ' ');
+            if !first.is_empty() {
+                title = first.to_string();
+                body = rest.to_string();
+            }
+        }
+    }
+
+    if title.trim().is_empty() && body.trim().is_empty() {
+        return None;
+    }
+    Some(ArchiveInput {
+        title,
+        content: body,
+        category_id,
+        ..Default::default()
+    })
+}
+
+/// 取 `<title>` 内容。
+fn html_title(html: &str) -> Option<String> {
+    let re = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").ok()?;
+    let captured = re.captures(html)?;
+    let value = captured.get(1)?.as_str().trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// 读取 xlsx 第一个工作表，首行表头，逐行映射为文档参数。
+fn xlsx_inputs(data: &[u8], category_id: u32) -> Option<Vec<ArchiveInput>> {
+    let archive = rustcms_ext::packer::ZipArchive::open(data.to_vec()).ok()?;
+    let shared = archive
+        .read_by_name("xl/sharedStrings.xml")
+        .ok()
+        .map(|raw| xlsx_shared_strings(&String::from_utf8_lossy(&raw)))
+        .unwrap_or_default();
+    let sheet = archive.read_by_name("xl/worksheets/sheet1.xml").ok()?;
+    let table = xlsx_table(&String::from_utf8_lossy(&sheet), &shared);
+    let headers = table.first()?;
+    let columns = import_columns(headers);
+    if !columns.contains_key("title") {
+        return None;
+    }
+
+    let mut inputs = Vec::new();
+    for row in table.iter().skip(1) {
+        let cell = |key: &str| -> String {
+            columns
+                .get(key)
+                .and_then(|index| row.get(*index))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        };
+        let title = cell("title");
+        if title.is_empty() {
+            continue;
+        }
+        inputs.push(ArchiveInput {
+            title,
+            content: cell("content"),
+            category_id,
+            seo_title: cell("seo_title"),
+            keywords: cell("keywords"),
+            description: cell("description"),
+            url_token: Some(cell("url_token")).filter(|value| !value.is_empty()),
+            origin_url: cell("origin_url"),
+            ..Default::default()
+        });
+    }
+    Some(inputs)
+}
+
+/// 表头别名 → 统一字段名。
+fn import_columns(headers: &[String]) -> HashMap<String, usize> {
+    let aliases: [(&str, &[&str]); 7] = [
+        ("title", &["title", "标题"]),
+        ("content", &["content", "内容", "正文"]),
+        ("seo_title", &["seo_title", "seo标题"]),
+        ("keywords", &["keywords", "关键词"]),
+        ("description", &["description", "描述", "简介"]),
+        ("url_token", &["url_token", "slug", "自定义链接"]),
+        ("origin_url", &["origin_url", "原文地址"]),
+    ];
+    let mut map = HashMap::new();
+    for (index, header) in headers.iter().enumerate() {
+        let header = header.trim().to_ascii_lowercase();
+        for (key, names) in aliases {
+            if names.contains(&header.as_str()) && !map.contains_key(key) {
+                map.insert(key.to_string(), index);
+            }
+        }
+    }
+    map
+}
+
+/// xlsx 共享字符串表。
+fn xlsx_shared_strings(xml: &str) -> Vec<String> {
+    let si = Regex::new(r"(?is)<si[^>]*>(.*?)</si>").expect("si 正则");
+    let text = Regex::new(r"(?is)<t[^>]*>(.*?)</t>").expect("t 正则");
+    si.captures_iter(xml)
+        .map(|captured| {
+            text.captures_iter(&captured[1])
+                .map(|value| unescape_xml(&value[1]))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect()
+}
+
+/// xlsx 工作表 → 二维单元格文本（按 `r` 列号对齐）。
+fn xlsx_table(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
+    let row_re = Regex::new(r"(?is)<row[^>]*>(.*?)</row>").expect("row 正则");
+    let cell_re = Regex::new(r"(?is)<c([^>]*)>(.*?)</c>").expect("c 正则");
+    let value_re = Regex::new(r"(?is)<v[^>]*>(.*?)</v>").expect("v 正则");
+    let inline_re = Regex::new(r"(?is)<t[^>]*>(.*?)</t>").expect("inline 正则");
+
+    let mut table = Vec::new();
+    for row in row_re.captures_iter(xml) {
+        let mut cells: Vec<String> = Vec::new();
+        for cell in cell_re.captures_iter(&row[1]) {
+            let attrs = &cell[1];
+            let body = &cell[2];
+            let index = cell_column(attrs).unwrap_or(cells.len());
+            let value = if attrs.contains("t=\"s\"") {
+                value_re
+                    .captures(body)
+                    .and_then(|value| value[1].trim().parse::<usize>().ok())
+                    .and_then(|index| shared.get(index).cloned())
+                    .unwrap_or_default()
+            } else if attrs.contains("t=\"inlineStr\"") {
+                inline_re
+                    .captures(body)
+                    .map(|value| unescape_xml(&value[1]))
+                    .unwrap_or_default()
+            } else {
+                value_re
+                    .captures(body)
+                    .map(|value| unescape_xml(value[1].trim()))
+                    .unwrap_or_default()
+            };
+            if cells.len() < index {
+                cells.resize(index, String::new());
+            }
+            if index < cells.len() {
+                cells[index] = value;
+            } else {
+                cells.push(value);
+            }
+        }
+        table.push(cells);
+    }
+    table
+}
+
+/// 单元格引用（`A1` / `AB12`）→ 0 基列号。
+fn cell_column(attrs: &str) -> Option<usize> {
+    let re = Regex::new(r#"r="([A-Za-z]+)\d+""#).ok()?;
+    let letters = re.captures(attrs)?.get(1)?.as_str().to_ascii_uppercase();
+    let mut index = 0usize;
+    for ch in letters.chars() {
+        if !ch.is_ascii_uppercase() {
+            return None;
+        }
+        index = index * 26 + (ch as usize - 'A' as usize + 1);
+    }
+    Some(index.saturating_sub(1))
+}
+
+fn unescape_xml(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// `GET /system/api/archive/import/status`
 ///
 /// 查询批量导入任务进度（Go：`GetQuickImportArchiveStatus`）。
-/// 导入本身未实现，这里恒为「没有任务」（`data` 为 `null`，与 Go 版一致）。
+/// 当前导入是同步完成的，这里固定返回一个可读的空闲态，避免 `data: null`
+/// 让前端无法展示状态。
 async fn archive_import_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    ok(Value::Null)
+    ok(json!({
+        "status": 0,
+        "running": false,
+        "total": 0,
+        "finished": 0,
+        "failed": 0,
+        "percent": 100,
+        "message": "当前没有进行中的导入任务",
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -706,8 +1020,9 @@ fn client_ip_of(headers: &HeaderMap, peer: SocketAddr) -> String {
 
 /// `POST /system/api/setting/convert/webp`
 ///
-/// 批量把图片转换成 WebP（Go：`ConvertImageToWebp`）。
-/// 图片转码需要图片处理组件，Rust 侧暂未接入：保留接口并返回明确提示。
+/// 批量把附件图片转换成 WebP（对齐 Go：`ConvertImageToWebp`）。
+/// Go 版同样依赖外置 `cwebp` 命令；本项目的内置图片引擎只支持 PNG/BMP 解码、
+/// 不具备 WebP 编码能力，因此这里复用系统 `cwebp`，不引入新依赖。
 async fn setting_convert_webp(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -715,8 +1030,148 @@ async fn setting_convert_webp(State(state): State<AppState>, headers: HeaderMap)
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    let _ = pool;
-    fail("批量转换图片为 WebP 需要图片处理组件，尚未实现")
+    if find_cwebp().is_none() {
+        return fail(
+            "未找到 cwebp：内置图片引擎不支持 WebP 编码。请安装 WebP 命令行工具\
+             （https://developers.google.com/speed/webp/download），把 cwebp(.exe) 放到程序目录\
+             或加入 PATH 后重试；也可改在前台/对象存储侧转换。",
+        );
+    }
+    let public_dir = state.with_config(|config| config.public_dir());
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        if let Err(err) = convert_attachments_to_webp(&pool, &public_dir).await {
+            tracing::warn!("批量转换 WebP 失败：{err:#}");
+        }
+    });
+    ok_msg("WebP 转换任务已提交至后台运行")
+}
+
+/// 找 `cwebp`：优先程序目录，其次 PATH。
+fn find_cwebp() -> Option<PathBuf> {
+    let names = ["cwebp.exe", "cwebp"];
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in names {
+                candidates.push(dir.join(name));
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in names {
+                candidates.push(dir.join(name));
+            }
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 遍历附件表，把 jpg/png/gif/bmp 转成同名 `.webp` 并同步替换引用。
+async fn convert_attachments_to_webp(
+    pool: &sqlx::MySqlPool,
+    public_dir: &Path,
+) -> anyhow::Result<()> {
+    let Some(cwebp) = find_cwebp() else {
+        return Ok(());
+    };
+    let rows = sqlx::query(
+        "SELECT id, file_location FROM attachments \
+         WHERE is_image = 1 AND file_location <> '' AND is_remote = 0",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let id: u32 = sqlx::Row::try_get(&row, "id")?;
+        let location: String = sqlx::Row::try_get(&row, "file_location")?;
+        let ext = Path::new(&location)
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp") {
+            continue;
+        }
+        let relative = location.trim_start_matches('/');
+        let source = public_dir.join(relative);
+        if !source.is_file() {
+            continue;
+        }
+        let target_relative = format!(
+            "{}.webp",
+            relative
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(relative)
+        );
+        let target = public_dir.join(&target_relative);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let output = std::process::Command::new(&cwebp)
+            .arg("-q")
+            .arg("90")
+            .arg(&source)
+            .arg("-o")
+            .arg(&target)
+            .output();
+        if !matches!(&output, Ok(out) if out.status.success()) {
+            tracing::warn!("cwebp 转换失败：{}", source.display());
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&target) else {
+            continue;
+        };
+        let (width, height) = attachment::image_size(&bytes);
+        let md5 = attachment::md5_hex(&bytes);
+        let size = bytes.len() as u64;
+        if let Err(err) = attachment::update(
+            pool,
+            id,
+            None,
+            Some(&target_relative),
+            Some(size),
+            Some(&md5),
+            Some(width),
+            Some(height),
+            None,
+        )
+        .await
+        {
+            tracing::warn!("更新附件记录失败（{id}）：{err}");
+            continue;
+        }
+        replace_attachment_refs(pool, &location, &target_relative).await;
+    }
+    Ok(())
+}
+
+/// 把各表里对旧图片路径的引用替换为新路径。
+async fn replace_attachment_refs(pool: &sqlx::MySqlPool, old: &str, new: &str) {
+    let targets: [(&str, &[&str]); 5] = [
+        ("archives", &["logo", "images"]),
+        ("archive_data", &["content"]),
+        ("categories", &["logo", "images", "content"]),
+        ("comments", &["content"]),
+        ("materials", &["content"]),
+    ];
+    for (table, columns) in targets {
+        for column in columns {
+            let sql = format!(
+                "UPDATE {table} SET {column} = REPLACE({column}, ?, ?) WHERE {column} LIKE ?"
+            );
+            if let Err(err) = sqlx::query(&sql)
+                .bind(old)
+                .bind(new)
+                .bind(format!("%{old}%"))
+                .execute(pool)
+                .await
+            {
+                tracing::warn!("替换 {table}.{column} 引用失败：{err}");
+            }
+        }
+    }
 }
 
 /// 站点前台地址（`settings.system` 的 `front_url` 优先，回退 `base_url`）。

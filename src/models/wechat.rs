@@ -1,8 +1,9 @@
 //! 微信公众号 / 小程序（`pluginWechat.go`、`pluginWeapp.go`）。
 //!
 //! 配置存 `settings.wechat` / `settings.weapp`（两者结构相同，公众号多两个验证相关字段）。
-//! 消息、自动回复、菜单三张表纯 DB 读写；**与微信服务器的交互（拉消息、同步菜单）未实现**。
+//! 消息、自动回复、菜单三张表纯 DB 读写；菜单同步与客服消息推送走微信服务器 API。
 
+use rustcms_ext::http::{self, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::mysql::MySqlPool;
@@ -192,9 +193,10 @@ pub async fn message_delete(pool: &MySqlPool, id: u32) -> anyhow::Result<bool> {
         > 0)
 }
 
-/// 记录回复内容。
+/// 记录回复内容，并在公众号已配置时通过客服接口推送给用户。
 ///
-/// 注意：真正把回复发到微信需要 access_token 与 HTTP 客户端，这里只落库。
+/// 公众号未配置（缺 AppID / AppSecret）时只落库；已配置但推送失败则整体失败，
+/// 与 Go 版 `ReplyWechatMessage` 一致。
 pub async fn message_reply(
     pool: &MySqlPool,
     id: u32,
@@ -204,13 +206,13 @@ pub async fn message_reply(
     if reply.is_empty() {
         return Err(ModelError::invalid("请填写回复内容"));
     }
-    if message_get(pool, id)
+    let message = message_get(pool, id)
         .await
         .map_err(|err| ModelError::invalid(format!("查询失败: {err}")))?
-        .is_none()
-    {
-        return Err(ModelError::invalid("消息不存在"));
-    }
+        .ok_or_else(|| ModelError::invalid("消息不存在"))?;
+
+    push_text(pool, &message.openid, reply).await?;
+
     let now = chrono::Utc::now().timestamp();
     sqlx::query("UPDATE wechat_messages SET reply = ?, reply_time = ?, updated_time = ? WHERE id = ?")
         .bind(reply)
@@ -463,10 +465,259 @@ pub async fn menu_delete(pool: &MySqlPool, id: u32) -> Result<u64, ModelError> {
     Ok(deleted)
 }
 
+// ---------------------------- 微信服务器 API --------------------------------
+
+/// 微信公众平台接口基址。
+const API_BASE: &str = "https://api.weixin.qq.com";
+
+/// 查询串百分号编码（`appid` / `secret` / `access_token` 都是查询参数）。
+fn url_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// 发一次请求并解析 JSON，HTTP 状态非 2xx 视为失败。
+async fn send_json(request: Request) -> Result<Value, ModelError> {
+    let response = http::send(&request)
+        .await
+        .map_err(|err| ModelError::invalid(format!("调用微信接口失败: {err}")))?;
+    if !response.is_success() {
+        return Err(ModelError::invalid(format!(
+            "微信接口返回 HTTP {}",
+            response.status
+        )));
+    }
+    response
+        .json()
+        .map_err(|err| ModelError::invalid(format!("微信接口响应解析失败: {err}")))
+}
+
+/// 微信响应里的 `errcode` 非 0 时转成业务错误。
+fn wechat_error(value: &Value) -> Option<String> {
+    let code = value.get("errcode").and_then(Value::as_i64).unwrap_or(0);
+    if code == 0 {
+        return None;
+    }
+    let message = value
+        .get("errmsg")
+        .and_then(Value::as_str)
+        .unwrap_or("未知错误");
+    Some(format!("微信接口错误({code})：{message}"))
+}
+
+/// 读公众号 AppID / AppSecret（缺一即视为未配置）。
+async fn credentials(pool: &MySqlPool) -> Result<(String, String), ModelError> {
+    let config = site_setting::get_section(pool, WECHAT)
+        .await
+        .map_err(|err| ModelError::invalid(format!("读取公众号配置失败: {err}")))?;
+    let app_id = config
+        .get("app_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let app_secret = config
+        .get("app_secret")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if app_id.is_empty() || app_secret.is_empty() {
+        return Err(ModelError::invalid("请先在公众号配置中填写 AppID 和 AppSecret"));
+    }
+    Ok((app_id, app_secret))
+}
+
+/// 取接口调用凭据 `access_token`。
+pub async fn access_token(app_id: &str, app_secret: &str) -> Result<String, ModelError> {
+    let url = format!(
+        "{API_BASE}/cgi-bin/token?grant_type=client_credential&appid={}&secret={}",
+        url_encode(app_id),
+        url_encode(app_secret)
+    );
+    let value = send_json(Request::get(url)).await?;
+    if let Some(message) = wechat_error(&value) {
+        return Err(ModelError::invalid(message));
+    }
+    value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ModelError::invalid("微信接口未返回 access_token"))
+}
+
+/// 把本地菜单组装成 `menu/create` 的请求体。
+///
+/// 与 Go 版 `SyncWechatMenu` 一致：`view` 类型用 `url`，其余类型用 `key`。
+/// 微信限制一级菜单最多 3 个、每个一级菜单最多 5 个二级菜单，超出时提前报错。
+pub fn menu_payload(menus: &[WechatMenu]) -> Result<Value, ModelError> {
+    if menus.is_empty() {
+        return Err(ModelError::invalid("请先添加公众号菜单"));
+    }
+    let tops: Vec<&WechatMenu> = menus.iter().filter(|menu| menu.parent_id <= 0).collect();
+    if tops.len() > 3 {
+        return Err(ModelError::invalid("一级菜单最多 3 个"));
+    }
+
+    let mut buttons = Vec::with_capacity(tops.len());
+    for top in tops {
+        let mut button = json!({ "name": top.name, "type": top.kind });
+        if top.kind == "view" {
+            button["url"] = json!(top.value);
+        } else {
+            button["key"] = json!(top.value);
+        }
+
+        let children: Vec<&WechatMenu> = menus
+            .iter()
+            .filter(|menu| menu.parent_id > 0 && menu.parent_id as u32 == top.id)
+            .collect();
+        if children.len() > 5 {
+            return Err(ModelError::invalid(format!(
+                "一级菜单「{}」的二级菜单最多 5 个",
+                top.name
+            )));
+        }
+        if !children.is_empty() {
+            let mut sub_buttons = Vec::with_capacity(children.len());
+            for child in children {
+                let mut item = json!({ "name": child.name, "type": child.kind });
+                if child.kind == "view" {
+                    item["url"] = json!(child.value);
+                } else {
+                    item["key"] = json!(child.value);
+                }
+                sub_buttons.push(item);
+            }
+            button["sub_button"] = Value::Array(sub_buttons);
+        }
+        buttons.push(button);
+    }
+
+    Ok(json!({ "button": buttons }))
+}
+
+/// 把本地菜单同步到微信服务器（`menu/create`），返回同步的菜单总数。
+pub async fn menu_sync(pool: &MySqlPool) -> Result<usize, ModelError> {
+    let (app_id, app_secret) = credentials(pool).await?;
+    let menus = menu_list(pool)
+        .await
+        .map_err(|err| ModelError::invalid(format!("读取菜单失败: {err}")))?;
+    let payload = menu_payload(&menus)?;
+
+    let token = access_token(&app_id, &app_secret).await?;
+    let url = format!(
+        "{API_BASE}/cgi-bin/menu/create?access_token={}",
+        url_encode(&token)
+    );
+    let value = send_json(Request::post(url).with_json(payload)).await?;
+    if let Some(message) = wechat_error(&value) {
+        return Err(ModelError::invalid(message));
+    }
+    Ok(menus.len())
+}
+
+/// 用客服接口把文本回复推给用户。
+///
+/// 公众号未配置 AppID / AppSecret 时返回 `Ok(false)`（仅落库，不推送），
+/// 已配置但推送失败则返回错误。
+pub async fn push_text(pool: &MySqlPool, openid: &str, content: &str) -> Result<bool, ModelError> {
+    let (app_id, app_secret) = match credentials(pool).await {
+        Ok(pair) => pair,
+        Err(_) => return Ok(false),
+    };
+    if openid.trim().is_empty() {
+        return Err(ModelError::invalid("消息缺少 openid，无法推送到微信"));
+    }
+
+    let token = access_token(&app_id, &app_secret).await?;
+    let url = format!(
+        "{API_BASE}/cgi-bin/message/custom/send?access_token={}",
+        url_encode(&token)
+    );
+    let payload = json!({
+        "touser": openid,
+        "msgtype": "text",
+        "text": { "content": content },
+    });
+    let value = send_json(Request::post(url).with_json(payload)).await?;
+    if let Some(message) = wechat_error(&value) {
+        return Err(ModelError::invalid(message));
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{db_lock, setting, test_pool};
+
+    fn sample_menu(id: u32, parent_id: i32, name: &str, kind: &str, value: &str) -> WechatMenu {
+        WechatMenu {
+            id,
+            created_time: None,
+            updated_time: None,
+            parent_id,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            value: value.to_string(),
+            sort: 10,
+        }
+    }
+
+    #[test]
+    fn builds_wechat_menu_payload() {
+        let menus = vec![
+            sample_menu(1, 0, "首页", "view", "https://example.com"),
+            sample_menu(2, 0, "关于", "click", "ABOUT"),
+            sample_menu(3, 1, "子菜单", "view", "https://example.com/a"),
+        ];
+        let payload = menu_payload(&menus).unwrap();
+        assert_eq!(payload["button"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["button"][0]["type"], "view");
+        assert_eq!(payload["button"][0]["url"], "https://example.com");
+        assert_eq!(
+            payload["button"][0]["sub_button"][0]["name"], "子菜单",
+            "{payload}"
+        );
+        assert_eq!(payload["button"][1]["type"], "click");
+        assert_eq!(payload["button"][1]["key"], "ABOUT");
+    }
+
+    #[test]
+    fn rejects_too_many_top_menus() {
+        let menus: Vec<WechatMenu> = (1..=4)
+            .map(|id| sample_menu(id, 0, &format!("菜单{id}"), "click", "K"))
+            .collect();
+        assert_eq!(
+            menu_payload(&menus).unwrap_err().to_string(),
+            "一级菜单最多 3 个"
+        );
+        assert_eq!(
+            menu_payload(&[]).unwrap_err().to_string(),
+            "请先添加公众号菜单"
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_children() {
+        let mut menus = vec![sample_menu(1, 0, "父级", "click", "K")];
+        for id in 2..=7 {
+            menus.push(sample_menu(id, 1, &format!("子{id}"), "click", "K"));
+        }
+        assert_eq!(
+            menu_payload(&menus).unwrap_err().to_string(),
+            "一级菜单「父级」的二级菜单最多 5 个"
+        );
+    }
 
     #[tokio::test]
     async fn config_roundtrip_with_server_url() {

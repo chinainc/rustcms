@@ -5,13 +5,19 @@
 //! - `第一|很好`：命中后替换成 `很好`；
 //! - `{\d{6,12}}`：花括号包住正则，命中后同样替换成等长 `*`（也支持 `{...}|替换词`）。
 
+use std::time::Duration;
+
 use regex::Regex;
+use serde_json::Value;
 use sqlx::mysql::MySqlPool;
 
-use super::{site_setting, ModelError};
+use super::{anqi, site_setting, ModelError};
 
 /// 敏感词配置键。
 pub const SETTING_KEY: &str = "sensitive_words";
+
+/// 云端服务地址（对齐 Go `provider.AnqiApi`）。
+pub const ANQI_API: &str = "https://auth.anqicms.com/auth";
 
 /// 一条规则。
 #[derive(Debug, Clone)]
@@ -115,6 +121,75 @@ pub async fn save(pool: &MySqlPool, words: &[String]) -> Result<(), ModelError> 
         .await
         .map_err(|err| ModelError::invalid(format!("保存失败: {err}")))?;
     Ok(())
+}
+
+/// 解析云端同步回包，返回敏感词列表（对齐 Go `AnqiSensitiveResult`）。
+fn parse_sync_result(value: &Value) -> Result<Vec<String>, ModelError> {
+    let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 {
+        let message = value
+            .get("msg")
+            .and_then(Value::as_str)
+            .filter(|msg| !msg.trim().is_empty())
+            .unwrap_or("云端返回错误");
+        return Err(ModelError::invalid(message.to_string()));
+    }
+    Ok(value
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+                .map(|word| word.to_string())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// 从云端同步敏感词：成功且带回非空列表时整份覆盖本地配置（Go `AnqiSyncSensitiveWords`）。
+pub async fn sync_from_cloud(pool: &MySqlPool) -> Result<usize, ModelError> {
+    let auth = anqi::auth_info_get(pool).await?;
+    let token = auth
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if token.is_empty() {
+        return Err(ModelError::invalid("请先登录云端服务账号"));
+    }
+
+    let system = site_setting::get_section(pool, site_setting::SYSTEM).await?;
+    let domain = system
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+
+    let request = rustcms_ext::http::Request::post(format!("{ANQI_API}/sensitive/sync"))
+        .with_header("token", token)
+        .with_header("domain", domain)
+        .with_header(
+            "User-Agent",
+            format!("rustcms/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .with_json(serde_json::json!({}))
+        .with_timeout(Duration::from_secs(300));
+
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| ModelError::invalid(format!("连接云端服务失败: {err}")))?;
+    let value: Value = response
+        .json()
+        .map_err(|err| ModelError::invalid(format!("云端返回数据无法解析: {err}")))?;
+    let words = parse_sync_result(&value)?;
+
+    if words.is_empty() {
+        return Ok(0);
+    }
+    save(pool, &words).await?;
+    Ok(words.len())
 }
 
 fn stars(count: usize) -> String {
@@ -229,6 +304,25 @@ mod tests {
         assert_eq!(found[0], "第一");
         assert_eq!(found[1], r"{\d{6,12}}");
         assert!(hits("无关内容", &rules).is_empty());
+    }
+
+    #[test]
+    fn parses_cloud_sync_result() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": [" 第一 ", "", "第二|很好"]
+        });
+        assert_eq!(
+            parse_sync_result(&value).unwrap(),
+            vec!["第一".to_string(), "第二|很好".to_string()]
+        );
+
+        let failed = serde_json::json!({"code": 1, "msg": "token 无效"});
+        let err = parse_sync_result(&failed).unwrap_err();
+        assert!(err.to_string().contains("token 无效"));
+
+        let empty = serde_json::json!({"code": 0, "data": []});
+        assert!(parse_sync_result(&empty).unwrap().is_empty());
     }
 
     #[tokio::test]

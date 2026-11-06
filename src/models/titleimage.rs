@@ -1,9 +1,16 @@
 //! 标题生成图片（`pluginTitleImage.go`）。
 //!
-//! 配置存 `settings.title_image`。**图片渲染本身未实现**（需要字体栅格化 + 绘图库），
-//! 但「配置读写」与「资源上传（字体 / 背景图）」是完整可用的：
+//! 配置存 `settings.title_image`。
+//! 由于项目未引入图片处理依赖，渲染采用 **SVG**（见 `image_ops` 的模块说明）：
+//! - 预览返回 `data:image/svg+xml;base64,...`，浏览器可直接查看；
+//! - 批量生成把 SVG 写到 `uploads/titleimage/generated/<md5>.svg`，并补进文档 `images`。
+//! 背景图按配置等比裁剪嵌入，字体以 `@font-face` 内嵌上传的 ttf，因此中文标题也可正常显示。
+//!
+//! 资源上传：
 //! - 字体只收 `.ttf`，固定落到 `uploads/titleimage/title_font.ttf`；
 //! - 背景图按 `md5(原文件名)` 命名，落到 `uploads/titleimage/`。
+
+pub mod image_ops;
 
 use std::path::Path;
 

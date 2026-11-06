@@ -160,6 +160,15 @@ pub async fn agent_exists(pool: &MySqlPool, agent_id: u32) -> anyhow::Result<boo
     Ok(count > 0)
 }
 
+/// 读取单个智能体（不存在返回 `None`）。
+pub async fn agent_get(pool: &MySqlPool, agent_id: u32) -> anyhow::Result<Option<Value>> {
+    let row = sqlx::query("SELECT * FROM ai_agents WHERE id = ?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(agent_json))
+}
+
 /// 指定智能体的执行日志（`id DESC` 分页；Go `AiAgentLog` 不回 total）。
 pub async fn agent_logs(
     pool: &MySqlPool,

@@ -139,6 +139,57 @@ pub async fn find_password_clear() {
     *slot = None;
 }
 
+/// 用系统 `nslookup` 查询域名的 TXT 记录。
+///
+/// 对齐 Go 的 `net.LookupTXT`（都走系统解析器），避免引入 DNS 依赖。
+/// 命令不存在/启动失败单独返回错误，便于前端提示安装。
+fn lookup_txt_records(host: &str) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("nslookup")
+        .args(["-type=TXT", host])
+        .output()
+        .map_err(|_| "系统缺少 nslookup 命令".to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // nslookup 输出把 TXT 内容放在双引号里，逐个提取引号内的片段
+    let mut records = Vec::new();
+    let mut current: Option<String> = None;
+    for ch in text.chars() {
+        match current {
+            Some(ref mut value) => {
+                if ch == '"' {
+                    records.push(value.clone());
+                    current = None;
+                } else {
+                    value.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' {
+                    current = Some(String::new());
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// DNS 方式校验：首条 TXT 记录必须等于令牌（对齐 Go 的 `FindPasswordVerify`）。
+/// 返回 `Err` 表示系统缺少命令等环境问题，`Ok(false)` 才是记录不存在/不匹配。
+pub async fn dns_txt_matches(host: &str, token: &str) -> Result<bool, String> {
+    if host.is_empty() || token.is_empty() {
+        return Ok(false);
+    }
+    let host = host.to_string();
+    let token = token.to_string();
+    match tokio::task::spawn_blocking(move || lookup_txt_records(&host)).await {
+        Ok(Ok(records)) => Ok(records
+            .first()
+            .map(|record| record.trim() == token)
+            .unwrap_or(false)),
+        Ok(Err(msg)) => Err(msg),
+        Err(_) => Err("DNS 查询任务执行失败".to_string()),
+    }
+}
+
 /// 取 URL 里的主机名（不含协议、端口与路径）。
 pub fn url_hostname(raw: &str) -> String {
     let rest = match raw.find("://") {

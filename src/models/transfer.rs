@@ -1,19 +1,26 @@
 //! 数据迁移（`pluginTransfer.go`）。
 //!
 //! Go 版的迁移任务是**纯内存对象** + 对远端站点 `*2rustcms.php` 发起 HTTP 请求拉数据，
-//! 本项目暂无 HTTP 客户端，因此：
-//! - `task` 恒为空（没有持久化，重启即丢，与 Go 一致）；
-//! - `create` / `modules` / `start` 明确返回未实现；
+//! 本包实现：
+//! - `create`：校验参数并请求远端 `a=config` 做连通性确认，返回任务对象；
 //! - **`download` 是真实可用的**：把内置的 `clientFiles/<provider>2rustcms.php` 发给用户，
-//!   用户在自己旧站上放好这个文件后，才能配迁移。
+//!   用户在自己旧站上放好这个文件后，才能配迁移；
+//! - `task` / `modules` / `start` 仍保持原有占位行为（不在本包范围）。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::ModelError;
 
 /// 支持的建站系统标识（与 `clientFiles/` 下的文件名一一对应）。
 pub const PROVIDERS: &[&str] = &["dedecms", "empire", "pbootcms", "wordpress", "xunruicms", "train"];
 
 /// 迁移任务（Go 里是内存结构，这里只用于回包）。
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct TransferTask {
     pub name: String,
     pub base_url: String,
@@ -57,6 +64,77 @@ pub fn client_file(root: &Path, provider: &str) -> Option<PathBuf> {
         return None;
     }
     Some(path)
+}
+
+/// 创建迁移任务：校验参数后请求远端站点 `a=config` 确认客户端文件可用。
+///
+/// 对齐 Go `CreateTransferTask`：参数非法 / 远端返回 `code != 0` / 响应无法解析时
+/// 都直接报错，不会把任务保存到任何地方（Go 版同样只存在内存里）。
+pub async fn create(input: TransferTask) -> Result<TransferTask, ModelError> {
+    let provider = input.provider.trim().to_string();
+    if provider.is_empty() {
+        return Err(ModelError::invalid("请选择迁移系统"));
+    }
+    if !valid_provider(&provider) {
+        return Err(ModelError::invalid("迁移系统标识不合法"));
+    }
+
+    let base_url = input.base_url.trim().trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        return Err(ModelError::invalid("请填写旧站地址"));
+    }
+
+    let task = TransferTask {
+        name: input.name.trim().to_string(),
+        base_url: base_url.clone(),
+        token: input.token.trim().to_string(),
+        target_id: input.target_id.trim().to_string(),
+        provider: provider.clone(),
+        status: 0,
+        ..Default::default()
+    };
+
+    let target_id = percent_encoding::utf8_percent_encode(
+        &task.target_id,
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    let url = format!(
+        "{base_url}/{provider}2rustcms.php?a=config&from=rustcms&target_id={target_id}"
+    );
+
+    let request = rustcms_ext::http::Request::post(url)
+        .with_json(json!({
+            "baseUrl": task.base_url,
+            "token": task.token,
+            "targetId": task.target_id,
+            "provider": task.provider,
+        }))
+        .with_timeout(Duration::from_secs(300));
+
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| ModelError::invalid(format!("连接旧站失败: {err}")))?;
+    if !response.is_success() {
+        return Err(ModelError::invalid(format!(
+            "旧站返回异常状态码 {}",
+            response.status
+        )));
+    }
+
+    let value: Value = response
+        .json()
+        .map_err(|err| ModelError::invalid(format!("旧站返回数据无法解析: {err}")))?;
+    let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 {
+        let message = value
+            .get("msg")
+            .and_then(Value::as_str)
+            .filter(|msg| !msg.trim().is_empty())
+            .unwrap_or("旧站返回错误");
+        return Err(ModelError::invalid(message.to_string()));
+    }
+
+    Ok(task)
 }
 
 #[cfg(test)]

@@ -12,6 +12,8 @@
 use serde_json::Value;
 use sqlx::mysql::MySqlPool;
 
+use super::ModelError;
+
 /// 按 key 取原始 JSON 文本。
 pub async fn get_raw(pool: &MySqlPool, key: &str) -> anyhow::Result<Option<String>> {
     let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE `key` = ?")
@@ -90,6 +92,78 @@ pub async fn remove(pool: &MySqlPool, key: &str) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// 表是否存在。
+async fn table_exists(pool: &MySqlPool, table: &str) -> Result<bool, ModelError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name = ?",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+/// 列是否存在；不存在时执行 `ddl` 补列。
+async fn ensure_column(
+    pool: &MySqlPool,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<bool, ModelError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await?;
+    if count > 0 {
+        return Ok(false);
+    }
+    sqlx::query(ddl).execute(pool).await?;
+    Ok(true)
+}
+
+/// 数据库自动迁移（对齐 Go `provider.AutoMigrateDB` 的可用子集）。
+///
+/// **先整库备份再执行变更**：备份失败就直接返回，不做任何 DDL。
+/// 变更都是幂等的：补齐模块自定义字段表，并给 `users` 补上会员中心的 `api_token` 列。
+pub async fn migrate_db(pool: &MySqlPool, backup_dir: &std::path::Path) -> Result<Value, ModelError> {
+    // 1. 先备份，拿到文件名后才允许往下走
+    let backup_file = super::backup::dump(pool, backup_dir).await?;
+
+    // 2. 模块自定义字段表：缺失则建表，缺列则补列
+    let modules = super::module::list(pool).await?;
+    let mut migrated_modules = Vec::new();
+    for module in &modules {
+        super::module::migrate(pool, module).await?;
+        migrated_modules.push(module.table_name.clone());
+    }
+
+    // 3. 会员中心新增的用户 API Token（Go `AutoMigrateMemberCenter`）
+    let mut added_columns = Vec::new();
+    if table_exists(pool, "users").await? {
+        let added = ensure_column(
+            pool,
+            "users",
+            "api_token",
+            "ALTER TABLE `users` ADD COLUMN `api_token` varchar(64) NOT NULL DEFAULT ''",
+        )
+        .await?;
+        if added {
+            added_columns.push("users.api_token");
+        }
+    }
+
+    Ok(serde_json::json!({
+        "backup": backup_file,
+        "modules": migrated_modules,
+        "added_columns": added_columns,
+    }))
 }
 
 #[cfg(test)]

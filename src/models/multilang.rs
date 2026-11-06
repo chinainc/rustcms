@@ -13,12 +13,16 @@
 //! - 内容同步需要跨站点复制 + 翻译外呼，未实现。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::mysql::MySqlPool;
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::Row;
 
-use super::{site_setting, website, ModelError};
+use super::{module, site_setting, website, ModelError};
+use crate::config::MysqlConfig;
 
 /// 多语言配置键。
 pub const SETTING_KEY: &str = "multi_lang";
@@ -34,6 +38,17 @@ pub struct SubSiteInput {
     pub language: String,
     #[serde(default)]
     pub language_icon: String,
+}
+
+/// 子站点内容同步入参。
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct SiteSyncInput {
+    /// 目标子站点 id
+    #[serde(default)]
+    pub id: u32,
+    /// 强制全量同步（忽略目标站点已记录的 `sync_time`）
+    #[serde(default)]
+    pub focus: bool,
 }
 
 /// 翻译缓存文件。
@@ -243,6 +258,349 @@ pub async fn site_remove(
         .await
         .map_err(|err| ModelError::invalid(format!("删除失败: {err}")))?;
     Ok(true)
+}
+
+// ---------------------------- 内容同步 -------------------------------------
+
+/// 需要同步的表（顺序对齐 Go 版 `SyncMultiLangSiteContent`）。
+const SYNC_TABLES: &[&str] = &[
+    "modules",
+    "nav_types",
+    "navs",
+    "attachments",
+    "categories",
+    "tags",
+    "tag_contents",
+    "archive_data",
+    "archives",
+    "tag_data",
+    "archive_categories",
+    "archive_flags",
+    "archive_relations",
+];
+
+/// 单批最多读取的行数（与 Go 的 `limitSize` 一致）。
+const SYNC_BATCH: i64 = 5000;
+
+/// MySQL 单条 SQL 的占位符上限是 65535，留一点余量。
+const MAX_PLACEHOLDERS: usize = 60000;
+
+/// 同步任务互斥：同一时间只允许一个同步在跑。
+static SYNCING: AtomicBool = AtomicBool::new(false);
+
+/// 守卫：离开作用域时自动释放同步锁（含提前 return / 报错分支）。
+struct SyncGuard;
+
+impl SyncGuard {
+    fn acquire() -> Result<Self, ModelError> {
+        SYNCING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self)
+            .map_err(|_| ModelError::invalid("同步任务正在进行中，请稍后再试"))
+    }
+}
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        SYNCING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 单表同步结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct TableSync {
+    pub table: String,
+    pub count: u64,
+}
+
+/// 同步结果汇总。
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncReport {
+    pub target_id: u32,
+    /// 是否全量同步（目标站点从未同步过，或请求里显式 `focus = true`）
+    pub full: bool,
+    pub total: u64,
+    pub tables: Vec<TableSync>,
+    pub message: String,
+}
+
+/// 校验表名只含字母、数字与下划线，避免拼接 SQL 时被注入。
+fn is_safe_table(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn quote(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// 从 `websites.mysql` 解析目标站点数据库配置。
+///
+/// `use_default = true` 时账号密码复用主站配置（与 Go 的 `MysqlConfig.UseDefault` 一致）。
+fn target_mysql(site: &website::Website, default_mysql: &MysqlConfig) -> Result<MysqlConfig, ModelError> {
+    let raw = site
+        .mysql
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ModelError::invalid("目标站点未配置独立数据库，无法同步内容"))?;
+    let mut config: MysqlConfig = serde_json::from_str(raw)
+        .map_err(|err| ModelError::invalid(format!("目标站点数据库配置解析失败: {err}")))?;
+
+    if config.database.trim().is_empty() {
+        return Err(ModelError::invalid("目标站点未填写数据库名称，无法同步内容"));
+    }
+    if config.use_default {
+        config.user = default_mysql.user.clone();
+        config.password = default_mysql.password.clone();
+        config.host = default_mysql.host.clone();
+        config.port = default_mysql.port;
+    }
+    if config.user.trim().is_empty() {
+        config.user = default_mysql.user.clone();
+    }
+    if config.host.trim().is_empty() {
+        config.host = default_mysql.host.clone();
+    }
+    if config.port == 0 {
+        config.port = default_mysql.port;
+    }
+    Ok(config)
+}
+
+/// 读取目标库某表的列名（按库内顺序）；表不存在时返回空列表。
+async fn table_columns(pool: &MySqlPool, table: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// 把源库一张表的数据逐批复制到目标库（按主键 upsert）。
+///
+/// 具体做法：`SELECT CAST(列 AS CHAR)` 读成字符串，再用 `INSERT ... ON DUPLICATE KEY UPDATE`
+/// 写回，避免为每张表维护一套强类型结构体；MySQL 会按目标列类型自动转换。
+async fn copy_table(
+    source: &MySqlPool,
+    target: &MySqlPool,
+    table: &str,
+    full: bool,
+) -> Result<u64, ModelError> {
+    if !is_safe_table(table) {
+        return Err(ModelError::invalid(format!("表名非法：{table}")));
+    }
+
+    let columns = match table_columns(target, table).await {
+        Ok(columns) if !columns.is_empty() => columns,
+        Ok(_) => return Ok(0), // 目标库没有这张表，跳过
+        Err(err) => return Err(ModelError::invalid(format!("读取 {table} 表结构失败: {err}"))),
+    };
+    if !columns.iter().any(|column| column.eq_ignore_ascii_case("id")) {
+        return Ok(0); // 没有主键 id，无法增量同步
+    }
+
+    let start_id: i64 = if full {
+        0
+    } else {
+        let sql = format!("SELECT COALESCE(CAST(MAX(id) AS SIGNED), 0) FROM {}", quote(table));
+        sqlx::query_scalar::<_, i64>(&sql)
+            .fetch_one(target)
+            .await
+            .unwrap_or(0)
+    };
+
+    let select_sql = format!(
+        "SELECT {} FROM {} WHERE id > ? ORDER BY id ASC LIMIT ?",
+        columns
+            .iter()
+            .map(|column| format!("CAST({} AS CHAR)", quote(column)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        quote(table)
+    );
+
+    // 每批行数要同时受「行数上限」和「占位符上限」约束
+    let batch = (MAX_PLACEHOLDERS / columns.len().max(1)).min(SYNC_BATCH as usize) as i64;
+    let batch = batch.max(1);
+
+    let id_index = columns
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case("id"))
+        .unwrap_or(0);
+
+    let placeholders = format!(
+        "({})",
+        vec!["?"; columns.len()].join(", ")
+    );
+    let updates = columns
+        .iter()
+        .map(|column| format!("{0} = VALUES({0})", quote(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let column_list = columns
+        .iter()
+        .map(|column| quote(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_head = format!("INSERT INTO {} ({}) VALUES ", quote(table), column_list);
+    let insert_tail = format!(" ON DUPLICATE KEY UPDATE {updates}");
+
+    let mut copied = 0u64;
+    let mut cursor = start_id;
+    loop {
+        let rows = sqlx::query(&select_sql)
+            .bind(cursor)
+            .bind(batch)
+            .fetch_all(source)
+            .await
+            .map_err(|err| ModelError::invalid(format!("读取 {table} 数据失败: {err}")))?;
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut values: Vec<Option<String>> = Vec::with_capacity(rows.len() * columns.len());
+        let mut last_id = cursor;
+        for row in &rows {
+            for index in 0..columns.len() {
+                values.push(row.try_get::<Option<String>, _>(index).unwrap_or(None));
+            }
+            if let Some(Some(raw)) = values.get(values.len() - columns.len() + id_index) {
+                if let Ok(id) = raw.trim().parse::<i64>() {
+                    last_id = id;
+                }
+            }
+        }
+
+        let mut sql = String::with_capacity(insert_head.len() + placeholders.len() * rows.len());
+        sql.push_str(&insert_head);
+        for index in 0..rows.len() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&placeholders);
+        }
+        sql.push_str(&insert_tail);
+
+        let mut query = sqlx::query(&sql);
+        for value in values {
+            query = query.bind(value);
+        }
+        query
+            .execute(target)
+            .await
+            .map_err(|err| ModelError::invalid(format!("写入 {table} 数据失败: {err}")))?;
+
+        copied += rows.len() as u64;
+        if last_id <= cursor {
+            // id 没前进（异常数据），避免死循环
+            break;
+        }
+        cursor = last_id;
+    }
+
+    Ok(copied)
+}
+
+/// 把主站内容同步到指定多语言子站点。
+///
+/// 对齐 Go 版 `SyncMultiLangSiteContent`：同步 modules / 导航 / 附件 / 分类 / 标签 /
+/// 文档及关联表；目标站点从未同步过（`sync_time = 0`）或 `focus = true` 时全量，
+/// 否则只同步 id 比目标库更大的新增行。
+///
+/// 未实现的部分：附件文件复制（需要目标站点存储配置）与自动翻译（需要翻译引擎外呼）。
+pub async fn site_sync(
+    pool: &MySqlPool,
+    default_mysql: &MysqlConfig,
+    target_id: u32,
+    focus: bool,
+) -> Result<SyncReport, ModelError> {
+    if target_id == 0 {
+        return Err(ModelError::invalid("请选择要同步的子站点"));
+    }
+    if target_id == 1 {
+        return Err(ModelError::invalid("不能同步主站点自身"));
+    }
+    let _guard = SyncGuard::acquire()?;
+
+    let site = website::get(pool, target_id)
+        .await
+        .map_err(|err| ModelError::invalid(format!("读取子站点信息失败: {err}")))?
+        .ok_or_else(|| ModelError::invalid("子站点不存在"))?;
+    if site.status == 0 {
+        return Err(ModelError::invalid("子站点尚未初始化，无法同步内容"));
+    }
+    let config = target_mysql(&site, default_mysql)?;
+    if config.database == default_mysql.database
+        && config.host == default_mysql.host
+        && config.port == default_mysql.port
+    {
+        return Err(ModelError::invalid("子站点与主站使用同一个数据库，无需同步"));
+    }
+
+    let target = MySqlPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&crate::db::url(&config))
+        .await
+        .map_err(|err| ModelError::invalid(format!("连接子站点数据库失败: {err}")))?;
+
+    let sync_time: i64 = sqlx::query_scalar("SELECT COALESCE(CAST(sync_time AS SIGNED), 0) FROM websites WHERE id = ?")
+        .bind(target_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| ModelError::invalid(format!("读取同步时间失败: {err}")))?
+        .unwrap_or(0);
+    let full = focus || sync_time <= 0;
+
+    let mut tables: Vec<String> = SYNC_TABLES.iter().map(|table| table.to_string()).collect();
+    if let Ok(modules) = module::list(pool).await {
+        for item in modules {
+            if let Ok(table) = item.safe_table() {
+                if !table.is_empty() && !tables.iter().any(|known| known == table) {
+                    tables.push(table.to_string());
+                }
+            }
+        }
+    }
+
+    let mut report = SyncReport {
+        target_id,
+        full,
+        total: 0,
+        tables: Vec::new(),
+        message: String::new(),
+    };
+    for table in &tables {
+        let count = copy_table(pool, &target, table, full).await?;
+        if count > 0 || SYNC_TABLES.contains(&table.as_str()) {
+            report.total += count;
+            report.tables.push(TableSync {
+                table: table.clone(),
+                count,
+            });
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    sqlx::query("UPDATE websites SET sync_time = ? WHERE id = ?")
+        .bind(now)
+        .bind(target_id)
+        .execute(pool)
+        .await
+        .map_err(|err| ModelError::invalid(format!("更新同步时间失败: {err}")))?;
+
+    let translated = config_get(pool)
+        .await
+        .map(|value| value.get("auto_translate").and_then(Value::as_bool).unwrap_or(false))
+        .unwrap_or(false);
+    report.message = if translated {
+        "内容已同步；自动翻译需要翻译引擎外呼，尚未执行".to_string()
+    } else {
+        "内容同步完成".to_string()
+    };
+    Ok(report)
 }
 
 /// 翻译缓存目录：`<cache>/multiLang`。

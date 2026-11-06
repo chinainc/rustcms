@@ -22,7 +22,7 @@ use crate::models::{
     multilang, nav, order, payment, place, plugin, redirect, replace, retailer, sensitive,
     sendmail, setting, site_setting, skill, statistic, subscriber, tag, titleimage, transfer,
     translate, upload_file, user, user_admin, user_auth, watermark, wechat, website,
-    withdraw, Category, ModelError,
+    withdraw, Category, ModelError, json_string_list,
 };
 use crate::state::AppState;
 
@@ -1753,9 +1753,12 @@ fn manage_router() -> Router<AppState> {
         .route("/aigenerate/plans", get(manage_aigenerate_plans))
         .route(
             "/aigenerate/article/collect",
-            post(manage_aigenerate_article),
+            post(manage_aigenerate_article_collect),
         )
-        .route("/aigenerate/article/start", post(manage_aigenerate_article))
+        .route(
+            "/aigenerate/article/start",
+            post(manage_aigenerate_article_start),
+        )
         .route(
             "/plugin/place/setting",
             get(manage_place_setting).post(manage_place_setting_save),
@@ -3542,24 +3545,6 @@ async fn manage_collector_replace(
     }
 }
 
-/// `POST /system/api/collector/article/collect`
-///
-/// 真正的抓取需要 HTTP 抓取 + HTML 解析模块，本项目暂无，明确告知未实现。
-async fn manage_collector_collect(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(res) = require_admin(&state, &headers).await {
-        return *res;
-    }
-    fail("采集功能尚未实现（需 HTTP 抓取模块）")
-}
-
-/// `POST /system/api/collector/article/start`
-async fn manage_collector_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(res) = require_admin(&state, &headers).await {
-        return *res;
-    }
-    fail("采集功能尚未实现（需 HTTP 抓取模块）")
-}
-
 #[derive(Debug, Deserialize, Default)]
 struct KeywordBody {
     #[serde(default)]
@@ -3568,7 +3553,127 @@ struct KeywordBody {
     title: String,
 }
 
+/// 在后台执行单个关键词的采集，并把进度写入任务记录。
+fn spawn_collect_keyword(pool: sqlx::MySqlPool, keyword: collector::Keyword) {
+    tokio::spawn(async move {
+        let job = match collector::task_create(&pool, collector::COLLECTOR_TASK_KEY, "collect").await
+        {
+            Ok(job) => job,
+            Err(err) => {
+                tracing::warn!("创建采集任务失败：{err:#}");
+                return;
+            }
+        };
+        let config = collector::get_setting(&pool).await.unwrap_or_else(|_| json!({}));
+        let result = collector::collect_keyword_articles(&pool, &keyword, &config).await;
+        let (status, done, message) = match &result {
+            Ok(count) => ("finished", *count as i64, format!("采集完成，新增 {count} 篇")),
+            Err(err) => ("failed", 0, format!("{err:#}")),
+        };
+        let total = if result.is_ok() { done } else { 0 };
+        if let Err(err) = collector::task_update(
+            &pool,
+            collector::COLLECTOR_TASK_KEY,
+            &job.id,
+            status,
+            done,
+            total,
+            &message,
+        )
+        .await
+        {
+            tracing::warn!("更新采集任务失败：{err:#}");
+        }
+    });
+}
+
+/// `POST /system/api/collector/article/collect`
+///
+/// 按关键词立即触发一次采集；`title` 为空时用 `id` 定位关键词。
+async fn manage_collector_collect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<KeywordBody>,
+) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+
+    let keyword = if body.title.trim().is_empty() {
+        match collector::get_keyword(pool, body.id).await {
+            Ok(Some(item)) => item,
+            Ok(None) => return fail("关键词不存在"),
+            Err(err) => return failed(err),
+        }
+    } else {
+        let title = body.title.trim();
+        match collector::ensure_keyword(pool, title).await {
+            Ok(id) => match collector::get_keyword(pool, id).await {
+                Ok(Some(item)) => item,
+                Ok(None) => return fail("关键词不存在"),
+                Err(err) => return failed(err),
+            },
+            Err(err) => return model_error(err),
+        }
+    };
+
+    spawn_collect_keyword(pool.clone(), keyword);
+    ok_msg("采集任务已触发")
+}
+
+/// `POST /system/api/collector/article/start`
+///
+/// 立即执行一次待采集关键词的采集任务，后台异步执行。
+async fn manage_collector_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let job = match collector::task_create(&pool, collector::COLLECTOR_TASK_KEY, "start").await {
+            Ok(job) => job,
+            Err(err) => {
+                tracing::warn!("创建采集任务失败：{err:#}");
+                return;
+            }
+        };
+        let config = collector::get_setting(&pool).await.unwrap_or_else(|_| json!({}));
+        let result = collector::collect_pending_articles(&pool, &config).await;
+        let (status, done, total, message) = match &result {
+            Ok((keywords, articles)) => (
+                "finished",
+                *keywords as i64,
+                *keywords as i64,
+                format!("处理 {keywords} 个关键词，新增 {articles} 篇"),
+            ),
+            Err(err) => ("failed", 0, 0, format!("{err:#}")),
+        };
+        if let Err(err) = collector::task_update(
+            &pool,
+            collector::COLLECTOR_TASK_KEY,
+            &job.id,
+            status,
+            done,
+            total,
+            &message,
+        )
+        .await
+        {
+            tracing::warn!("更新采集任务失败：{err:#}");
+        }
+    });
+    ok_msg("采集任务已触发")
+}
+
 /// `POST /system/api/collector/article/combination/get`
+///
+/// 用素材库里的同关键词素材组装一篇问答组合文章，结果不直接入库。
 async fn manage_collector_combination(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3577,20 +3682,75 @@ async fn manage_collector_combination(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    let hint = if body.title.trim().is_empty() {
-        format!("#{}", body.id)
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+
+    let keyword = if body.title.trim().is_empty() {
+        match collector::get_keyword(pool, body.id).await {
+            Ok(Some(item)) => item.title,
+            Ok(None) => return fail("关键词不存在"),
+            Err(err) => return failed(err),
+        }
     } else {
         body.title.trim().to_string()
     };
-    fail(format!("问答组合文章生成尚未实现（关键词：{hint}，需 AI/外呼）"))
+
+    match collector::combination_article(pool, &keyword).await {
+        Ok(article) => ok(article),
+        Err(err) => failed(err),
+    }
 }
 
 /// `POST /system/api/collector/keyword/dig`
+///
+/// 立即触发一轮关键词挖掘（联想词扩展），后台异步执行。
 async fn manage_collector_dig(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("关键词拓展尚未实现（需外呼）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let job = match collector::task_create(&pool, collector::COLLECTOR_TASK_KEY, "dig").await {
+            Ok(job) => job,
+            Err(err) => {
+                tracing::warn!("创建关键词挖掘任务失败：{err:#}");
+                return;
+            }
+        };
+        let setting = collector::keyword_setting_get(&pool)
+            .await
+            .unwrap_or_else(|_| json!({}));
+        let language = collector::cfg_str(&setting, "language", "zh");
+        let max_count = collector::cfg_i64(&setting, "max_count", 100000);
+        let result = collector::dig_keywords(&pool, 20, &language, max_count).await;
+        let (status, done, total, message) = match &result {
+            Ok((processed, added)) => (
+                "finished",
+                *processed as i64,
+                *processed as i64,
+                format!("处理 {processed} 个关键词，新增 {added} 个"),
+            ),
+            Err(err) => ("failed", 0, 0, format!("{err:#}")),
+        };
+        if let Err(err) = collector::task_update(
+            &pool,
+            collector::COLLECTOR_TASK_KEY,
+            &job.id,
+            status,
+            done,
+            total,
+            &message,
+        )
+        .await
+        {
+            tracing::warn!("更新关键词挖掘任务失败：{err:#}");
+        }
+    });
+    ok_msg("关键词拓展任务已触发")
 }
 
 // ---------------------------- AI 技能 --------------------------------------
@@ -3701,10 +3861,10 @@ async fn manage_skill_reload(State(state): State<AppState>, headers: HeaderMap) 
 // 口径（对齐 coverage-plan 第七节第 7 条）：
 // - 这一组接口成功/失败用 `code:0` / `code:-1`（Go 版 StatusOK/StatusFailed），
 //   与普通插件的 0/1 不同；`fail_ai` 统一产出 -1 信封；
-// - 登录 / 模板分享下载 / 反馈 / 翻译 / 伪原创 / 生图 / 提取等需要外呼
-//   云端服务或 LLM 的动作，接口保留 + 参数校验 + 明确未实现提示；
+// - 需要外呼云端服务的动作（翻译 / 伪原创 / 生图 / 提取 / AI 对话 / 流式生成）
+//   统一走 `anqi_cloud_post`（`ext::http`）真实调用，凭据从 `settings.anqi` 读取；
 // - 站内可得的（授权信息读取、AI 接口配置、会话历史、智能体列表与日志、
-//   对话附件上传）真实实现。
+//   对话附件上传）直接从数据库实现。
 
 /// AI 组专用失败信封：`code:-1`（Go `config.StatusFailed`）。
 fn fail_ai(msg: impl Into<String>) -> Response {
@@ -3723,7 +3883,25 @@ async fn manage_anqi_info(State(state): State<AppState>, headers: HeaderMap) -> 
         return fail(NO_DB);
     };
     match anqi::auth_info_get(pool).await {
-        Ok(value) => ok(value),
+        Ok(mut value) => {
+            let bound = value
+                .get("token")
+                .and_then(Value::as_str)
+                .map(|token| !token.trim().is_empty())
+                .unwrap_or(false);
+            if let Value::Object(map) = &mut value {
+                map.insert("bound".into(), json!(bound));
+                map.insert(
+                    "tip".into(),
+                    json!(if bound {
+                        ""
+                    } else {
+                        "请先绑定安企账号后再使用 AI 助手"
+                    }),
+                );
+            }
+            ok(value)
+        }
         Err(err) => failed(err),
     }
 }
@@ -3744,6 +3922,395 @@ struct AnqiLoginBody {
     password: String,
 }
 
+// ---------------------------- 云端服务客户端 ---------------------------------
+//
+// 对齐 Go `provider/anqi.go`：请求全部打到 `AnqiApi`，统一带
+// `token`（`settings.anqi.token`）、`domain`（站点 `settings.system.base_url`）、
+// `User-Agent: anqicms/<version>` 三个头，响应信封 `{code,msg,data}`，`code != 0` 即失败。
+// 出网走 `rustcms_ext::http`（curl 后端支持 https），zip 走 `rustcms_ext::packer`。
+
+/// 云端服务 API 根地址（Go `provider.AnqiApi`）。
+const ANQI_API: &str = "https://auth.anqicms.com/auth";
+
+/// 云端调用失败提示（直接作为 `code:1` 的 `msg` 回给前端）。
+type CloudResult<T> = Result<T, String>;
+
+/// 云端请求头：token / domain / User-Agent。
+async fn anqi_cloud_headers(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
+    let token = setting::get_json(pool, anqi::SETTING_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| {
+            value
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    vec![
+        ("token".to_string(), token),
+        ("domain".to_string(), site_base_url(pool).await),
+        (
+            "User-Agent".to_string(),
+            format!("anqicms/{}", env!("CARGO_PKG_VERSION")),
+        ),
+    ]
+}
+
+/// 云端账号绑定校验：`ai/chat` 与 AI 写作/流式入口共用，文案保持一致。
+async fn ensure_anqi_bound(pool: &sqlx::MySqlPool) -> Result<(), String> {
+    let info = anqi::auth_info_get(pool)
+        .await
+        .map_err(|err| format!("读取云端服务登录态失败：{err}"))?;
+    let token = info
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() {
+        return Err("请先绑定安企账号后再使用 AI 助手".to_string());
+    }
+    Ok(())
+}
+
+/// 截断云端返回的异常正文，避免把整段响应塞进错误提示。
+fn anqi_short_text(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// 解析云端信封：`code != 0` 视为失败。
+fn anqi_cloud_envelope(response: &rustcms_ext::http::Response) -> CloudResult<Value> {
+    let text = response.text();
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("云端服务返回异常：{}", anqi_short_text(&text, 200)))?;
+    let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 {
+        let msg = value
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Err(if msg.is_empty() {
+            format!("云端服务返回失败（code={code}）")
+        } else {
+            msg
+        });
+    }
+    Ok(value)
+}
+
+/// POST JSON 到云端服务，返回完整信封。
+async fn anqi_cloud_post(
+    pool: &sqlx::MySqlPool,
+    path: &str,
+    payload: &Value,
+) -> CloudResult<Value> {
+    let mut request = rustcms_ext::http::Request::post(format!("{ANQI_API}{path}"))
+        .with_json(payload.clone())
+        .with_timeout(std::time::Duration::from_secs(300));
+    for (key, value) in anqi_cloud_headers(pool).await {
+        request = request.with_header(key, value);
+    }
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| format!("云端服务请求失败：{err}"))?;
+    anqi_cloud_envelope(&response)
+}
+
+/// 轮询云端 AI 计划结果（`/ai/syncplan`，每 10 秒一次、最多 30 次）。
+///
+/// `pending` 是 `/ai/generate`、`/ai/pseudo` 首次返回的 `data`；已完成则直接返回。
+async fn anqi_ai_wait_plan(
+    pool: &sqlx::MySqlPool,
+    req_id: i64,
+    mut pending: Value,
+) -> CloudResult<Value> {
+    if pending.get("status").and_then(Value::as_i64).unwrap_or(0) == 2 {
+        return Ok(pending);
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        pending = anqi_cloud_post(pool, "/ai/syncplan", &json!({ "req_id": req_id }))
+            .await?
+            .get("data")
+            .cloned()
+            .unwrap_or(Value::Null);
+        match pending.get("status").and_then(Value::as_i64).unwrap_or(0) {
+            // 0 等待、1 进行中：继续轮询
+            0 | 1 => {}
+            2 => return Ok(pending),
+            _ => return Err("AI 任务失败，请稍后重试".to_string()),
+        }
+    }
+    Err("AI 任务超时（5 分钟内未完成），请稍后重试".to_string())
+}
+
+/// multipart 上传到云端（字段名 `attach`，对齐 Go `SendFile(data, name, "attach")`）。
+///
+/// `ext::http` 没有 multipart 体，这里按 RFC 7578 手工拼包，用 `Body::Bytes` 发送。
+async fn anqi_cloud_upload(
+    pool: &sqlx::MySqlPool,
+    file_name: &str,
+    data: &[u8],
+) -> CloudResult<Value> {
+    let boundary = format!(
+        "----rustcms{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    );
+    let safe_name = file_name.replace(['"', '\r', '\n'], "");
+    let mut body = Vec::with_capacity(data.len() + 256);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"attach\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let mut request = rustcms_ext::http::Request::post(format!("{ANQI_API}/template/upload"))
+        .with_body(rustcms_ext::http::Body::Bytes(body))
+        .with_header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .with_timeout(std::time::Duration::from_secs(300));
+    for (key, value) in anqi_cloud_headers(pool).await {
+        request = request.with_header(key, value);
+    }
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| format!("云端服务请求失败：{err}"))?;
+    anqi_cloud_envelope(&response)
+}
+
+/// 云端账号登录态校验（Go `AuthId == 0` → 提示先登录）。
+async fn anqi_require_login(pool: &sqlx::MySqlPool) -> CloudResult<()> {
+    let auth_id = setting::get_json(pool, anqi::SETTING_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.get("auth_id").and_then(Value::as_i64))
+        .unwrap_or(0);
+    if auth_id == 0 {
+        return Err("请先登录 AnqiCMS 云端账号".to_string());
+    }
+    Ok(())
+}
+
+/// 递归收集目录下所有文件。
+fn anqi_collect_files(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            anqi_collect_files(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// 打模板分享包（Go `CreateDesignZip`）：条目统一挂在 `template/` 与 `static/` 两个前缀下。
+fn anqi_design_zip(store: &design::DesignStore, package: &str) -> CloudResult<Vec<u8>> {
+    let template_dir = store.template_root.join(package);
+    let mut files = Vec::new();
+    anqi_collect_files(&template_dir, &mut files)
+        .map_err(|err| format!("读取模板目录失败：{err}"))?;
+    let static_dir = store.static_root.join(package);
+    if static_dir.is_dir() {
+        anqi_collect_files(&static_dir, &mut files)
+            .map_err(|err| format!("读取静态资源目录失败：{err}"))?;
+    }
+
+    let mut writer = rustcms_ext::packer::ZipWriter::new();
+    for file in &files {
+        let (root, prefix) = if static_dir.is_dir() && file.starts_with(&static_dir) {
+            (&static_dir, "static")
+        } else {
+            (&template_dir, "template")
+        };
+        let rel = file
+            .strip_prefix(root)
+            .map_err(|err| format!("读取模板文件路径失败：{err}"))?;
+        let name = format!("{prefix}/{}", rel.to_string_lossy().replace('\\', "/"));
+        let data = std::fs::read(file).map_err(|err| format!("读取 {} 失败：{err}", file.display()))?;
+        writer
+            .add_file(&name, &data)
+            .map_err(|err| format!("打包 {} 失败：{err}", name))?;
+    }
+    Ok(writer.finish())
+}
+
+/// 回写模板配置（Go `writeDesignInfo`）。
+fn anqi_write_design_info(
+    store: &design::DesignStore,
+    package: &str,
+    info: &design::DesignPackage,
+) -> CloudResult<()> {
+    let dir = store.template_root.join(package);
+    std::fs::create_dir_all(&dir).map_err(|err| format!("创建模板目录失败：{err}"))?;
+    let raw = serde_json::to_string_pretty(info)
+        .map_err(|err| format!("序列化模板配置失败：{err}"))?;
+    std::fs::write(dir.join("config.json"), raw)
+        .map_err(|err| format!("写入模板配置失败：{err}"))
+}
+
+/// 解包云端模板（Go `UploadDesignZip`）。
+///
+/// 包名优先取 `template/config.json` 的 `package`，否则用下载文件名；
+/// `template/` 下只收 `.html` / `.json` / `.db`，`.php` 一律跳过；`static/` 全收。
+fn anqi_extract_design_zip(
+    store: &design::DesignStore,
+    data: &[u8],
+    download_url: &str,
+) -> CloudResult<String> {
+    let archive = rustcms_ext::packer::ZipArchive::open(data.to_vec())
+        .map_err(|err| format!("模板包解析失败：{err}"))?;
+
+    let mut info = Value::Object(Default::default());
+    if let Ok(raw) = archive.read_by_name("template/config.json") {
+        if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+            if value.is_object() {
+                info = value;
+            }
+        }
+    }
+    let mut package = info
+        .get("package")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if package.is_empty() {
+        package = download_url
+            .rsplit(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".zip")
+            .to_string();
+    }
+    if !design::valid_package(&package) {
+        return Err("模板包名不合法".to_string());
+    }
+
+    // 同名模板已存在时追加序号（对齐 Go 的处理方式）
+    let mut final_package = package.clone();
+    let mut index = 1;
+    while store.template_root.join(&final_package).exists() {
+        if index > 100 {
+            return Err("同名模板过多，无法落盘".to_string());
+        }
+        final_package = format!("{package}{index}");
+        index += 1;
+    }
+
+    for entry in archive.entries() {
+        if entry.is_dir {
+            continue;
+        }
+        let name = entry.name.replace('\\', "/");
+        if name.split('/').any(|segment| segment == "..") {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".php") {
+            continue;
+        }
+        let dest = if let Some(rel) = name.strip_prefix("template/") {
+            let rel_lower = rel.to_ascii_lowercase();
+            if !(rel_lower.ends_with(".html")
+                || rel_lower.ends_with(".json")
+                || rel_lower.ends_with(".db"))
+            {
+                continue;
+            }
+            store.template_root.join(&final_package).join(rel)
+        } else if let Some(rel) = name.strip_prefix("static/") {
+            store.static_root.join(&final_package).join(rel)
+        } else {
+            continue;
+        };
+        if let Ok(bytes) = archive.read_entry(entry) {
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&dest, bytes);
+        }
+    }
+
+    if let Value::Object(map) = &mut info {
+        map.insert("package".to_string(), json!(final_package));
+        if !map.contains_key("created") {
+            map.insert(
+                "created".to_string(),
+                json!(chrono::Utc::now()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()),
+            );
+        }
+    }
+    let dir = store.template_root.join(&final_package);
+    std::fs::create_dir_all(&dir).map_err(|err| format!("创建模板目录失败：{err}"))?;
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&info).map_err(|err| format!("序列化模板配置失败：{err}"))?,
+    )
+    .map_err(|err| format!("写入模板配置失败：{err}"))?;
+    Ok(final_package)
+}
+
+/// 记录翻译日志（Go `AddTranslateLog`，`md5` 冲突则更新）。
+///
+/// 写库失败只记警告：日志本身不影响翻译结果。
+async fn anqi_add_translate_log(
+    pool: &sqlx::MySqlPool,
+    language: &str,
+    to_language: &str,
+    texts: &[String],
+) {
+    use md5::{Digest, Md5};
+
+    let title: String = texts
+        .first()
+        .map(|text| text.chars().take(190).collect())
+        .unwrap_or_default();
+    // Go: md5(fmt.Sprint(text) + "-" + toLanguage)，fmt.Sprint([]string) 形如 `[a b c]`
+    let joined = format!("[{}]", texts.join(" "));
+    let digest = format!(
+        "{:x}",
+        Md5::digest(format!("{joined}-{to_language}").as_bytes())
+    );
+    if let Err(err) = sqlx::query(
+        "INSERT INTO translate_logs (created_time, `md5`, origin_title, language, to_language) \
+         VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE origin_title = VALUES(origin_title), \
+         language = VALUES(language), to_language = VALUES(to_language)",
+    )
+    .bind(chrono::Utc::now().timestamp())
+    .bind(digest)
+    .bind(title)
+    .bind(language)
+    .bind(to_language)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!("记录翻译日志失败：{err}");
+    }
+}
+
 /// `POST /system/api/anqi/login`
 async fn manage_anqi_login(
     State(state): State<AppState>,
@@ -3757,7 +4324,36 @@ async fn manage_anqi_login(
     if body.user_name.trim().is_empty() || body.password.is_empty() {
         return fail_ai("请输入云端服务账号和密码");
     }
-    fail_ai("云端服务账号登录需要外呼云端 API，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    // Go `AnqiLogin`：先清空本地登录态，再请求云端
+    if let Err(err) = setting::save_json(pool, anqi::SETTING_KEY, &json!({})).await {
+        return failed(err);
+    }
+    let payload = json!({
+        "user_name": body.user_name.trim(),
+        "password": body.password,
+    });
+    let value = match anqi_cloud_post(pool, "/login", &payload).await {
+        Ok(value) => value,
+        Err(msg) => return fail_ai(msg),
+    };
+    // 落盘云端返回的账号信息 + 登录 / 校验时间
+    let data = value.get("data").cloned().unwrap_or_else(|| json!({}));
+    let now = chrono::Utc::now().timestamp();
+    let mut stored = data;
+    if let Value::Object(map) = &mut stored {
+        map.insert("login_time".to_string(), json!(now));
+        map.insert("check_time".to_string(), json!(now));
+    }
+    if let Err(err) = setting::save_json(pool, anqi::SETTING_KEY, &stored).await {
+        return failed(err);
+    }
+    match anqi::auth_info_get(pool).await {
+        Ok(info) => ok(info),
+        Err(err) => failed(err),
+    }
 }
 
 /// `POST /system/api/anqi/upload`
@@ -3769,24 +4365,45 @@ async fn manage_anqi_upload(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    // 先收文件（与 Go 一致先校验参数），再明确未实现
-    let mut has_file = false;
+    // 先收文件（Go `FormFile("file")`），再校验登录态后上传云端
+    let mut file_name = String::new();
+    let mut file_bytes: Option<Vec<u8>> = None;
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
                 if field.name() == Some("file") {
-                    has_file = true;
-                    let _ = field.bytes().await;
+                    let name = field.file_name().unwrap_or("upload.bin").to_string();
+                    match field.bytes().await {
+                        Ok(bytes) => {
+                            file_name = name;
+                            file_bytes = Some(bytes.to_vec());
+                        }
+                        Err(err) => return failed(err.into()),
+                    }
                 }
             }
             Ok(None) => break,
             Err(err) => return failed(err.into()),
         }
     }
-    if !has_file {
+    let Some(data) = file_bytes else {
         return fail_ai("请选择要上传的文件");
+    };
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(msg) = anqi_require_login(pool).await {
+        return fail_ai(msg);
     }
-    fail_ai("上传附件到云端服务需要外呼，尚未实现")
+    match anqi_cloud_upload(pool, &file_name, &data).await {
+        Ok(value) => Json(json!({
+            "code": 0,
+            "msg": "上传成功",
+            "data": value.get("data").cloned().unwrap_or(Value::Null),
+        }))
+        .into_response(),
+        Err(msg) => fail_ai(msg),
+    }
 }
 
 /// `POST /system/api/anqi/template/share`
@@ -3801,10 +4418,87 @@ async fn manage_anqi_template_share(
     if !body.is_object() {
         return fail_ai("请求格式错误");
     }
-    if body.get("package").and_then(Value::as_str).unwrap_or("").is_empty() {
+    let package = body
+        .get("package")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if package.is_empty() {
         return fail_ai("请提供模板包名 package");
     }
-    fail_ai("分享模板到云端服务需要外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(msg) = anqi_require_login(pool).await {
+        return fail_ai(msg);
+    }
+    let store = design_store(&state);
+    // 先确认模板存在并读出现有配置（Go `GetDesignInfo(package)`）
+    let info = match store.get(&package, true) {
+        Ok(info) => info,
+        Err(err) => return fail_ai(err.to_string()),
+    };
+    // Go 在 `auto_backup` 打开时先备份演示数据；本站没有对应的演示数据备份子能力，
+    // 这里跳过，分享流程本身不依赖备份结果。
+    let zip_data = match anqi_design_zip(&store, &package) {
+        Ok(data) => data,
+        Err(msg) => return fail_ai(msg),
+    };
+    // 上传模板包，拿到云端文件地址
+    let attachment = match anqi_cloud_upload(pool, &format!("{package}.zip"), &zip_data).await {
+        Ok(value) => value.get("data").cloned().unwrap_or(Value::Null),
+        Err(msg) => return fail_ai(msg),
+    };
+    let file_location = attachment
+        .get("file_location")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if file_location.is_empty() {
+        return fail_ai("云端模板包上传失败");
+    }
+    // 请求体原样透传，补上模板路径 / 类型 / 云端 ID（Go 写法）
+    let mut payload = body.clone();
+    if let Value::Object(map) = &mut payload {
+        map.insert("template_path".to_string(), json!(file_location));
+        map.insert("template_type".to_string(), json!(info.template_type));
+        map.insert("template_id".to_string(), json!(info.template_id));
+    }
+    let value = match anqi_cloud_post(pool, "/template/share", &payload).await {
+        Ok(value) => value,
+        Err(msg) => return fail_ai(msg),
+    };
+    // 回写云端返回的模板信息（Go `writeDesignInfo`）
+    if let Some(data) = value.get("data").filter(|data| data.is_object()) {
+        let mut updated = info.clone();
+        if let Some(v) = data.get("template_id").and_then(Value::as_i64) {
+            updated.template_id = v;
+        }
+        if let Some(v) = data.get("auth_id").and_then(Value::as_i64) {
+            updated.auth_id = v;
+        }
+        if let Some(v) = data.get("name").and_then(Value::as_str) {
+            updated.name = v.to_string();
+        }
+        if let Some(v) = data.get("version").and_then(Value::as_str) {
+            updated.version = v.to_string();
+        }
+        if let Some(v) = data.get("description").and_then(Value::as_str) {
+            updated.description = v.to_string();
+        }
+        if let Some(v) = data.get("author").and_then(Value::as_str) {
+            updated.author = v.to_string();
+        }
+        if let Some(v) = data.get("homepage").and_then(Value::as_str) {
+            updated.homepage = v.to_string();
+        }
+        if let Err(msg) = anqi_write_design_info(&store, &package, &updated) {
+            return fail_ai(msg);
+        }
+    }
+    ok_msg("提交成功")
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3825,7 +4519,45 @@ async fn manage_anqi_template_download(
     if body.template_id == 0 {
         return fail_ai("请提供要下载的模板 ID template_id");
     }
-    fail_ai("从云端服务下载模板需要外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    // 1) 向云端要下载地址
+    let value = match anqi_cloud_post(
+        pool,
+        "/template/download",
+        &json!({ "template_id": body.template_id }),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(msg) => return fail_ai(msg),
+    };
+    let url = value
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return fail_ai("读取模板下载地址失败");
+    }
+    // 2) 下载模板包
+    let request = rustcms_ext::http::Request::get(url.clone())
+        .with_timeout(std::time::Duration::from_secs(300));
+    let response = match rustcms_ext::http::send(&request).await {
+        Ok(response) => response,
+        Err(err) => return fail_ai(format!("下载模板包失败：{err}")),
+    };
+    if !response.is_success() {
+        return fail_ai(format!("下载模板包失败（HTTP {}）", response.status));
+    }
+    // 3) 解包落盘（Go `UploadDesignZip`）
+    let store = design_store(&state);
+    match anqi_extract_design_zip(&store, &response.body, &url) {
+        Ok(_package) => ok_msg("下载成功"),
+        Err(msg) => fail_ai(msg),
+    }
 }
 
 /// `POST /system/api/anqi/feedback`
@@ -3846,12 +4578,28 @@ async fn manage_anqi_feedback(
     if body.get("content").and_then(Value::as_str).unwrap_or("").is_empty() {
         return fail_ai("请填写反馈内容");
     }
-    fail_ai("提交反馈到云端服务需要外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(msg) = anqi_require_login(pool).await {
+        return fail_ai(msg);
+    }
+    // Go `AnqiSendFeedback`：补上版本 / 平台 / 域名后透传
+    let mut payload = body.clone();
+    if let Value::Object(map) = &mut payload {
+        map.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        map.insert("platform".to_string(), json!(std::env::consts::OS));
+        map.insert("domain".to_string(), json!(site_base_url(pool).await));
+    }
+    match anqi_cloud_post(pool, "/feedback", &payload).await {
+        Ok(_) => ok_msg("提交成功"),
+        Err(msg) => fail_ai(msg),
+    }
 }
 
 /// `POST /system/api/anqi/translate`
 ///
-/// 文档 / 草稿存在性是站内校验（真实做），翻译本身需要云端服务外呼。
+/// 云端翻译标题 / 摘要 / 关键词 / 正文，并回写文档或草稿。
 async fn manage_anqi_translate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3876,26 +4624,178 @@ async fn manage_anqi_translate(
     if to_language.is_empty() {
         return fail_ai("请提供目标语言 to_language");
     }
-    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archives WHERE id = ?")
-        .bind(id)
-        .fetch_one(pool)
+    // 取待翻译字段：先正式文档，再草稿（Go `GetArchiveByID` / `GetArchiveDraft`）
+    let archive_row: Option<(Option<String>, Option<String>, Option<String>)> =
+        match sqlx::query_as("SELECT title, description, keywords FROM archives WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(err) => return failed(err.into()),
+        };
+    let use_draft = archive_row.is_none();
+    let row = match archive_row {
+        Some(row) => row,
+        None => {
+            match sqlx::query_as(
+                "SELECT title, description, keywords FROM archive_drafts WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(Some(row)) => row,
+                Ok(None) => return fail_ai("文档不存在"),
+                Err(err) => return failed(err.into()),
+            }
+        }
+    };
+    let table = if use_draft { "archive_drafts" } else { "archives" };
+    let (title, description, keywords) = (
+        row.0.unwrap_or_default(),
+        row.1.unwrap_or_default(),
+        row.2.unwrap_or_default(),
+    );
+    let content = match archive::content(pool, id).await {
+        Ok(Some(content)) => content,
+        Ok(None) => return fail_ai("文档正文不存在"),
+        Err(err) => return failed(err),
+    };
+    // Go `AnqiTranslateString`：源语言取站点语言
+    let language = site_setting::get_section(pool, site_setting::SYSTEM)
         .await
-        .unwrap_or(0);
-    if exists == 0 {
-        let draft: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM archive_drafts WHERE id = ?")
+        .ok()
+        .and_then(|value| {
+            value
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "zh-CN".to_string());
+    let texts = vec![
+        title.clone(),
+        description.clone(),
+        keywords.clone(),
+        content.clone(),
+    ];
+    let payload = json!({
+        "text": texts,
+        "language": language,
+        "to_language": to_language,
+    });
+    let value = match anqi_cloud_post(pool, "/translate", &payload).await {
+        Ok(value) => value,
+        Err(msg) => return fail_ai(msg),
+    };
+    let translated: Vec<String> = value
+        .get("data")
+        .and_then(|data| data.get("text"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if translated.len() < 4 {
+        return fail_ai("翻译结果数量不足");
+    }
+    // 回写标题 / 摘要 / 关键词与正文（Go `AnqiTranslate` 的两处 Save）
+    if let Err(err) = sqlx::query(&format!(
+        "UPDATE {table} SET title = ?, description = ?, keywords = ? WHERE id = ?"
+    ))
+    .bind(&translated[0])
+    .bind(&translated[1])
+    .bind(&translated[2])
+    .bind(id)
+    .execute(pool)
+    .await
+    {
+        return failed(err.into());
+    }
+    if let Err(err) = sqlx::query("UPDATE archive_data SET content = ? WHERE id = ?")
+        .bind(&translated[3])
+        .bind(id)
+        .execute(pool)
+        .await
+    {
+        return failed(err.into());
+    }
+    anqi_add_translate_log(pool, &language, &to_language, &translated).await;
+    ok_msg("翻译完成")
+}
+
+/// 把伪原创结果写回文档（先试 `archives`，没有命中再试 `archive_drafts`）。
+async fn apply_pseudo_result(
+    pool: &sqlx::MySqlPool,
+    id: i64,
+    data: &Value,
+) -> anyhow::Result<()> {
+    let content = data.get("content").and_then(Value::as_str).unwrap_or("");
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let title = data
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let description = data
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| archive_write::summarize(content, 250));
+    let keywords = data
+        .get("keywords")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    for table in ["archives", "archive_drafts"] {
+        let affected = if title.is_empty() {
+            sqlx::query(&format!(
+                "UPDATE {table} SET description = ?, keywords = ?, has_pseudo = 1 WHERE id = ?"
+            ))
+            .bind(&description)
+            .bind(&keywords)
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(&format!(
+                "UPDATE {table} SET title = ?, description = ?, keywords = ?, has_pseudo = 1 WHERE id = ?"
+            ))
+            .bind(&title)
+            .bind(&description)
+            .bind(&keywords)
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+        };
+        if affected > 0 {
+            sqlx::query("UPDATE archive_data SET content = ? WHERE id = ?")
+                .bind(content)
                 .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(0);
-        if draft == 0 {
-            return fail_ai("文档不存在");
+                .execute(pool)
+                .await?;
+            return Ok(());
         }
     }
-    fail_ai("文档翻译需要云端服务翻译外呼，尚未实现")
+    Ok(())
 }
 
 /// `POST /system/api/anqi/ai/pseudo`
+///
+/// 取文档标题与正文提交云端 `/ai/pseudo`，随后后台轮询 `/ai/syncplan`，
+/// 完成后把改写结果写回文档（对齐 Go `AnqiAiPseudoArticle` 的云端分支）。
 async fn manage_anqi_ai_pseudo(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3911,26 +4811,92 @@ async fn manage_anqi_ai_pseudo(
     if id <= 0 {
         return fail_ai("请提供要伪原创的文档 ID");
     }
-    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archives WHERE id = ?")
+    let language = body
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("zh")
+        .to_string();
+
+    let title = match sqlx::query_scalar::<_, String>("SELECT title FROM archives WHERE id = ?")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .unwrap_or(0);
-    if exists == 0 {
-        let draft: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM archive_drafts WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(0);
-        if draft == 0 {
-            return fail_ai("文档不存在");
+    {
+        Ok(Some(title)) => title,
+        Ok(None) => {
+            match sqlx::query_scalar::<_, String>(
+                "SELECT title FROM archive_drafts WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(Some(title)) => title,
+                Ok(None) => return fail_ai("文档不存在"),
+                Err(err) => return failed(err.into()),
+            }
         }
+        Err(err) => return failed(err.into()),
+    };
+    let content = match archive::content(pool, id).await {
+        Ok(Some(content)) => content,
+        Ok(None) => return fail_ai("文档内容不存在"),
+        Err(err) => return failed(err),
+    };
+
+    let payload = json!({
+        "title": title,
+        "content": content,
+        "language": language,
+        "async": true,
+    });
+    let data = match anqi_cloud_post(pool, "/ai/pseudo", &payload).await {
+        Ok(value) => value.get("data").cloned().unwrap_or(Value::Null),
+        Err(msg) => return fail_ai(msg),
+    };
+    let req_id = data.get("req_id").and_then(Value::as_i64).unwrap_or(0);
+    if req_id <= 0 {
+        return fail_ai("云端未返回任务编号（req_id）");
     }
-    fail_ai("AI 伪原创需要云端服务 AI 外呼，尚未实现")
+
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        match anqi_ai_wait_plan(&pool, req_id, data).await {
+            Ok(result) => {
+                if let Err(err) = apply_pseudo_result(&pool, id, &result).await {
+                    tracing::warn!("AI 伪原创结果写回失败（文档 {id}）：{err:#}");
+                }
+            }
+            Err(err) => tracing::warn!("AI 伪原创失败（文档 {id}）：{err}"),
+        }
+    });
+    ok_msg("AI伪原创已加入生成计划")
+}
+
+/// 流式生成任务的内存态（等价 Go `AiStreamResults`，进程内、不落库）。
+#[derive(Debug, Default)]
+struct AnqiStreamEntry {
+    /// 尚未下发给前端的增量内容。
+    pending: String,
+    err: String,
+    finished: bool,
+}
+
+fn anqi_stream_store(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, AnqiStreamEntry>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, AnqiStreamEntry>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// `POST /system/api/anqi/ai/stream`
+///
+/// 提交云端 `/ai/stream` 并在后台读取 NDJSON 结果，立即返回 `stream_id`，
+/// 前端用 `/ai/stream/data` 轮询。注意：`ext::http` 会缓冲整个响应，
+/// 因此内容在上游完成后一次性可读，而不是逐 token 到达。
 async fn manage_anqi_ai_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3942,16 +4908,112 @@ async fn manage_anqi_ai_stream(
     if !body.is_object() {
         return fail_ai("请求格式错误");
     }
-    if body.get("title").and_then(Value::as_str).unwrap_or("").is_empty() {
+    let title = body
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() {
         return fail_ai("请提供关键词标题 title");
     }
-    fail_ai("AI 流式生成需要云端服务 AI 外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(msg) = ensure_anqi_bound(pool).await {
+        return fail_ai(msg);
+    }
+    let demand = body
+        .get("demand")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let language = body
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("zh")
+        .to_string();
+
+    let stream_id = format!("{}", chrono::Utc::now().timestamp_millis());
+    anqi_stream_store()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(stream_id.clone(), AnqiStreamEntry::default());
+
+    let task_id = stream_id.clone();
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let payload = json!({
+            "keyword": title,
+            "demand": demand,
+            "language": language,
+        });
+        let mut request =
+            rustcms_ext::http::Request::post(format!("{ANQI_API}/ai/stream"))
+                .with_json(payload)
+                .with_timeout(std::time::Duration::from_secs(300));
+        for (key, value) in anqi_cloud_headers(&pool).await {
+            request = request.with_header(key, value);
+        }
+
+        let response = match rustcms_ext::http::send(&request).await {
+            Ok(response) => response,
+            Err(err) => {
+                let mut store = anqi_stream_store().lock().unwrap_or_else(|err| err.into_inner());
+                if let Some(entry) = store.get_mut(&task_id) {
+                    entry.err = format!("AI 流式生成请求失败：{err}");
+                    entry.finished = true;
+                }
+                return;
+            }
+        };
+
+        let mut content = String::new();
+        let mut error = String::new();
+        if !response.is_success() {
+            error = format!("AI 流式生成失败（HTTP {}）", response.status);
+        } else {
+            for line in response.text().lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(line) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        error = "AI 流式生成返回异常".to_string();
+                        break;
+                    }
+                };
+                let code = value.get("code").and_then(Value::as_i64).unwrap_or(0);
+                if code != 0 {
+                    error = value
+                        .get("msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("AI 流式生成失败")
+                        .to_string();
+                    break;
+                }
+                content.push_str(value.get("data").and_then(Value::as_str).unwrap_or(""));
+            }
+        }
+
+        let mut store = anqi_stream_store().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(entry) = store.get_mut(&task_id) {
+            entry.pending = content;
+            entry.err = error;
+            entry.finished = true;
+        }
+    });
+    ok(stream_id)
 }
 
-/// `GET /system/api/anqi/ai/stream/data`
+/// `GET /system/api/anqi/ai/stream/data?stream_id=`
 ///
-/// 流式任务由 `/ai/stream` 产生（未实现），因此永远查不到任务 ——
-/// 与 Go 版对未知 stream_id 的行为一致：`content=""`、`finished=true`。
+/// 返回尚未下发的增量内容；任务结束后再查一次即得到 `msg="finished"`。
 async fn manage_anqi_ai_stream_data(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3960,8 +5022,27 @@ async fn manage_anqi_ai_stream_data(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    let _ = query.stream_id;
-    Json(json!({ "code": 0, "msg": "finished", "data": "" })).into_response()
+    let stream_id = query.stream_id.trim().to_string();
+    let mut store = anqi_stream_store().lock().unwrap_or_else(|err| err.into_inner());
+    let (content, error, finished) = match store.get_mut(&stream_id) {
+        Some(entry) => {
+            let content = std::mem::take(&mut entry.pending);
+            let error = std::mem::take(&mut entry.err);
+            (content, error, entry.finished)
+        }
+        // 未知 / 已清理的任务：与 Go 版一致，直接回 finished
+        None => (String::new(), String::new(), true),
+    };
+    if finished {
+        store.remove(&stream_id);
+    }
+    drop(store);
+
+    if !error.is_empty() {
+        return fail_ai(error);
+    }
+    let msg = if finished { "finished" } else { "" };
+    Json(json!({ "code": 0, "msg": msg, "data": content })).into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3972,20 +5053,202 @@ struct AnqiStreamDataQuery {
 
 // ── AI 对话（aiChat.go）──
 
+/// AI 对话请求体（对齐 Go 的 `AiChatRequest`）。
+#[derive(Debug, Deserialize, Default)]
+struct AiChatBody {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    session_id: String,
+}
+
+/// 取配置项字符串（兼容多个字段别名）。
+fn config_string(config: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| config.get(*key).and_then(Value::as_str))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 解析本次对话使用的接口：`custom:<下标>` 取站内配置，否则走官方云端。
+async fn resolve_ai_provider(
+    pool: &sqlx::MySqlPool,
+    model: &str,
+) -> Result<(String, String, String, u64, f64, u64), String> {
+    let model = model.trim();
+    if let Some(index) = model
+        .strip_prefix("custom:")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        let ai = anqi::ai_settings_get(pool)
+            .await
+            .map_err(|err| format!("读取 AI 配置失败：{err}"))?;
+        let config = ai
+            .get("configs")
+            .and_then(Value::as_array)
+            .and_then(|list| list.get(index))
+            .ok_or_else(|| "自定义 AI 接口配置不存在".to_string())?;
+        let base_url = config_string(config, &["base_url", "url"])
+            .ok_or_else(|| "自定义 AI 接口缺少 base_url".to_string())?;
+        let api_key = config_string(config, &["api_key", "token"])
+            .ok_or_else(|| "自定义 AI 接口缺少 api_key".to_string())?;
+        let model_name = config_string(config, &["model", "name"])
+            .ok_or_else(|| "自定义 AI 接口缺少 model".to_string())?;
+        let max_tokens = config
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096);
+        let temperature = config
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.7);
+        let timeout = config
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .unwrap_or(120);
+        return Ok((base_url, api_key, model_name, max_tokens, temperature, timeout));
+    }
+
+    let official = if model.is_empty() {
+        "anqi-flash"
+    } else if matches!(model, "anqi-flash" | "anqi-pro") {
+        model
+    } else {
+        return Err("官方模型只支持 anqi-flash / anqi-pro".to_string());
+    };
+    let info = anqi::auth_info_get(pool)
+        .await
+        .map_err(|err| format!("读取云端服务登录态失败：{err}"))?;
+    let token = info
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    ensure_anqi_bound(pool).await?;
+    Ok((
+        "https://auth.anqicms.com/auth/v1".to_string(),
+        token,
+        official.to_string(),
+        8192,
+        0.7,
+        300,
+    ))
+}
+
+/// 调用 OpenAI 兼容的 `/chat/completions`（非流式），返回助手回复文本。
+///
+/// 官方云端与 `custom:<下标>` 配置共用；`system_prompt` 供智能体注入策略。
+async fn ai_chat_complete(
+    pool: &sqlx::MySqlPool,
+    message: &str,
+    model: &str,
+    system_prompt: Option<&str>,
+) -> CloudResult<String> {
+    let (base_url, api_key, model, max_tokens, temperature, timeout) =
+        resolve_ai_provider(pool, model).await?;
+    let mut messages = Vec::new();
+    if let Some(prompt) = system_prompt.map(str::trim).filter(|value| !value.is_empty()) {
+        messages.push(json!({ "role": "system", "content": prompt }));
+    }
+    messages.push(json!({ "role": "user", "content": message }));
+
+    let link = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let payload = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": false,
+    });
+    let request = rustcms_ext::http::Request::post(link)
+        .with_header("authorization", format!("Bearer {api_key}"))
+        .with_header("content-type", "application/json")
+        .with_json(payload)
+        .with_timeout(std::time::Duration::from_secs(timeout));
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| {
+            tracing::warn!("AI 对话请求失败：{err:#}");
+            format!("AI 服务请求失败：{err}")
+        })?;
+    let value: Value = serde_json::from_str(&response.text()).unwrap_or(Value::Null);
+    if !response.is_success() {
+        let message = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("msg").and_then(Value::as_str))
+            .unwrap_or("AI 服务返回错误");
+        return Err(message.to_string());
+    }
+    let content = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if content.is_empty() {
+        return Err("AI 服务返回内容为空".to_string());
+    }
+    Ok(content)
+}
+
+/// 按项目现有 SSE 约定输出单块回复：`session` → `message` → `end`。
+fn ai_chat_sse(session_id: &str, content: &str) -> Response {
+    let mut body = String::new();
+    body.push_str(&format!("event: session\ndata: {session_id}\n\n"));
+    body.push_str(&format!(
+        "event: message\ndata: {}\n\n",
+        json!({ "v": content, "timestamp": chrono::Utc::now().timestamp() })
+    ));
+    body.push_str("event: end\ndata: [DONE]\n\n");
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// `POST /system/api/anqi/ai/chat`
 ///
-/// Rust 版未内置 LLM 对话服务（Go 的 AiSrv），等价于 Go 的
-/// `AiSrv == nil` 分支，明确告知。
+/// 调用 OpenAI 兼容的 `/chat/completions`（官方云端或 `custom:<下标>` 配置），
+/// 返回与 Go 版一致的最小 SSE：`session` → 单个 `message` 块 → `end`。
 async fn manage_ai_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(body): Json<AiChatBody>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    let _ = body;
-    fail_ai("AI 对话服务未实现（依赖 LLM 外呼）")
+    let message = if body.message.trim().is_empty() {
+        body.prompt.trim().to_string()
+    } else {
+        body.message.trim().to_string()
+    };
+    if message.is_empty() {
+        return fail_ai("message cannot be empty");
+    }
+    let Some(pool) = state.db() else {
+        return fail_ai("数据库未配置");
+    };
+    let session_id = if body.session_id.trim().is_empty() {
+        format!("session_{}", chrono::Utc::now().timestamp_millis())
+    } else {
+        body.session_id.trim().to_string()
+    };
+    let content = match ai_chat_complete(pool, &message, &body.model, None).await {
+        Ok(value) => value,
+        Err(err) => return fail_ai(err),
+    };
+    ai_chat_sse(&session_id, &content)
 }
 
 /// `POST /system/api/anqi/ai/chat/confirm`
@@ -4233,6 +5496,9 @@ async fn manage_ai_agent_logs(
 }
 
 /// `POST /system/api/anqi/ai/agents/:id/chat`
+///
+/// 与普通 AI 对话共用 `/chat/completions`，额外把智能体的策略与最近摘要
+/// 注入 system 提示，并用智能体自己的 `session_id` 回给前端。
 async fn manage_ai_agent_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4248,15 +5514,54 @@ async fn manage_ai_agent_chat(
     if agent_id == 0 {
         return fail_ai("ID无效");
     }
-    let message = body.get("message").and_then(Value::as_str).unwrap_or("");
-    if message.trim().is_empty() {
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("prompt").and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if message.is_empty() {
         return fail_ai("消息不能为空");
     }
-    match anqi::agent_exists(pool, agent_id).await {
-        Ok(true) => fail_ai("AI 对话服务未实现（依赖 LLM 外呼）"),
-        Ok(false) => fail_ai("智能体不存在"),
-        Err(err) => failed(err),
+    let agent = match anqi::agent_get(pool, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return fail_ai("智能体不存在"),
+        Err(err) => return failed(err),
+    };
+    let session_id = agent
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent_{agent_id}_{}", chrono::Utc::now().timestamp_millis()));
+    let strategy = agent
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let summary = agent
+        .get("last_summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut prompt = String::from("你是 AnQiCMS 的 AI 智能体，请按下面的执行策略完成用户任务。");
+    if !strategy.is_empty() {
+        prompt.push_str(&format!("\n执行策略：{strategy}"));
     }
+    if !summary.is_empty() {
+        prompt.push_str(&format!("\n最近一次执行摘要：{summary}"));
+    }
+
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let content = match ai_chat_complete(pool, &message, model, Some(&prompt)).await {
+        Ok(value) => value,
+        Err(err) => return fail_ai(err),
+    };
+    ai_chat_sse(&session_id, &content)
 }
 
 /// `GET /system/api/anqi/ai/health`
@@ -4277,8 +5582,6 @@ async fn manage_ai_chat_trace(State(state): State<AppState>, headers: HeaderMap)
     fail_ai("ai service not available")
 }
 
-// image/size/kind 等字段为对齐 Go 请求体而保留，未实现的外呼分支才会用到
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default)]
 struct AnqiImageBody {
     #[serde(default)]
@@ -4291,7 +5594,35 @@ struct AnqiImageBody {
     kind: i32,
 }
 
+/// 标准 Base64 编码（图生图需要把图片转成 base64 再提交云端）。
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// `POST /system/api/anqi/ai/image`
+///
+/// 文生图 / 图生图：`image` 支持远程 URL（会先下载再转 base64），也支持直接传
+/// base64；最终统一提交云端 `/ai/image`，返回云端生图记录。
 async fn manage_ai_image(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4303,11 +5634,41 @@ async fn manage_ai_image(
     if body.prompt.trim().is_empty() {
         return fail_ai("提示词不能为空");
     }
-    fail_ai("AI 生图需要云端服务外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+
+    let mut image = body.image.trim().to_string();
+    if image.starts_with("http://") || image.starts_with("https://") || image.starts_with("//") {
+        let url = if image.starts_with("//") {
+            format!("https:{image}")
+        } else {
+            image.clone()
+        };
+        let request = rustcms_ext::http::Request::get(url)
+            .with_timeout(std::time::Duration::from_secs(30));
+        let response = match rustcms_ext::http::send(&request).await {
+            Ok(response) => response,
+            Err(err) => return fail_ai(format!("下载参考图片失败：{err}")),
+        };
+        if !response.is_success() {
+            return fail_ai(format!("下载参考图片失败（HTTP {}）", response.status));
+        }
+        image = base64_encode(&response.body);
+    }
+
+    let payload = json!({
+        "image": image,
+        "prompt": body.prompt.trim(),
+        "size": body.size.trim(),
+        "type": body.kind,
+    });
+    match anqi_cloud_post(pool, "/ai/image", &payload).await {
+        Ok(value) => ok(value.get("data").cloned().unwrap_or(Value::Null)),
+        Err(msg) => fail_ai(msg),
+    }
 }
 
-// title/replace/replace_id 在未实现的下载分支才会用到
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default)]
 struct AnqiImageConfirmBody {
     #[serde(default)]
@@ -4322,10 +5683,98 @@ struct AnqiImageConfirmBody {
     replace_id: u32,
 }
 
+/// 保存下载到的图片：`replace_id > 0` 时覆盖原附件，否则按 md5 去重后落盘入库。
+async fn store_image_bytes(
+    pool: &sqlx::MySqlPool,
+    public_dir: &std::path::Path,
+    stem: &str,
+    ext: &str,
+    bytes: &[u8],
+    replace_id: u32,
+) -> CloudResult<()> {
+    let md5 = attachment::md5_hex(bytes);
+    let (width, height) = attachment::image_size(bytes);
+
+    if replace_id > 0 {
+        let existing = attachment::get(pool, replace_id)
+            .await
+            .map_err(|err| format!("读取原图片失败：{err}"))?
+            .ok_or_else(|| "要替换的图片资源不存在".to_string())?;
+        if let Ok(Some(other)) = attachment::get_by_md5(pool, &md5).await {
+            if other.id != existing.id {
+                return Err("替换失败，当前图片资源已存在".to_string());
+            }
+        }
+        let full = public_dir.join(&existing.file_location);
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| format!("创建目录失败：{err}"))?;
+        }
+        tokio::fs::write(&full, bytes)
+            .await
+            .map_err(|err| format!("保存图片失败：{err}"))?;
+        attachment::update(
+            pool,
+            existing.id,
+            None,
+            None,
+            Some(bytes.len() as u64),
+            Some(&md5),
+            Some(width),
+            Some(height),
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+
+    // 同一份图片只存一条
+    if let Ok(Some(_)) = attachment::get_by_md5(pool, &md5).await {
+        return Ok(());
+    }
+
+    let now = chrono::Local::now();
+    let subdir = format!("uploads/{}/{}", now.format("%Y%m"), now.format("%d"));
+    let mut base = if is_english_name(stem) {
+        stem.to_lowercase().replace("%20", "-").replace(' ', "-")
+    } else {
+        md5.get(8..24).unwrap_or(&md5).to_string()
+    };
+    if base.chars().count() > 200 {
+        base = base.chars().take(200).collect();
+    }
+    let file_location = format!("{subdir}/{base}{ext}");
+    let full = public_dir.join(&file_location);
+    if let Some(parent) = full.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| format!("创建目录失败：{err}"))?;
+    }
+    tokio::fs::write(&full, bytes)
+        .await
+        .map_err(|err| format!("保存图片失败：{err}"))?;
+    attachment::insert(
+        pool,
+        stem,
+        &file_location,
+        bytes.len() as u64,
+        &md5,
+        width,
+        height,
+        0,
+        1,
+        "",
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 /// `POST /system/api/anqi/ai/image/confirm`
 ///
-/// `action=0`（舍弃）是纯 no-op，真实可用；`action=1` 需要下载远端图片，
-/// 明确未实现。
+/// `action=1` 时下载远端图片并保存为附件（`replace` + `replace_id` 覆盖原图）。
 async fn manage_ai_image_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4334,13 +5783,88 @@ async fn manage_ai_image_confirm(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    if body.action == 1 {
-        if body.url.trim().is_empty() {
-            return fail_ai("请提供要保存的图片地址 url");
-        }
-        return fail_ai("保存图片需下载远端文件（需 HTTP 客户端），尚未实现");
+    if body.action != 1 {
+        return ok_msg("");
     }
-    ok_msg("")
+    let url = body.url.trim();
+    if url.is_empty() {
+        return fail_ai("请提供要保存的图片地址 url");
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+
+    let mut title = body.title.trim().to_string();
+    let mut replace_id = body.replace_id;
+    if body.replace && replace_id > 0 {
+        match attachment::get(pool, replace_id).await {
+            Ok(Some(existing)) => {
+                if title.is_empty() {
+                    title = existing.file_name.clone();
+                }
+            }
+            Ok(None) => return fail_ai("要替换的图片资源不存在"),
+            Err(err) => return failed(err),
+        }
+    } else {
+        replace_id = 0;
+    }
+    if title.is_empty() {
+        let path = url.split(|ch| ch == '?' || ch == '#').next().unwrap_or("");
+        let name = path.rsplit('/').next().unwrap_or("image");
+        title = name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .unwrap_or(name)
+            .to_string();
+    }
+    if title.trim().is_empty() {
+        title = "image".to_string();
+    }
+
+    let request = rustcms_ext::http::Request::get(url)
+        .with_header("referer", url)
+        .with_timeout(std::time::Duration::from_secs(15));
+    let response = match rustcms_ext::http::send(&request).await {
+        Ok(response) => response,
+        Err(err) => return fail_ai(format!("下载图片失败：{err}")),
+    };
+    if !response.is_success() {
+        return fail_ai(format!("下载图片失败（HTTP {}）", response.status));
+    }
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match content_type.as_str() {
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        _ => return fail_ai("不支持的图片格式（仅支持 jpg / png / gif / webp）"),
+    };
+    if response.body.is_empty() {
+        return fail_ai("下载的图片内容为空");
+    }
+
+    let public_dir = state.with_config(|config| config.public_dir());
+    match store_image_bytes(
+        pool,
+        &public_dir,
+        title.trim(),
+        ext,
+        &response.body,
+        replace_id,
+    )
+    .await
+    {
+        Ok(()) => ok_msg(""),
+        Err(msg) => fail_ai(msg),
+    }
 }
 
 /// `GET /system/api/anqi/ai/image/histories`
@@ -4370,7 +5894,23 @@ async fn manage_anqi_extract_keywords(
     if body.get("text").and_then(Value::as_str).unwrap_or("").is_empty() {
         return fail_ai("请提供要提取关键词的文本 text");
     }
-    fail_ai("关键词提取需要云端服务 AI 外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let payload = json!({
+        "text": body.get("text").cloned().unwrap_or(Value::Null),
+        "num": body.get("num").and_then(Value::as_i64).unwrap_or(0),
+    });
+    let value = match anqi_cloud_post(pool, "/extract/keywords", &payload).await {
+        Ok(value) => value,
+        Err(msg) => return fail_ai(msg),
+    };
+    Json(json!({
+        "code": 0,
+        "msg": "提交成功",
+        "data": value.get("data").cloned().unwrap_or(Value::Null),
+    }))
+    .into_response()
 }
 
 /// `POST /system/api/anqi/extract/description`
@@ -4385,7 +5925,27 @@ async fn manage_anqi_extract_description(
     if body.get("text").and_then(Value::as_str).unwrap_or("").is_empty() {
         return fail_ai("请提供要提取摘要的文本 text");
     }
-    fail_ai("摘要提取需要云端服务 AI 外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let payload = json!({
+        "text": body.get("text").cloned().unwrap_or(Value::Null),
+    });
+    let value = match anqi_cloud_post(pool, "/extract/summarize", &payload).await {
+        Ok(value) => value,
+        Err(msg) => return fail_ai(msg),
+    };
+    // Go 把云端返回的 []string 直接拼接成一段摘要
+    let summary = match value.get("data") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    };
+    Json(json!({ "code": 0, "msg": "提交成功", "data": summary })).into_response()
 }
 
 /// `POST /system/api/anqi/restart`
@@ -4393,7 +5953,25 @@ async fn manage_anqi_restart(State(state): State<AppState>, headers: HeaderMap) 
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail_ai("服务进程重启尚未实现（Rust 版无守护重启通道）")
+    // 方案 A：拉起同一可执行文件的新进程后退出（依赖外部守护 / 进程管理器接管）。
+    // 先让本次响应写完，再换进程，避免端口被旧进程占住。
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => return fail_ai(format!("读取可执行文件路径失败：{err}")),
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        match std::process::Command::new(&exe).args(&args).spawn() {
+            Ok(_) => tracing::info!("重启服务：已拉起新进程 {}", exe.display()),
+            Err(err) => {
+                tracing::error!("重启服务：拉起新进程失败：{err}");
+                return;
+            }
+        }
+        std::process::exit(0);
+    });
+    ok_msg("重启成功")
 }
 
 // ---------------------------- 站点设置 -------------------------------------
@@ -4515,9 +6093,102 @@ async fn manage_setting_content_save(
     write_setting_section(&state, &headers, site_setting::CONTENT, &body).await
 }
 
+/// 缩略图文件路径（与原图同目录，文件名前加 `thumb_`）。
+fn thumb_path_of(location: &str) -> String {
+    match location.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/thumb_{name}"),
+        None => format!("thumb_{location}"),
+    }
+}
+
+/// 后台批量重建附件缩略图（当前图片引擎支持 PNG/BMP）。
+async fn rebuild_all_thumbs(pool: sqlx::mysql::MySqlPool, public_dir: std::path::PathBuf) {
+    let content = site_setting::get_section(&pool, site_setting::CONTENT)
+        .await
+        .ok()
+        .unwrap_or_else(|| json!({}));
+    let thumb_width = content
+        .get("thumb_width")
+        .and_then(Value::as_u64)
+        .unwrap_or(250)
+        .clamp(1, 4096) as u32;
+    let thumb_height = content
+        .get("thumb_height")
+        .and_then(Value::as_u64)
+        .unwrap_or(250)
+        .clamp(1, 4096) as u32;
+    let crop = content
+        .get("thumb_crop")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    let mut last_id = 0u32;
+    loop {
+        let rows: Vec<(u32, String)> = match sqlx::query_as(
+            "SELECT id, file_location FROM attachments WHERE is_image = 1 AND `status` = 1 AND id > ? ORDER BY id ASC LIMIT 500",
+        )
+        .bind(last_id)
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => break,
+        };
+        if rows.is_empty() {
+            break;
+        }
+        last_id = rows.iter().map(|row| row.0).max().unwrap_or(last_id);
+
+        for (id, location) in rows {
+            let ext = file_ext(&location);
+            if !crate::models::titleimage::image_ops::supports_extension(&ext) {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(public_dir.join(&location)).await else {
+                continue;
+            };
+            let Ok(image) = crate::models::titleimage::image_ops::decode(&bytes) else {
+                continue;
+            };
+            let thumb = match crop {
+                0 => crate::models::titleimage::image_ops::resize_fit(
+                    &image,
+                    thumb_width,
+                    thumb_height,
+                ),
+                1 => crate::models::titleimage::image_ops::resize_contain(
+                    &image,
+                    thumb_width,
+                    thumb_height,
+                    [255, 255, 255, 255],
+                ),
+                _ => crate::models::titleimage::image_ops::resize_cover(
+                    &image,
+                    thumb_width,
+                    thumb_height,
+                ),
+            };
+            let Ok(encoded) = crate::models::titleimage::image_ops::encode(&thumb, &ext) else {
+                continue;
+            };
+            let thumb_path = thumb_path_of(&location);
+            let path = public_dir.join(&thumb_path);
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if tokio::fs::write(&path, encoded).await.is_err() {
+                continue;
+            }
+            let _ = sqlx::query("UPDATE attachments SET logo = ? WHERE id = ?")
+                .bind(&thumb_path)
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+    }
+}
+
 /// `POST /system/api/setting/thumb/rebuild`
-///
-/// 缩略图重建依赖图片处理库，本项目暂未实现，明确告知。
 async fn manage_setting_thumb_rebuild(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4525,7 +6196,15 @@ async fn manage_setting_thumb_rebuild(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("缩略图重建尚未实现（需图片处理库）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let public_dir = state.with_config(|config| config.public_dir());
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        rebuild_all_thumbs(pool, public_dir).await;
+    });
+    ok_msg("已提交，缩略图将在后台重建（当前引擎支持 PNG/BMP）")
 }
 
 /// `GET /system/api/setting/index`
@@ -4817,11 +6496,25 @@ async fn manage_setting_banner_delete(
 }
 
 /// `POST /system/api/setting/migratedb`
+///
+/// 对齐 Go `SettingMigrateDB`：先整库备份，再幂等补齐表结构。
 async fn manage_setting_migrate_db(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("数据库自动迁移尚未实现（Rust 侧不跑 GORM AutoMigrate）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let dir = backup_dir(&state);
+    match setting::migrate_db(pool, &dir).await {
+        Ok(report) => Json(json!({
+            "code": 0,
+            "msg": "数据库表结构已更新",
+            "data": report,
+        }))
+        .into_response(),
+        Err(err) => model_error(err),
+    }
 }
 
 /// `GET /system/api/setting/ai`
@@ -5130,11 +6823,33 @@ async fn manage_design_delete(
 }
 
 /// `POST /system/api/design/download`
-async fn manage_design_download(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// 把 `template/<package>` 与 `public/static/<package>` 打包为 zip，以附件返回。
+async fn manage_design_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DesignDataBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("模板打包下载尚未实现（需 zip 库）")
+    let package = body.package.unwrap_or_default();
+    let package = package.trim();
+    let data = match design::market::package_zip(&design_store(&state), package) {
+        Ok(data) => data,
+        Err(err) => return model_error(err),
+    };
+    (
+        [
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment;filename={package}.zip"),
+            ),
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+        ],
+        data,
+    )
+        .into_response()
 }
 
 /// `GET /system/api/design/upload/check?package=`
@@ -5161,28 +6876,144 @@ async fn manage_design_upload_check(
     }
 }
 
-/// `POST /system/api/design/upload`
-async fn manage_design_upload(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `POST /system/api/design/upload`（multipart：`file` + `cover`）
+///
+/// `cover = "cover"` 时覆盖同名模板，否则自动追加序号；解压时拒绝模板包内的
+/// 绝对路径与 `..`（见 `design::market::install_zip`）。
+async fn manage_design_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("模板包上传解压尚未实现（需 zip 库）")
+    let mut file_name = String::new();
+    let mut cover = String::new();
+    let mut bytes: Option<Vec<u8>> = None;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(err) => return failed(err.into()),
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" => {
+                file_name = field.file_name().unwrap_or_default().to_string();
+                match field.bytes().await {
+                    Ok(value) => bytes = Some(value.to_vec()),
+                    Err(err) => return failed(err.into()),
+                }
+            }
+            "cover" => cover = field.text().await.unwrap_or_default(),
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+    let Some(bytes) = bytes else {
+        return fail("请选择要上传的模板压缩包");
+    };
+    if file_name.is_empty() {
+        return fail("请选择要上传的模板压缩包");
+    }
+    match design::market::install_zip(&design_store(&state), &bytes, &file_name, cover.trim()) {
+        Ok(package) => Json(json!({
+            "code": 0,
+            "msg": "上传成功",
+            "data": { "package": package },
+        }))
+        .into_response(),
+        Err(err) => model_error(err),
+    }
+}
+
+/// 模板演示数据备份请求体。
+#[derive(Debug, Deserialize, Default)]
+struct DesignDataBody {
+    #[serde(default)]
+    package: Option<String>,
 }
 
 /// `POST /system/api/design/data/backup`
-async fn manage_design_data_backup(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn manage_design_data_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DesignDataBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("模板演示数据备份尚未实现（需备份模块）")
+    let package = body.package.unwrap_or_default();
+    let package = package.trim();
+    if !design::valid_package(package) {
+        return fail("模板包名不合法");
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let store = design_store(&state);
+    let public_dir = state.with_config(|config| config.public_dir());
+    match design::market::backup_data(&store, pool, package, &public_dir).await {
+        Ok(()) => ok_msg("数据备份成功"),
+        Err(err) => model_error(err),
+    }
+}
+
+/// 模板演示数据恢复请求体。
+///
+/// 对齐 Go `request.DesignDataRequest`：`auto_cleanup` 为真时先自动备份整站数据，
+/// 再清空现有数据；`auto_backup` 单独为真时只备份。
+#[derive(Debug, Deserialize, Default)]
+struct DesignDataRestoreBody {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    auto_backup: bool,
+    #[serde(default)]
+    auto_cleanup: bool,
 }
 
 /// `POST /system/api/design/data/restore`
-async fn manage_design_data_restore(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn manage_design_data_restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DesignDataRestoreBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("模板演示数据初始化尚未实现（需备份模块）")
+    let package = body.package.unwrap_or_default();
+    let package = package.trim();
+    if !design::valid_package(package) {
+        return fail("模板包名不合法");
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let store = design_store(&state);
+    let public_dir = state.with_config(|config| config.public_dir());
+
+    if body.auto_backup || body.auto_cleanup {
+        if let Err(err) = backup::new_task("backup") {
+            return model_error(err);
+        }
+        if let Err(err) = backup::dump(pool, &backup_dir(&state)).await {
+            backup::finish_status("backup", format!("{err}"));
+            return model_error(err);
+        }
+        backup::finish_status("backup", "备份完成");
+    }
+    if body.auto_cleanup {
+        if let Err(err) = backup::cleanup(pool, &public_dir, false).await {
+            return model_error(err);
+        }
+    }
+    match design::market::restore_data(&store, pool, package, &public_dir).await {
+        Ok(()) => ok_msg("数据初始化成功"),
+        Err(err) => model_error(err),
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -5524,20 +7355,242 @@ async fn manage_version_env(State(state): State<AppState>, headers: HeaderMap) -
     }))
 }
 
+/// 按 `.` 分段比较版本号（对齐 Go `library.VersionCompare`）。
+fn version_compare(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let segments = |text: &str| -> Vec<i64> {
+        text.trim()
+            .trim_start_matches(['v', 'V'])
+            .split(|ch: char| !ch.is_ascii_digit())
+            .map(|item| item.parse::<i64>().unwrap_or(0))
+            .collect()
+    };
+    let left = segments(left);
+    let right = segments(right);
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        match a.cmp(&b) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    Ordering::Equal
+}
+
 /// `GET /system/api/version/check`
+///
+/// 对齐 Go 版 `CheckVersion`：请求官方 `version.json`，比对当前版本；
+/// 外呼失败时按「已是最新版本」返回（前端不会因此报错）。
 async fn manage_version_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("在线版本检查尚未实现（需外呼官方接口）")
+
+    // 与 Go 的 runtime.GOOS / runtime.GOARCH 口径保持一致
+    let goos = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let goarch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        other => other,
+    };
+    let version_type = if statistic::TRIAL { "trial" } else { "" };
+    let url = format!(
+        "https://www.anqicms.com/downloads/version.json?goos={goos}&goarch={goarch}&type={version_type}"
+    );
+    let request = rustcms_ext::http::Request::get(url)
+        .with_timeout(std::time::Duration::from_secs(10));
+    let response = match rustcms_ext::http::send(&request).await {
+        Ok(response) if response.is_success() => response,
+        _ => return ok_msg("当前已是最新版本"),
+    };
+    let remote: Value = match serde_json::from_str(&response.text()) {
+        Ok(value) => value,
+        Err(_) => return ok_msg("当前已是最新版本"),
+    };
+
+    let remote_version = remote.get("version").and_then(Value::as_str).unwrap_or("");
+    if version_compare(remote_version, statistic::VERSION).is_gt() {
+        return Json(json!({
+            "code": 0,
+            "msg": "发现新版本",
+            "data": remote,
+        }))
+        .into_response();
+    }
+
+    let trial_version = remote
+        .get("trial_version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !trial_version.is_empty() && version_compare(trial_version, statistic::VERSION).is_gt() {
+        let mut data = remote.clone();
+        if let Value::Object(map) = &mut data {
+            map.insert("trial".into(), json!(true));
+            map.insert("version".into(), json!(trial_version));
+            map.insert(
+                "description".into(),
+                remote.get("trial_description").cloned().unwrap_or(json!("")),
+            );
+        }
+        return Json(json!({
+            "code": 0,
+            "msg": "发现新试用版本",
+            "data": data,
+        }))
+        .into_response();
+    }
+
+    ok_msg("当前已是最新版本")
+}
+
+/// 在线升级请求体（对齐 Go 的 `request.VersionData`）。
+#[derive(Debug, Deserialize, Default)]
+struct VersionUpgradeBody {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    trial: bool,
+    #[serde(default)]
+    trial_version: String,
+}
+
+/// 解压升级包并覆盖程序目录。
+///
+/// 与 Go 一致：跳过模板 / 静态资源 / 脚本 / favicon，主程序先写 `.new`，
+/// 再把正在运行的程序改名备份后替换；包内路径拒绝 `..` 与绝对路径。
+fn install_upgrade_zip(body: &[u8], exec_dir: &std::path::Path) -> Result<(), ModelError> {
+    let archive = rustcms_ext::packer::ZipArchive::open(body.to_vec())
+        .map_err(|err| ModelError::invalid(format!("升级包解压失败：{err}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|err| ModelError::invalid(format!("取程序路径失败：{err}")))?;
+    let exe_name = exe
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "rustcms".to_string());
+    let exe_path = exec_dir.join(&exe_name);
+    let new_exe_path = exec_dir.join(format!("{exe_name}.new"));
+
+    for entry in archive.entries() {
+        if entry.is_dir {
+            continue;
+        }
+        let name = entry.name.replace('\\', "/");
+        if name.contains("template/")
+            || name.contains("static/")
+            || name.contains(".sh")
+            || name.contains(".bat")
+            || name.contains("favicon.ico")
+        {
+            continue;
+        }
+        // 防路径穿越：拒绝绝对路径、盘符与上级目录
+        if name.starts_with('/')
+            || name.starts_with('.')
+            || name.contains(':')
+            || name.split('/').any(|segment| segment == "..")
+        {
+            continue;
+        }
+        let target = if name == exe_name {
+            new_exe_path.clone()
+        } else {
+            exec_dir.join(&name)
+        };
+        let Ok(bytes) = archive.read_entry(entry) else {
+            continue;
+        };
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&target, bytes);
+        if name == exe_name {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    // 替换主程序：先备份旧程序，失败时回滚
+    let old_exe_path = exec_dir.join(format!("{exe_name}.old"));
+    let _ = std::fs::remove_file(&old_exe_path);
+    if new_exe_path.exists() && std::fs::rename(&exe_path, &old_exe_path).is_ok() {
+        if std::fs::rename(&new_exe_path, &exe_path).is_ok() {
+            let _ = std::fs::remove_file(&old_exe_path);
+        } else {
+            let _ = std::fs::rename(&old_exe_path, &exe_path);
+        }
+    }
+    Ok(())
 }
 
 /// `POST /system/api/version/upgrade`
-async fn manage_version_upgrade(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// 从官方下载站按平台 / 架构拼接安装包地址，下载 zip 后覆盖程序目录。
+async fn manage_version_upgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<VersionUpgradeBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("在线升级尚未实现（需下载 + 覆盖二进制）")
+    let version = if body.trial {
+        body.trial_version.trim()
+    } else {
+        body.version.trim()
+    };
+    if version.is_empty() {
+        return fail("缺少目标版本号");
+    }
+
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        other => other,
+    };
+    let link = if statistic::TRIAL {
+        format!("https://www.anqicms.com/downloads/anqicms-trial-{os}-{arch}-v{version}.zip")
+    } else {
+        format!("https://www.anqicms.com/downloads/anqicms-{os}-{arch}-v{version}.zip")
+    };
+
+    let request = rustcms_ext::http::Request::get(link)
+        .with_timeout(std::time::Duration::from_secs(600));
+    let response = match rustcms_ext::http::send(&request).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!("下载升级包失败：{err:#}");
+            return fail("版本更新失败");
+        }
+    };
+    if !response.is_success() || response.body.is_empty() {
+        return fail("版本更新失败");
+    }
+
+    let exec_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+    {
+        Some(dir) => dir,
+        None => return fail("版本更新失败"),
+    };
+    match install_upgrade_zip(&response.body, &exec_dir) {
+        Ok(()) => ok_msg("系统版本已升级"),
+        Err(err) => model_error(err),
+    }
 }
 
 /// `POST /system/api/version/upload-upgrade`
@@ -5723,12 +7776,35 @@ async fn manage_website_delete(
     }
 }
 
+/// 多站点切换登录请求体。
+#[derive(Debug, Deserialize, Default)]
+struct WebsiteLoginBody {
+    #[serde(default)]
+    site_id: u32,
+}
+
 /// `POST /system/api/website/login`
-async fn manage_website_login(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// 生成带一次性令牌的跳转链接：默认站点直接用当前连接池，子站点用其自身数据库。
+async fn manage_website_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WebsiteLoginBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("多站点切换登录尚未实现（当前为单连接池架构）")
+    if body.site_id == 0 {
+        return fail("站点不存在");
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = state.with_config(|config| config.clone());
+    match website::login_sub_site(pool, &config, body.site_id).await {
+        Ok(link) => ok(link),
+        Err(err) => model_error(err),
+    }
 }
 
 /// `GET /system/api/siteinfo`
@@ -5971,12 +8047,22 @@ async fn manage_link_delete(
 
 /// `POST /system/api/plugin/link/check`
 ///
-/// 回链检查要抓取对方页面，本项目暂无 HTTP 客户端。
-async fn manage_link_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// 抓取对方页面，检查是否回链本站（对齐 Go `PluginLinkCheck`）。
+async fn manage_link_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<IdQuery>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("友情链接回链检查尚未实现（需 HTTP 客户端）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    match link::check(pool, body.id).await {
+        Ok(item) => ok(item),
+        Err(err) => model_error(err),
+    }
 }
 
 // ---------------------------- 关键词 ---------------------------------------
@@ -7072,11 +9158,20 @@ async fn manage_transfer_download(
 }
 
 /// `POST /system/api/plugin/transfer/create`
-async fn manage_transfer_create(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// 校验迁移参数并请求旧站 `a=config` 确认客户端文件可用（对齐 Go `CreateTransferTask`）。
+async fn manage_transfer_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<transfer::TransferTask>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("数据迁移需要 HTTP 客户端拉取远端数据，尚未实现")
+    match transfer::create(body).await {
+        Ok(task) => ok(task),
+        Err(err) => model_error(err),
+    }
 }
 
 /// `POST /system/api/plugin/transfer/modules`
@@ -7239,11 +9334,19 @@ async fn manage_multilang_site_remove(
 async fn manage_multilang_site_sync(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Json(input): Json<multilang::SiteSyncInput>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("多语言内容同步尚未实现（需跨站点复制 + 翻译外呼）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let mysql = state.with_config(|config| config.mysql.clone());
+    match multilang::site_sync(pool, &mysql, input.id, input.focus).await {
+        Ok(report) => Json(json!({ "code": 0, "msg": "同步完成", "data": report })).into_response(),
+        Err(err) => model_error(err),
+    }
 }
 
 /// `GET /system/api/plugin/multilang/site/sync/status`
@@ -7603,6 +9706,204 @@ async fn manage_llms_setting_save(
     }
 }
 
+// ---------------------------- 图片预览公共工具 -----------------------------
+
+/// 读 `public` 下的静态资源；路径含 `..` 或读取失败时返回 `None`。
+async fn read_public_asset(public_dir: &std::path::Path, relative: &str) -> Option<Vec<u8>> {
+    let relative = relative.trim().trim_start_matches('/');
+    if relative.is_empty() || relative.contains("..") {
+        return None;
+    }
+    tokio::fs::read(public_dir.join(relative)).await.ok()
+}
+
+/// 取小写扩展名（不含点）。
+fn file_ext(relative: &str) -> String {
+    relative
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// 按扩展名推断图片 MIME。
+fn image_mime_of(relative: &str) -> &'static str {
+    match file_ext(relative).as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 基础 base64 编码（不引入新依赖）。
+fn image_base64(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let bits = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((bits >> 18) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((bits >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(bits & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// SVG 文本转义。
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// 校验并规范化 `#rrggbb` 颜色；非法时回落到默认值。
+fn hex_color_or(raw: &str, default: &str) -> String {
+    let value = raw.trim();
+    let valid = value.len() == 7
+        && value.starts_with('#')
+        && value[1..].chars().all(|ch| ch.is_ascii_hexdigit());
+    if valid {
+        value.to_ascii_lowercase()
+    } else {
+        default.to_string()
+    }
+}
+
+/// 按估算字宽折行（中文按 1 个字号，ASCII 按 0.5 个字号）。
+fn wrap_title_text(text: &str, size: usize, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+            continue;
+        }
+        let advance = if ch.is_ascii() {
+            (size / 2).max(1)
+        } else {
+            size
+        };
+        if used + advance > max_width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(ch);
+        used += advance;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// 标题的 32 位数字摘要（对齐 Go `sumTitle`）。
+fn titleimage_title_sum(title: &str) -> String {
+    attachment::md5_hex(title.as_bytes())
+        .bytes()
+        .map(|byte| char::from(if byte > 57 { byte - 49 } else { byte }))
+        .collect()
+}
+
+/// 无背景图时按标题生成深色背景（对齐 Go `RandColor` / `RandDeepColor`）。
+fn titleimage_bg_color(title: &str) -> String {
+    let sum = titleimage_title_sum(title);
+    let head: i64 = sum.get(0..9).and_then(|part| part.parse().ok()).unwrap_or(0);
+    let tail: i64 = sum
+        .get(22..31)
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    let red = head % 255;
+    let green = (head / 1000) % 255;
+    let blue = if red + green > 400 {
+        0
+    } else {
+        (400 - red - green).min(255)
+    };
+    let increase = 30 + tail % 255;
+    let red = (red - increase).abs().min(255);
+    let green = (green - increase).abs().min(255);
+    let blue = (blue - increase).abs().min(255);
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+/// 背景噪声（对应 Go 的 `Noise` 开关）。
+fn titleimage_noise(title: &str, width: u32, height: u32) -> String {
+    let sum = titleimage_title_sum(title);
+    let bytes = sum.as_bytes();
+    let mut out = String::new();
+    for index in 0..24usize {
+        let a = bytes[(index * 5) % bytes.len()] as u32;
+        let b = bytes[(index * 7 + 3) % bytes.len()] as u32;
+        let c = bytes[(index * 11 + 5) % bytes.len()] as u32;
+        let x = if width > 8 { a % (width - 8) } else { 0 };
+        let y = if height > 8 { b % (height - 8) } else { 0 };
+        out.push_str(&format!(
+            r##"<rect x="{x}" y="{y}" width="8" height="8" fill="#{:02x}{:02x}{:02x}" opacity="0.35"/>"##,
+            c * 8 % 256,
+            a * 8 % 256,
+            b * 8 % 256
+        ));
+    }
+    out
+}
+
+/// 水印素材等比缩放到不超过 `max_width × max_height`。
+fn fit_mark(source_width: u32, source_height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    if source_width == 0 || source_height == 0 {
+        return (max_width, max_height);
+    }
+    let scale = (max_width as f64 / source_width as f64)
+        .min(max_height as f64 / source_height as f64);
+    (
+        ((source_width as f64 * scale).round() as u32).max(1),
+        ((source_height as f64 * scale).round() as u32).max(1),
+    )
+}
+
+/// 水印位置：5 居中、1 左上、3 右上、7 左下，其它按右下。
+fn watermark_position(
+    position: i64,
+    canvas_width: u32,
+    canvas_height: u32,
+    width: u32,
+    height: u32,
+    edge: u32,
+) -> (i64, i64) {
+    let right = canvas_width as i64 - edge as i64 - width as i64;
+    let bottom = canvas_height as i64 - edge as i64 - height as i64;
+    match position {
+        5 => (
+            (canvas_width.saturating_sub(width) / 2) as i64,
+            (canvas_height.saturating_sub(height) / 2) as i64,
+        ),
+        1 => (edge as i64, edge as i64),
+        3 => (right, edge as i64),
+        7 => (edge as i64, bottom),
+        _ => (right, bottom),
+    }
+}
+
 // ---------------------------- 标题生成图片 ---------------------------------
 
 /// `GET /system/api/plugin/titleimage/config`
@@ -7643,15 +9944,174 @@ async fn manage_titleimage_config_save(
     }
 }
 
+/// 标题图片预览的查询参数。
+#[derive(Debug, Deserialize, Default)]
+struct TitleImagePreviewQuery {
+    /// 预览文字；缺省时使用欢迎语。
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// 渲染标题图片 SVG（预览与批量生成共用）。
+fn render_titleimage_svg(
+    config: &Value,
+    text: &str,
+    font_data: Option<&Vec<u8>>,
+    background: Option<(&str, &[u8])>,
+) -> String {
+    let width = config
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or(800)
+        .clamp(1, 4096) as u32;
+    let height = config
+        .get("height")
+        .and_then(Value::as_u64)
+        .unwrap_or(600)
+        .clamp(1, 4096) as u32;
+    let font_size = config
+        .get("font_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(32)
+        .clamp(8, 200) as usize;
+    let font_color = hex_color_or(
+        config.get("font_color").and_then(Value::as_str).unwrap_or(""),
+        "#ffffff",
+    );
+    let font_bg_color = hex_color_or(
+        config
+            .get("font_bg_color")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "",
+    );
+    let noise = config.get("noise").and_then(Value::as_bool).unwrap_or(false);
+
+    let mut svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#
+    );
+    if let Some(bytes) = font_data {
+        svg.push_str(&format!(
+            r#"<defs><style>@font-face{{font-family:'TitleImageFont';src:url(data:font/ttf;base64,{}) format('truetype');}}</style></defs>"#,
+            image_base64(bytes)
+        ));
+    }
+    match background {
+        Some((relative, bytes)) => {
+            svg.push_str(&format!(
+                r#"<image x="0" y="0" width="{width}" height="{height}" preserveAspectRatio="xMidYMid slice" href="data:{};base64,{}"/>"#,
+                image_mime_of(relative),
+                image_base64(bytes)
+            ));
+        }
+        None => {
+            let bg_color = titleimage_bg_color(text);
+            svg.push_str(&format!(
+                r#"<rect x="0" y="0" width="{width}" height="{height}" fill="{bg_color}"/>"#
+            ));
+            if noise {
+                svg.push_str(&titleimage_noise(text, width, height));
+            }
+        }
+    }
+
+    // 与 Go `drawTitle` 一致：按文字数量自适应字号，超宽自动折行并居中。
+    let max_text_width = (width.saturating_sub(100) as usize).max(1);
+    let real_size = (max_text_width / text.chars().count().max(1))
+        .clamp(font_size.min(100).max(1), 100);
+    let lines = wrap_title_text(text, real_size, max_text_width);
+    let line_count = lines.len() as i64;
+    let start_y = height as i64 / 2
+        - ((real_size as f64 / 1.5) as i64
+            + ((line_count - 1) as f64 * real_size as f64 * 1.6) as i64 / 2)
+        + real_size as i64;
+
+    if !font_bg_color.is_empty() {
+        let bg_y = start_y - real_size as i64 - real_size as i64 / 2;
+        let bg_y1 = start_y
+            + (real_size as f64 * 1.6 * (line_count - 1) as f64) as i64
+            + (real_size as f64 * 1.6 / 2.0) as i64;
+        let bg_height = (bg_y1 - bg_y).max(1);
+        svg.push_str(&format!(
+            r#"<rect x="0" y="{bg_y}" width="{width}" height="{bg_height}" fill="{font_bg_color}"/>"#
+        ));
+    }
+
+    let font_family = if font_data.is_some() {
+        "TitleImageFont, sans-serif"
+    } else {
+        "sans-serif"
+    };
+    for (index, line) in lines.iter().enumerate() {
+        let y = start_y + (index as f64 * 1.6 * real_size as f64) as i64;
+        svg.push_str(&format!(
+            r#"<text x="{}" y="{y}" fill="{font_color}" font-size="{real_size}" font-family="{font_family}" text-anchor="middle">{}</text>"#,
+            width / 2,
+            xml_escape(line)
+        ));
+    }
+    svg.push_str("</svg>");
+    svg
+}
+
 /// `GET /system/api/plugin/titleimage/preview`
+///
+/// 对齐 Go 版 `PluginTitleImagePreview`：按当前配置生成一张可直接查看的
+/// `data:image/svg+xml;base64,` 图片（内嵌字体、背景图、噪声）。
 async fn manage_titleimage_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<TitleImagePreviewQuery>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("标题图片预览尚未实现（需图片渲染库）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = match titleimage::config_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    let public_dir = state.with_config(|config| config.public_dir());
+    let text = query
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("欢迎使用安企CMS")
+        .to_string();
+
+    // 字体资源（可选）；存在时以 @font-face 内嵌，保证预览与生成效果一致。
+    let font_path = config.get("font_path").and_then(Value::as_str).unwrap_or("");
+    let font_data = read_public_asset(&public_dir, font_path).await;
+
+    // 背景图（可选）；与 Go 版本一致，多张时随机取一张。
+    let mut background = None;
+    if let Some(items) = config.get("bg_images").and_then(Value::as_array) {
+        if !items.is_empty() {
+            use rand::Rng;
+            let index = rand::thread_rng().gen_range(0..items.len());
+            let relative = items[index].as_str().unwrap_or("");
+            background = read_public_asset(&public_dir, relative)
+                .await
+                .map(|bytes| (relative.to_string(), bytes));
+        }
+    }
+
+    let svg = render_titleimage_svg(
+        &config,
+        &text,
+        font_data.as_ref(),
+        background
+            .as_ref()
+            .map(|(relative, bytes)| (relative.as_str(), bytes.as_slice())),
+    );
+
+    ok(json!(format!(
+        "data:image/svg+xml;base64,{}",
+        image_base64(svg.as_bytes())
+    )))
 }
 
 /// `POST /system/api/plugin/titleimage/upload`（multipart：`name` + `file`）
@@ -7716,6 +10176,88 @@ async fn manage_titleimage_upload(
     ok(json!(path))
 }
 
+/// 后台批量生成标题图片：为无图文档生成 SVG 并写回 `images`。
+async fn generate_all_title_images(pool: sqlx::mysql::MySqlPool, public_dir: std::path::PathBuf) {
+    let Ok(config) = titleimage::config_get(&pool).await else {
+        return;
+    };
+    let font_path = config.get("font_path").and_then(Value::as_str).unwrap_or("");
+    let font_data = read_public_asset(&public_dir, font_path).await;
+    let bg_images: Vec<String> = config
+        .get("bg_images")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut last_id = 0i64;
+    loop {
+        let rows: Vec<(i64, String, Option<String>)> = match sqlx::query_as(
+            "SELECT id, title, images FROM archives WHERE id > ? ORDER BY id ASC LIMIT 500",
+        )
+        .bind(last_id)
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => break,
+        };
+        if rows.is_empty() {
+            break;
+        }
+        last_id = rows.iter().map(|row| row.0).max().unwrap_or(last_id);
+
+        for (id, title, images) in rows {
+            if !json_string_list(images.as_deref()).is_empty() || title.trim().is_empty() {
+                continue;
+            }
+            let background = if bg_images.is_empty() {
+                None
+            } else {
+                use rand::Rng;
+                let index = rand::thread_rng().gen_range(0..bg_images.len());
+                read_public_asset(&public_dir, &bg_images[index])
+                    .await
+                    .map(|bytes| (bg_images[index].clone(), bytes))
+            };
+            let svg = render_titleimage_svg(
+                &config,
+                &title,
+                font_data.as_ref(),
+                background
+                    .as_ref()
+                    .map(|(relative, bytes)| (relative.as_str(), bytes.as_slice())),
+            );
+            let relative = format!(
+                "uploads/titleimage/generated/{}.svg",
+                attachment::md5_hex(title.as_bytes())
+            );
+            let path = public_dir.join(&relative);
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if tokio::fs::write(&path, svg.as_bytes()).await.is_err() {
+                continue;
+            }
+
+            let mut list = json_string_list(images.as_deref());
+            if !list.contains(&relative) {
+                list.push(relative);
+            }
+            let images_json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+            let _ = sqlx::query("UPDATE archives SET images = ? WHERE id = ?")
+                .bind(images_json)
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+    }
+}
+
 /// `POST /system/api/plugin/titleimage/generate`
 async fn manage_titleimage_generate(
     State(state): State<AppState>,
@@ -7724,7 +10266,15 @@ async fn manage_titleimage_generate(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("标题图片批量生成尚未实现（需图片渲染库）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let public_dir = state.with_config(|config| config.public_dir());
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        generate_all_title_images(pool, public_dir).await;
+    });
+    ok_msg("已提交，标题图片将在后台生成")
 }
 
 // ---------------------------- 敏感词 ---------------------------------------
@@ -7798,11 +10348,19 @@ async fn manage_sensitive_check(
 }
 
 /// `POST /system/api/setting/sensitive/sync`
+///
+/// 从云端同步敏感词，成功且带回非空列表时整份覆盖本地配置。
 async fn manage_sensitive_sync(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("从云端同步敏感词需要外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    match sensitive::sync_from_cloud(pool).await {
+        Ok(count) => ok_msg(format!("同步完成，共 {count} 条敏感词")),
+        Err(err) => model_error(err),
+    }
 }
 
 // ---------------------------- 评论 -----------------------------------------
@@ -8307,12 +10865,211 @@ async fn manage_subscriber_delete(
     }
 }
 
+/// 订阅群发任务状态（后台按 job_id 查询）。
+#[derive(Debug, Clone, Serialize)]
+struct SubscriberSendJob {
+    job_id: String,
+    finished: bool,
+    total: i64,
+    sent: i64,
+    failed: i64,
+    percent: i32,
+    message: String,
+    created_time: i64,
+}
+
+/// 进程内任务表（对齐备份任务的做法：进度只保存在进程内存里）。
+fn subscriber_send_jobs(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, SubscriberSendJob>> {
+    static JOBS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, SubscriberSendJob>>,
+    > = std::sync::OnceLock::new();
+    JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 新建任务；任务表超过 50 条时清理最早结束的一条。
+fn subscriber_send_job_create(job: SubscriberSendJob) {
+    let mut jobs = subscriber_send_jobs()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if jobs.len() >= 50 {
+        let oldest = jobs
+            .iter()
+            .filter(|(_, item)| item.finished)
+            .min_by_key(|(_, item)| item.created_time)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            jobs.remove(&key);
+        }
+    }
+    jobs.insert(job.job_id.clone(), job);
+}
+
+/// 更新任务进度（任务已被清理时忽略）。
+fn subscriber_send_job_update(job_id: &str, update: impl FnOnce(&mut SubscriberSendJob)) {
+    let mut jobs = subscriber_send_jobs()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(job) = jobs.get_mut(job_id) {
+        update(job);
+    }
+}
+
+/// 读取任务状态。
+fn subscriber_send_job_get(job_id: &str) -> Option<SubscriberSendJob> {
+    let jobs = subscriber_send_jobs()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    jobs.get(job_id).cloned()
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SubscriberSendBody {
+    #[serde(default, alias = "categoryId")]
+    category_id: i64,
+    #[serde(default, alias = "title")]
+    subject: String,
+    #[serde(default)]
+    content: String,
+}
+
 /// `POST /system/api/plugin/subscriber/send`
-async fn manage_subscriber_send(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// 按分类（category_id=0 表示全部已确认订阅用户）异步群发，立即返回 job_id，
+/// 进度通过 `GET /plugin/subscriber/send/status?job_id=` 查询。
+async fn manage_subscriber_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SubscriberSendBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("订阅群发需要 SMTP 客户端，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let subject = body.subject.trim().to_string();
+    let content = body.content.trim().to_string();
+    if subject.is_empty() {
+        return fail("请填写邮件标题");
+    }
+    if content.is_empty() {
+        return fail("请填写邮件内容");
+    }
+    let config = match sendmail::config_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    let Some(account) = sendmail_smtp_account(&config) else {
+        return fail("请先设置邮件发送账户");
+    };
+
+    // 只群发给已确认（status=1）的订阅用户。
+    let sql = if body.category_id > 0 {
+        "SELECT email FROM subscribers WHERE status = 1 AND category_id = ? ORDER BY id ASC"
+    } else {
+        "SELECT email FROM subscribers WHERE status = 1 ORDER BY id ASC"
+    };
+    let mut query = sqlx::query_scalar::<_, String>(sql);
+    if body.category_id > 0 {
+        query = query.bind(body.category_id);
+    }
+    let emails = match query.fetch_all(pool).await {
+        Ok(list) => list,
+        Err(err) => return failed(err.into()),
+    };
+    if emails.is_empty() {
+        return fail("没有可发送的订阅用户");
+    }
+
+    let job_id = format!(
+        "{:x}{:04x}",
+        chrono::Utc::now().timestamp_millis(),
+        rand::random::<u16>()
+    );
+    let total = emails.len() as i64;
+    subscriber_send_job_create(SubscriberSendJob {
+        job_id: job_id.clone(),
+        finished: false,
+        total,
+        sent: 0,
+        failed: 0,
+        percent: 0,
+        message: format!("正在发送 (0/{total})"),
+        created_time: chrono::Utc::now().timestamp(),
+    });
+
+    let site_name = site_setting::get_section(pool, site_setting::SYSTEM)
+        .await
+        .ok()
+        .and_then(|value| value["site_name"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let cache_dir = state.with_config(|config| config.cache_dir());
+
+    let pool_bg = pool.clone();
+    let job_id_bg = job_id.clone();
+    tokio::spawn(async move {
+        for email in emails {
+            let data = json!({
+                "system": {"SiteName": site_name},
+                "user": {"UserName": email, "Email": email},
+            });
+            let mail_subject =
+                sendmail::render_template(&subject, &data).unwrap_or_else(|_| subject.clone());
+            let mail_html =
+                sendmail::render_template(&content, &data).unwrap_or_else(|_| content.clone());
+            let account_one = account.clone();
+            let recipient = email.clone();
+            let mail_subject_bg = mail_subject.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                ext_smtp_send(&account_one, &recipient, &mail_subject_bg, &mail_html)
+            })
+            .await;
+            let success = matches!(result, Ok(Ok(())));
+
+            let now = chrono::Utc::now().timestamp() as i32;
+            let update_sql = if success {
+                "UPDATE subscribers SET send_times = COALESCE(send_times, 0) + 1, \
+                 updated_time = ? WHERE email = ?"
+            } else {
+                "UPDATE subscribers SET error_times = COALESCE(error_times, 0) + 1, \
+                 updated_time = ? WHERE email = ?"
+            };
+            let _ = sqlx::query(update_sql)
+                .bind(now)
+                .bind(&email)
+                .execute(&pool_bg)
+                .await;
+            append_mail_log(
+                &cache_dir,
+                &mail_subject,
+                if success { "success" } else { "failed" },
+                &email,
+            );
+            subscriber_send_job_update(&job_id_bg, |job| {
+                if success {
+                    job.sent += 1;
+                } else {
+                    job.failed += 1;
+                }
+                let done = job.sent + job.failed;
+                let total = job.total;
+                job.percent = if total > 0 {
+                    (done * 100 / total) as i32
+                } else {
+                    100
+                };
+                job.message = format!("正在发送 ({done}/{total})");
+            });
+        }
+        subscriber_send_job_update(&job_id_bg, |job| {
+            job.finished = true;
+            job.percent = 100;
+            job.message = format!("发送完成：成功 {} 条，失败 {} 条", job.sent, job.failed);
+        });
+    });
+
+    ok(json!({ "job_id": job_id, "total": total }))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -8342,9 +11099,10 @@ async fn manage_subscriber_send_status(
              从返回结果里取 job_id，再带上它来查进度（如 ?job_id=xxx）。",
         );
     };
-    fail(format!(
-        "未找到 job_id={job_id} 的群发任务（群发本身尚未实现）"
-    ))
+    match subscriber_send_job_get(job_id) {
+        Some(job) => ok(job),
+        None => fail(format!("未找到 job_id={job_id} 的群发任务")),
+    }
 }
 
 /// `GET /system/api/plugin/subscriber/category/list`
@@ -9068,11 +11826,131 @@ async fn manage_watermark_config_save(
 }
 
 /// `GET /system/api/plugin/watermark/preview`
+///
+/// 对齐 Go 版 `PluginWatermarkPreview`：用当前配置在 800×600 纯色底图上
+/// 生成水印效果，返回可直接查看的 `data:image/svg+xml;base64,` 图片。
 async fn manage_watermark_preview(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("水印预览尚未实现（需图片处理库）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = match watermark::config_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    let public_dir = state.with_config(|config| config.public_dir());
+
+    const PREVIEW_WIDTH: u32 = 800;
+    const PREVIEW_HEIGHT: u32 = 600;
+    let size = config
+        .get("size")
+        .and_then(Value::as_i64)
+        .unwrap_or(20)
+        .clamp(1, 200) as u32;
+    let position = config
+        .get("position")
+        .and_then(Value::as_i64)
+        .unwrap_or(9);
+    let opacity = config
+        .get("opacity")
+        .and_then(Value::as_i64)
+        .unwrap_or(100)
+        .clamp(1, 100);
+    let watermark_type = config.get("type").and_then(Value::as_i64).unwrap_or(0);
+
+    let max_width = (PREVIEW_WIDTH * size / 100).max(1);
+    let max_height = (PREVIEW_HEIGHT * size / 100).max(1);
+    let edge = (PREVIEW_WIDTH / 15).min(50);
+
+    let mut svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{PREVIEW_WIDTH}" height="{PREVIEW_HEIGHT}" viewBox="0 0 {PREVIEW_WIDTH} {PREVIEW_HEIGHT}"><rect x="0" y="0" width="{PREVIEW_WIDTH}" height="{PREVIEW_HEIGHT}" fill="#607d8b"/>"##
+    );
+
+    if watermark_type == 0 {
+        // 图片水印
+        let image_path = config
+            .get("image_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(bytes) = read_public_asset(&public_dir, image_path).await else {
+            return fail("水印图片未配置或无法读取");
+        };
+        let (source_width, source_height) = attachment::image_size(&bytes);
+        let (mark_width, mark_height) = fit_mark(source_width, source_height, max_width, max_height);
+        let (x, y) = watermark_position(
+            position,
+            PREVIEW_WIDTH,
+            PREVIEW_HEIGHT,
+            mark_width,
+            mark_height,
+            edge,
+        );
+        svg.push_str(&format!(
+            r#"<image x="{x}" y="{y}" width="{mark_width}" height="{mark_height}" preserveAspectRatio="xMidYMid meet" opacity="{}" href="data:{};base64,{}"/>"#,
+            opacity as f64 / 100.0,
+            image_mime_of(image_path),
+            image_base64(&bytes)
+        ));
+    } else {
+        // 文字水印
+        let text = config
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return fail("水印文字未配置");
+        }
+        let font_path = config.get("font_path").and_then(Value::as_str).unwrap_or("");
+        let font_data = read_public_asset(&public_dir, font_path).await;
+        let color = hex_color_or(
+            config.get("color").and_then(Value::as_str).unwrap_or(""),
+            "#ffffff",
+        );
+
+        // 与 Go 一致：中文按 1 个字号、英文按 0.5 个字号估算文字宽度
+        let text_width: u32 = text
+            .chars()
+            .map(|ch| if ch.is_ascii() { (size / 2).max(1) } else { size })
+            .sum();
+        let mark_width = text_width + text_width / 10;
+        let mark_height = size + size / 10;
+        let (x, y) = watermark_position(
+            position,
+            PREVIEW_WIDTH,
+            PREVIEW_HEIGHT,
+            mark_width,
+            mark_height,
+            edge,
+        );
+
+        if let Some(bytes) = &font_data {
+            svg.push_str(&format!(
+                r#"<defs><style>@font-face{{font-family:'WatermarkFont';src:url(data:font/ttf;base64,{}) format('truetype');}}</style></defs>"#,
+                image_base64(bytes)
+            ));
+        }
+        let font_family = if font_data.is_some() {
+            "WatermarkFont, sans-serif"
+        } else {
+            "sans-serif"
+        };
+        svg.push_str(&format!(
+            r#"<text x="{x}" y="{}" fill="{color}" font-size="{size}" font-family="{font_family}" opacity="{}">{}</text>"#,
+            y + size as i64,
+            opacity as f64 / 100.0,
+            xml_escape(&text)
+        ));
+    }
+    svg.push_str("</svg>");
+
+    ok(json!(format!(
+        "data:image/svg+xml;base64,{}",
+        image_base64(svg.as_bytes())
+    )))
 }
 
 /// `POST /system/api/plugin/watermark/upload`（multipart：`name` + `file`）
@@ -9132,12 +12010,145 @@ async fn manage_watermark_upload(
     ok(json!(path))
 }
 
+/// 后台批量添加图片水印（当前图片引擎支持 PNG/BMP）。
+async fn generate_all_watermarks(pool: sqlx::mysql::MySqlPool, public_dir: std::path::PathBuf) {
+    let Ok(config) = watermark::config_get(&pool).await else {
+        return;
+    };
+    if config.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        return;
+    }
+    let size = config
+        .get("size")
+        .and_then(Value::as_i64)
+        .unwrap_or(20)
+        .clamp(1, 200) as u32;
+    let position = config
+        .get("position")
+        .and_then(Value::as_i64)
+        .unwrap_or(9);
+    let opacity = config
+        .get("opacity")
+        .and_then(Value::as_i64)
+        .unwrap_or(100)
+        .clamp(0, 100) as u8;
+    let min_size = config
+        .get("min_size")
+        .and_then(Value::as_i64)
+        .unwrap_or(400)
+        .max(1) as u32;
+
+    let image_path = config
+        .get("image_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Ok(mark_bytes) = tokio::fs::read(public_dir.join(image_path.trim_start_matches('/'))).await
+    else {
+        return;
+    };
+    let Ok(mark_source) = crate::models::titleimage::image_ops::decode(&mark_bytes) else {
+        return;
+    };
+
+    let mut last_id = 0u32;
+    loop {
+        let rows: Vec<(u32, String)> = match sqlx::query_as(
+            "SELECT id, file_location FROM attachments WHERE is_image = 1 AND watermark = 0 AND `status` = 1 AND id > ? ORDER BY id ASC LIMIT 500",
+        )
+        .bind(last_id)
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => break,
+        };
+        if rows.is_empty() {
+            break;
+        }
+        last_id = rows.iter().map(|row| row.0).max().unwrap_or(last_id);
+
+        for (id, location) in rows {
+            let ext = file_ext(&location);
+            if !crate::models::titleimage::image_ops::supports_extension(&ext) {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(public_dir.join(&location)).await else {
+                continue;
+            };
+            let Ok(mut image) = crate::models::titleimage::image_ops::decode(&bytes) else {
+                continue;
+            };
+            if image.width < min_size && image.height < min_size {
+                continue;
+            }
+
+            let max_width = (image.width * size / 100).max(1);
+            let max_height = (image.height * size / 100).max(1);
+            let mark = crate::models::titleimage::image_ops::resize_fit(
+                &mark_source, max_width, max_height,
+            );
+            let edge = (image.width / 15).min(50);
+            let (x, y) = watermark_position(
+                position,
+                image.width,
+                image.height,
+                mark.width,
+                mark.height,
+                edge,
+            );
+            image.composite(&mark, x, y, opacity);
+            let Ok(encoded) = crate::models::titleimage::image_ops::encode(&image, &ext) else {
+                continue;
+            };
+            if tokio::fs::write(public_dir.join(&location), encoded)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let _ = sqlx::query("UPDATE attachments SET watermark = 1 WHERE id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+    }
+}
+
 /// `POST /system/api/plugin/watermark/generate`
 async fn manage_watermark_generate(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("批量加水印尚未实现（需图片处理库）")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = match watermark::config_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    if !config.get("open").and_then(Value::as_bool).unwrap_or(false) {
+        return ok_msg("水印插件未开启");
+    }
+    if config.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        return fail("当前图片引擎暂只支持图片水印（PNG/BMP）批量处理");
+    }
+    let image_path = config
+        .get("image_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let public_dir = state.with_config(|config| config.public_dir());
+    let Ok(mark_bytes) = tokio::fs::read(public_dir.join(image_path.trim_start_matches('/'))).await
+    else {
+        return fail("水印图片未配置或无法读取");
+    };
+    if crate::models::titleimage::image_ops::decode(&mark_bytes).is_err() {
+        return fail("水印图片格式不受支持（当前引擎支持 PNG/BMP）");
+    }
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        generate_all_watermarks(pool, public_dir).await;
+    });
+    ok_msg("已提交，水印将在后台生成")
 }
 
 /// `GET /system/api/plugin/interference/config`
@@ -9223,12 +12234,24 @@ async fn manage_limiter_blocked(State(state): State<AppState>, headers: HeaderMa
     ok(json!([]))
 }
 
+/// 解除 IP 封禁请求体。
+#[derive(Debug, Deserialize, Default)]
+struct LimiterIpBody {
+    #[serde(default)]
+    ip: String,
+}
+
 /// `POST /system/api/plugin/limiter/blockedip/remove`
-async fn manage_limiter_unblock(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn manage_limiter_unblock(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LimiterIpBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("限流器尚未实现，没有可解除的 IP")
+    plugin::limiter_unblock(&body.ip);
+    ok_msg("删除成功")
 }
 
 // ---------------------------- Akismet / 全文索引 / 导入 API ------------------
@@ -9303,12 +12326,234 @@ async fn manage_fulltext_config_save(
     }
 }
 
+/// 全文索引文件目录：`<cache>/fulltext`。
+fn fulltext_index_dir(cache_dir: &std::path::Path) -> std::path::PathBuf {
+    cache_dir.join("fulltext")
+}
+
+/// 去掉 HTML 标签并压缩空白，供索引正文使用。
+fn fulltext_plain_text(input: &str) -> String {
+    let mut text = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+            text.push(' ');
+        } else if !in_tag {
+            text.push(ch);
+        }
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 按配置的 `contain_length` 截断索引正文（0 表示不截断）。
+fn fulltext_trim(text: &str, limit: usize) -> String {
+    if limit == 0 {
+        text.to_string()
+    } else {
+        text.chars().take(limit).collect()
+    }
+}
+
+/// 读取插件配置里的布尔开关。
+fn config_flag(config: &Value, key: &str) -> bool {
+    config.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// 读取全文索引配置里的模型 ID 列表。
+fn fulltext_modules(config: &Value) -> Vec<u32> {
+    config
+        .get("modules")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.as_u64().map(|id| id as u32))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 按配置为内容、栏目与标签建立本地全文索引，写入 `<cache>/fulltext/index.json`。
+async fn build_fulltext_index(
+    pool: &sqlx::mysql::MySqlPool,
+    cache_dir: &std::path::Path,
+    modules: &[u32],
+    use_content: bool,
+    use_category: bool,
+    use_tag: bool,
+    contain_length: usize,
+) -> anyhow::Result<usize> {
+    let placeholders = vec!["?"; modules.len()].join(",");
+    let mut docs: Vec<Value> = Vec::new();
+
+    // 内容
+    let mut archive_sql = String::from(
+        "SELECT a.id, a.title, a.keywords, a.description, a.module_id, a.category_id",
+    );
+    if use_content {
+        archive_sql.push_str(", d.content");
+        archive_sql.push_str(" FROM archives a LEFT JOIN archive_data d ON a.id = d.id");
+    } else {
+        archive_sql.push_str(" FROM archives a");
+    }
+    archive_sql.push_str(&format!(
+        " WHERE a.module_id IN ({placeholders}) ORDER BY a.id ASC"
+    ));
+
+    if use_content {
+        let mut query =
+            sqlx::query_as::<_, (i64, String, String, String, u32, u32, Option<String>)>(
+                &archive_sql,
+            );
+        for id in modules {
+            query = query.bind(*id);
+        }
+        for (id, title, keywords, description, module_id, category_id, content) in
+            query.fetch_all(pool).await?
+        {
+            let body = fulltext_trim(
+                &fulltext_plain_text(content.as_deref().unwrap_or_default()),
+                contain_length,
+            );
+            docs.push(json!({
+                "id": id,
+                "type": "archive",
+                "title": title,
+                "keywords": keywords,
+                "description": description,
+                "module_id": module_id,
+                "category_id": category_id,
+                "content": body,
+            }));
+        }
+    } else {
+        let mut query =
+            sqlx::query_as::<_, (i64, String, String, String, u32, u32)>(&archive_sql);
+        for id in modules {
+            query = query.bind(*id);
+        }
+        for (id, title, keywords, description, module_id, category_id) in
+            query.fetch_all(pool).await?
+        {
+            docs.push(json!({
+                "id": id,
+                "type": "archive",
+                "title": title,
+                "keywords": keywords,
+                "description": description,
+                "module_id": module_id,
+                "category_id": category_id,
+                "content": "",
+            }));
+        }
+    }
+
+    // 栏目
+    if use_category {
+        let sql = format!(
+            "SELECT id, title, keywords, description, module_id, content FROM categories \
+             WHERE module_id IN ({placeholders}) ORDER BY id ASC"
+        );
+        let mut query =
+            sqlx::query_as::<_, (u32, String, String, String, u32, Option<String>)>(&sql);
+        for id in modules {
+            query = query.bind(*id);
+        }
+        for (id, title, keywords, description, module_id, content) in
+            query.fetch_all(pool).await?
+        {
+            let body = fulltext_trim(
+                &fulltext_plain_text(content.as_deref().unwrap_or_default()),
+                contain_length,
+            );
+            docs.push(json!({
+                "id": id,
+                "type": "category",
+                "title": title,
+                "keywords": keywords,
+                "description": description,
+                "module_id": module_id,
+                "category_id": 0,
+                "content": body,
+            }));
+        }
+    }
+
+    // 标签
+    if use_tag {
+        let rows: Vec<(u32, String, String, String)> =
+            sqlx::query_as("SELECT id, title, keywords, description FROM tags ORDER BY id ASC")
+                .fetch_all(pool)
+                .await?;
+        for (id, title, keywords, description) in rows {
+            docs.push(json!({
+                "id": id,
+                "type": "tag",
+                "title": title,
+                "keywords": keywords,
+                "description": description,
+                "module_id": 0,
+                "category_id": 0,
+                "content": "",
+            }));
+        }
+    }
+
+    let total = docs.len();
+    let dir = fulltext_index_dir(cache_dir);
+    std::fs::create_dir_all(&dir)?;
+    let payload = json!({
+        "built_at": chrono::Local::now().timestamp(),
+        "total": total,
+        "docs": docs,
+    });
+    std::fs::write(dir.join("index.json"), serde_json::to_string(&payload)?)?;
+    Ok(total)
+}
+
 /// `POST /system/api/plugin/fulltext/rebuild`
 async fn manage_fulltext_rebuild(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("全文索引重建需要索引引擎，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = match plugin::fulltext_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    if !config_flag(&config, "open") {
+        return fail("全文索引未开启，请先在配置中开启");
+    }
+    let modules = fulltext_modules(&config);
+    if modules.is_empty() {
+        return fail("请先选择需要建立索引的模型");
+    }
+    let contain_length = config
+        .get("contain_length")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let cache_dir = state.with_config(|config| config.cache_dir());
+    match build_fulltext_index(
+        pool,
+        &cache_dir,
+        &modules,
+        config_flag(&config, "use_content"),
+        config_flag(&config, "use_category"),
+        config_flag(&config, "use_tag"),
+        contain_length,
+    )
+    .await
+    {
+        Ok(total) => {
+            let _ = plugin::fulltext_save(pool, &json!({ "initialed": true })).await;
+            ok(json!({ "total": total, "initialed": true }))
+        }
+        Err(err) => failed(err),
+    }
 }
 
 /// `GET /system/api/plugin/fulltext/status`
@@ -9402,23 +12647,582 @@ async fn manage_htmlcache_config_save(
     }
 }
 
+/// 静态缓存输出目录：`<cache>/html`（与 clean 接口保持一致）。
+fn html_cache_root(state: &AppState) -> std::path::PathBuf {
+    state
+        .with_config(|config| config.cache_dir())
+        .join("html")
+}
+
+/// 把站点内链接转成缓存文件相对路径，等价 Go 的 `transToLocalPath`。
+fn html_cache_local_path(link: &str) -> String {
+    let path = link.split(['?', '#']).next().unwrap_or("");
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if path.ends_with('/') {
+        return format!("{path}index.html");
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    if base.contains('.') {
+        path
+    } else {
+        format!("{path}/index.html")
+    }
+}
+
+/// 写入静态缓存文件。
+fn html_cache_write(root: &std::path::Path, link: &str, body: &str) -> Result<(), String> {
+    let local = html_cache_local_path(link);
+    let rel = local.trim_start_matches('/');
+    if rel.is_empty() || rel.split('/').any(|segment| segment == ".." || segment.contains('\\')) {
+        return Err(format!("非法缓存路径：{link}"));
+    }
+    let file = root.join(rel);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("创建缓存目录失败：{err}"))?;
+    }
+    std::fs::write(&file, body).map_err(|err| format!("写入缓存失败：{err}"))
+}
+
+/// 静态缓存页面作用域（与前台管线首屏一致）。
+fn html_cache_scope(page: u32) -> crate::template::Scope {
+    let mut scope = crate::template::Scope::new();
+    scope.insert("currentPage".to_string(), Value::from(page));
+    scope.insert(
+        "version".to_string(),
+        Value::from(env!("CARGO_PKG_VERSION")),
+    );
+    scope.insert("isMobile".to_string(), Value::Bool(false));
+    scope.insert("urlParams".to_string(), json!({}));
+    scope
+}
+
+/// 从候选模板名里挑第一个实际存在的模板。
+fn html_cache_template(state: &AppState, candidates: &[String]) -> Option<String> {
+    let dir = state.templates().dir().to_path_buf();
+    candidates
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .find(|name| dir.join(name).is_file())
+        .cloned()
+}
+
+async fn render_html_cache_index(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+) -> Result<String, String> {
+    let template = html_cache_template(
+        state,
+        &["index/index.html".to_string(), "index.html".to_string()],
+    )
+    .ok_or_else(|| "缺少首页模板 index/index.html".to_string())?;
+    let provider = crate::template::site_provider::SiteProvider::new(pool.clone(), 0)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    state
+        .templates()
+        .render(&template, &html_cache_scope(1), &provider)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+async fn render_html_cache_module(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    item: &crate::models::Module,
+) -> Result<String, String> {
+    let template = html_cache_template(
+        state,
+        &[
+            format!("{}/index.html", item.table_name),
+            format!("{}_index.html", item.table_name),
+        ],
+    )
+    .ok_or_else(|| format!("缺少模型 {} 的列表模板", item.table_name))?;
+    let provider = crate::template::site_provider::SiteProvider::for_module(pool.clone(), item.id)
+        .await
+        .map_err(|err| format!("{err:#}"))?
+        .with_page(1);
+    let mut scope = html_cache_scope(1);
+    scope.insert(
+        "module".to_string(),
+        serde_json::to_value(item).map_err(|err| format!("{err:#}"))?,
+    );
+    state
+        .templates()
+        .render(&template, &scope, &provider)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+async fn render_html_cache_category(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    item: &Category,
+    modules: &[crate::models::Module],
+) -> Result<String, String> {
+    let table = modules
+        .iter()
+        .find(|module| module.id == item.module_id)
+        .map(|module| module.table_name.clone())
+        .unwrap_or_else(|| "article".to_string());
+    let mut custom = item.template.trim().to_string();
+    if !custom.is_empty() && !custom.ends_with(".html") {
+        custom.push_str(".html");
+    }
+    let template = html_cache_template(
+        state,
+        &[
+            custom,
+            format!("{table}/{}.html", item.url_token),
+            format!("{table}/list-{}.html", item.id),
+            format!("{table}/list.html"),
+            format!("{table}_list.html"),
+        ],
+    )
+    .ok_or_else(|| format!("缺少栏目 {} 的列表模板", item.title))?;
+    let provider = crate::template::site_provider::SiteProvider::new(pool.clone(), item.id)
+        .await
+        .map_err(|err| format!("{err:#}"))?
+        .with_page(1);
+    let mut scope = html_cache_scope(1);
+    scope.insert(
+        "category".to_string(),
+        serde_json::to_value(item).map_err(|err| format!("{err:#}"))?,
+    );
+    if let Some(module) = modules.iter().find(|module| module.id == item.module_id) {
+        scope.insert(
+            "module".to_string(),
+            serde_json::to_value(module).map_err(|err| format!("{err:#}"))?,
+        );
+    }
+    state
+        .templates()
+        .render(&template, &scope, &provider)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+async fn render_html_cache_archive(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    id: i64,
+    item: &crate::models::archive::Archive,
+    current: Option<&Category>,
+    modules: &[crate::models::Module],
+) -> Result<String, String> {
+    let table = current
+        .and_then(|category| modules.iter().find(|module| module.id == category.module_id))
+        .map(|module| module.table_name.clone())
+        .unwrap_or_else(|| "article".to_string());
+    let mut custom = item.template.trim().to_string();
+    if custom.is_empty() {
+        custom = current
+            .map(|category| category.detail_template.trim().to_string())
+            .unwrap_or_default();
+    }
+    if !custom.is_empty() && !custom.ends_with(".html") {
+        custom.push_str(".html");
+    }
+    let template = html_cache_template(
+        state,
+        &[
+            custom,
+            format!("{table}/detail-{}.html", item.id),
+            format!("{table}/detail.html"),
+            format!("{table}_detail.html"),
+        ],
+    )
+    .ok_or_else(|| format!("缺少内容 {} 的详情模板", item.title))?;
+    let provider = crate::template::site_provider::SiteProvider::for_archive(pool.clone(), id)
+        .await
+        .map_err(|err| format!("{err:#}"))?
+        .ok_or_else(|| "内容不存在".to_string())?;
+    let mut scope = html_cache_scope(1);
+    scope.insert(
+        "archive".to_string(),
+        serde_json::to_value(item).map_err(|err| format!("{err:#}"))?,
+    );
+    if let Some(category) = current {
+        scope.insert(
+            "category".to_string(),
+            serde_json::to_value(category).map_err(|err| format!("{err:#}"))?,
+        );
+    }
+    state
+        .templates()
+        .render(&template, &scope, &provider)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+async fn render_html_cache_tag_index(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+) -> Result<String, String> {
+    let template = html_cache_template(
+        state,
+        &["tag/index.html".to_string(), "tag_index.html".to_string()],
+    )
+    .ok_or_else(|| "缺少标签首页模板 tag/index.html".to_string())?;
+    let provider = crate::template::site_provider::SiteProvider::new(pool.clone(), 0)
+        .await
+        .map_err(|err| format!("{err:#}"))?
+        .as_tag_index()
+        .with_page(1);
+    state
+        .templates()
+        .render(&template, &html_cache_scope(1), &provider)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+async fn render_html_cache_tag(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    item: &tag::Tag,
+) -> Result<String, String> {
+    let mut custom = item.template.trim().to_string();
+    if !custom.is_empty() && !custom.ends_with(".html") {
+        custom.push_str(".html");
+    }
+    let template = html_cache_template(
+        state,
+        &[
+            custom,
+            format!("tag/list-{}.html", item.id),
+            "tag/list.html".to_string(),
+            "tag_list.html".to_string(),
+        ],
+    )
+    .ok_or_else(|| format!("缺少标签 {} 的列表模板", item.title))?;
+    let provider = crate::template::site_provider::SiteProvider::new(pool.clone(), item.category_id)
+        .await
+        .map_err(|err| format!("{err:#}"))?
+        .with_tag(item.clone())
+        .with_page(1);
+    let mut scope = html_cache_scope(1);
+    scope.insert(
+        "tag".to_string(),
+        serde_json::to_value(item).map_err(|err| format!("{err:#}"))?,
+    );
+    state
+        .templates()
+        .render(&template, &scope, &provider)
+        .await
+        .map_err(|err| format!("{err:#}"))
+}
+
+/// 静态缓存生成统计。
+#[derive(Default)]
+struct HtmlCacheReport {
+    index: usize,
+    category: usize,
+    archive: usize,
+    tag: usize,
+    failed: usize,
+}
+
+impl HtmlCacheReport {
+    fn total(&self) -> usize {
+        self.index + self.category + self.archive + self.tag
+    }
+
+    fn data(&self) -> Value {
+        json!({
+            "index": self.index,
+            "category": self.category,
+            "archive": self.archive,
+            "tag": self.tag,
+            "failed": self.failed,
+            "total": self.total(),
+        })
+    }
+}
+
+/// 渲染并写入一个缓存页，按类型累计统计。
+fn html_cache_store(
+    report: &mut HtmlCacheReport,
+    kind: &str,
+    root: &std::path::Path,
+    link: &str,
+    page: Result<String, String>,
+) {
+    match page {
+        Ok(html) => match html_cache_write(root, link, &html) {
+            Ok(()) => match kind {
+                "index" => report.index += 1,
+                "category" => report.category += 1,
+                "archive" => report.archive += 1,
+                _ => report.tag += 1,
+            },
+            Err(err) => {
+                report.failed += 1;
+                tracing::warn!("{err}");
+            }
+        },
+        Err(err) => {
+            report.failed += 1;
+            tracing::warn!("静态缓存渲染失败（{link}）：{err}");
+        }
+    }
+}
+
+async fn build_html_cache_index(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    root: &std::path::Path,
+    report: &mut HtmlCacheReport,
+) {
+    let page = render_html_cache_index(state, pool).await;
+    html_cache_store(report, "index", root, "/", page);
+}
+
+async fn build_html_cache_categories(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    root: &std::path::Path,
+    report: &mut HtmlCacheReport,
+) {
+    let mode = crate::models::url::load_mode(pool).await.unwrap_or(0);
+    let modules = match module::list(pool).await {
+        Ok(list) => list,
+        Err(err) => {
+            report.failed += 1;
+            tracing::warn!("读取模型列表失败：{err:#}");
+            return;
+        }
+    };
+    for item in modules.iter().filter(|module| module.status == 1) {
+        let link = crate::models::url::archive_index_url(mode, &item.url_token, 1);
+        let page = render_html_cache_module(state, pool, item).await;
+        html_cache_store(report, "category", root, &link, page);
+    }
+    let categories = match category::list_all(pool).await {
+        Ok(list) => list,
+        Err(err) => {
+            report.failed += 1;
+            tracing::warn!("读取栏目列表失败：{err:#}");
+            return;
+        }
+    };
+    for item in categories
+        .iter()
+        .filter(|category| category.status == 1 && category.kind == 1)
+    {
+        let module_token = modules
+            .iter()
+            .find(|module| module.id == item.module_id)
+            .map(|module| module.url_token.as_str())
+            .unwrap_or("");
+        let link =
+            crate::models::url::category_url(mode, &item.url_token, module_token, item.id, 1);
+        let page = render_html_cache_category(state, pool, item, &modules).await;
+        html_cache_store(report, "category", root, &link, page);
+    }
+}
+
+async fn build_html_cache_archives(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    root: &std::path::Path,
+    report: &mut HtmlCacheReport,
+) {
+    let mode = crate::models::url::load_mode(pool).await.unwrap_or(0);
+    let modules = match module::list(pool).await {
+        Ok(list) => list,
+        Err(err) => {
+            report.failed += 1;
+            tracing::warn!("读取模型列表失败：{err:#}");
+            return;
+        }
+    };
+    let categories = match category::list_all(pool).await {
+        Ok(list) => list,
+        Err(err) => {
+            report.failed += 1;
+            tracing::warn!("读取栏目列表失败：{err:#}");
+            return;
+        }
+    };
+    let rows: Vec<(i64, u32, String)> =
+        match sqlx::query_as("SELECT id, category_id, url_token FROM archives ORDER BY id ASC")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(list) => list,
+            Err(err) => {
+                report.failed += 1;
+                tracing::warn!("读取内容列表失败：{err:#}");
+                return;
+            }
+        };
+    for (id, category_id, token) in rows {
+        let Some(current) = categories
+            .iter()
+            .find(|category| category.id == category_id)
+        else {
+            continue;
+        };
+        if current.status != 1 {
+            continue;
+        }
+        let item = match archive::get(pool, id).await {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(err) => {
+                report.failed += 1;
+                tracing::warn!("读取内容 {id} 失败：{err:#}");
+                continue;
+            }
+        };
+        let module_token = modules
+            .iter()
+            .find(|module| module.id == item.module_id)
+            .map(|module| module.url_token.as_str())
+            .unwrap_or("");
+        let link = item
+            .fixed_link
+            .as_deref()
+            .map(str::trim)
+            .filter(|link| !link.is_empty())
+            .map(|link| link.to_string())
+            .unwrap_or_else(|| {
+                crate::models::url::archive_url(
+                    mode,
+                    &current.url_token,
+                    module_token,
+                    id,
+                    &token,
+                    category_id,
+                    1,
+                )
+            });
+        let page = render_html_cache_archive(state, pool, id, &item, Some(current), &modules).await;
+        html_cache_store(report, "archive", root, &link, page);
+    }
+}
+
+async fn build_html_cache_tags(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+    root: &std::path::Path,
+    report: &mut HtmlCacheReport,
+) {
+    let mode = crate::models::url::load_mode(pool).await.unwrap_or(0);
+    let link = crate::models::url::tag_index_url(mode, 1);
+    let page = render_html_cache_tag_index(state, pool).await;
+    html_cache_store(report, "tag", root, &link, page);
+
+    let tags: Vec<tag::Tag> = match sqlx::query_as("SELECT * FROM tags ORDER BY id ASC")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(list) => list,
+        Err(err) => {
+            report.failed += 1;
+            tracing::warn!("读取标签列表失败：{err:#}");
+            return;
+        }
+    };
+    for item in tags.iter().filter(|tag| tag.status == 1) {
+        let link = crate::models::url::tag_url(mode, item.id, &item.url_token, 1);
+        let page = render_html_cache_tag(state, pool, item).await;
+        html_cache_store(report, "tag", root, &link, page);
+    }
+}
+
+async fn build_html_cache_all(
+    state: &AppState,
+    pool: &sqlx::mysql::MySqlPool,
+) -> HtmlCacheReport {
+    let root = html_cache_root(state);
+    let mut report = HtmlCacheReport::default();
+    if let Err(err) = std::fs::create_dir_all(&root) {
+        report.failed += 1;
+        tracing::warn!("创建静态缓存目录失败：{err}");
+        return report;
+    }
+    build_html_cache_index(state, pool, &root, &mut report).await;
+    build_html_cache_categories(state, pool, &root, &mut report).await;
+    build_html_cache_archives(state, pool, &root, &mut report).await;
+    build_html_cache_tags(state, pool, &root, &mut report).await;
+    report
+}
+
 /// `POST /system/api/plugin/htmlcache/build`
 async fn manage_htmlcache_build(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("静态缓存生成需要渲染管线，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = match plugin::html_cache_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    if !config_flag(&config, "open") {
+        return fail("静态缓存未开启，请先在配置中开启");
+    }
+    let report = build_html_cache_all(&state, pool).await;
+    let now = chrono::Local::now().timestamp();
+    let _ = plugin::html_cache_save(pool, &json!({ "last_build_time": now })).await;
+    let mut data = report.data();
+    if let Some(object) = data.as_object_mut() {
+        object.insert("last_build_time".to_string(), json!(now));
+    }
+    ok(data)
 }
 
 /// `POST /system/api/plugin/htmlcache/build/{index,category,archive,tag}`
 async fn manage_htmlcache_build_part(
     State(state): State<AppState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("静态缓存生成需要渲染管线，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = match plugin::html_cache_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    if !config_flag(&config, "open") {
+        return fail("静态缓存未开启，请先在配置中开启");
+    }
+    let kind = uri
+        .path()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let root = html_cache_root(&state);
+    if let Err(err) = std::fs::create_dir_all(&root) {
+        return failed(err.into());
+    }
+    let mut report = HtmlCacheReport::default();
+    match kind {
+        "index" => build_html_cache_index(&state, pool, &root, &mut report).await,
+        "category" => build_html_cache_categories(&state, pool, &root, &mut report).await,
+        "archive" => build_html_cache_archives(&state, pool, &root, &mut report).await,
+        "tag" => build_html_cache_tags(&state, pool, &root, &mut report).await,
+        _ => return fail("未知的静态缓存构建类型"),
+    }
+    let now = chrono::Local::now().timestamp();
+    let _ = plugin::html_cache_save(pool, &json!({ "last_build_time": now })).await;
+    let mut data = report.data();
+    if let Some(object) = data.as_object_mut() {
+        object.insert("type".to_string(), json!(kind));
+        object.insert("last_build_time".to_string(), json!(now));
+    }
+    ok(data)
 }
 
 /// `GET /system/api/plugin/htmlcache/build/status`
@@ -9515,12 +13319,397 @@ async fn manage_htmlcache_upload(
     ok(json!(file_name))
 }
 
+/// 递归列出目录下的普通文件。
+fn html_cache_walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// 把本地文件映射成远端相对路径。
+fn html_cache_push_entry(
+    file: &std::path::Path,
+    public_dir: &std::path::Path,
+    cache_root: &std::path::Path,
+) -> Option<(std::path::PathBuf, String)> {
+    if !file.is_file() {
+        return None;
+    }
+    if let Ok(rel) = file.strip_prefix(public_dir) {
+        return Some((file.to_path_buf(), rel.to_string_lossy().replace('\\', "/")));
+    }
+    if let Ok(rel) = file.strip_prefix(cache_root) {
+        return Some((file.to_path_buf(), rel.to_string_lossy().replace('\\', "/")));
+    }
+    let name = file.file_name()?.to_string_lossy().to_string();
+    Some((file.to_path_buf(), name))
+}
+
+/// 解析请求里传入的推送路径（兼容绝对路径、public 相对路径与 cache/html 相对路径）。
+fn html_cache_resolve_push_path(
+    raw: &str,
+    public_dir: &std::path::Path,
+    cache_root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let direct = std::path::PathBuf::from(raw);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let rel = raw.trim_start_matches('/').replace('\\', "/");
+    let under_public = public_dir.join(&rel);
+    if under_public.is_file() {
+        return Some(under_public);
+    }
+    let under_cache = cache_root.join(&rel);
+    if under_cache.is_file() {
+        return Some(under_cache);
+    }
+    None
+}
+
+/// 收集本次需要推送的文件；`paths` 为空时全量收集 public 与 cache/html。
+fn collect_html_cache_push_files(
+    state: &AppState,
+    paths: &[String],
+) -> Vec<(std::path::PathBuf, String)> {
+    let public_dir = state.with_config(|config| config.public_dir());
+    let cache_root = html_cache_root(state);
+    let mut entries = Vec::new();
+    if paths.is_empty() {
+        for file in html_cache_walk_files(&public_dir) {
+            if let Some(entry) = html_cache_push_entry(&file, &public_dir, &cache_root) {
+                entries.push(entry);
+            }
+        }
+        for file in html_cache_walk_files(&cache_root) {
+            if let Some(entry) = html_cache_push_entry(&file, &public_dir, &cache_root) {
+                entries.push(entry);
+            }
+        }
+        return entries;
+    }
+    for raw in paths {
+        let Some(file) = html_cache_resolve_push_path(raw, &public_dir, &cache_root) else {
+            continue;
+        };
+        if let Some(entry) = html_cache_push_entry(&file, &public_dir, &cache_root) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// FTP 推送参数。
+struct FtpTarget {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    webroot: String,
+}
+
+/// 读取一条 FTP 响应（含多行响应）。
+fn ftp_read_reply(
+    reader: &mut std::io::BufReader<std::net::TcpStream>,
+) -> Result<(u16, String), String> {
+    use std::io::BufRead;
+
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|err| format!("读取 FTP 响应失败：{err}"))?;
+    if line.trim().is_empty() {
+        return Err("FTP 连接已关闭".to_string());
+    }
+    let code = line
+        .get(0..3)
+        .and_then(|text| text.parse::<u16>().ok())
+        .ok_or_else(|| format!("FTP 响应格式错误：{line}"))?;
+    let first = line.trim().to_string();
+    if line.as_bytes().get(3) == Some(&b'-') {
+        loop {
+            let mut next = String::new();
+            reader
+                .read_line(&mut next)
+                .map_err(|err| format!("读取 FTP 响应失败：{err}"))?;
+            if next.trim().is_empty() {
+                return Err("FTP 连接已关闭".to_string());
+            }
+            if next.as_bytes().get(3) == Some(&b' ') && next.starts_with(&code.to_string()) {
+                return Ok((code, next.trim().to_string()));
+            }
+        }
+    }
+    Ok((code, first))
+}
+
+/// 发送一条 FTP 命令并读取响应。
+fn ftp_send(
+    reader: &mut std::io::BufReader<std::net::TcpStream>,
+    command: &str,
+) -> Result<(u16, String), String> {
+    use std::io::Write;
+
+    {
+        let stream = reader.get_mut();
+        stream
+            .write_all(format!("{command}\r\n").as_bytes())
+            .map_err(|err| format!("发送 FTP 命令失败：{err}"))?;
+        stream
+            .flush()
+            .map_err(|err| format!("发送 FTP 命令失败：{err}"))?;
+    }
+    ftp_read_reply(reader)
+}
+
+/// 解析 PASV 响应中的数据通道地址。
+fn ftp_parse_pasv(text: &str) -> Result<std::net::SocketAddr, String> {
+    let start = text
+        .find('(')
+        .ok_or_else(|| format!("FTP PASV 响应无效：{text}"))?;
+    let end = text[start..]
+        .find(')')
+        .map(|offset| start + offset)
+        .ok_or_else(|| format!("FTP PASV 响应无效：{text}"))?;
+    let parts: Vec<&str> = text[start + 1..end].split(',').collect();
+    if parts.len() < 6 {
+        return Err(format!("FTP PASV 响应无效：{text}"));
+    }
+    let mut nums = [0u8; 6];
+    for (index, part) in parts.iter().take(6).enumerate() {
+        nums[index] = part
+            .trim()
+            .parse::<u8>()
+            .map_err(|_| format!("FTP PASV 响应无效：{text}"))?;
+    }
+    let host = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
+    let port = (nums[4] as u16) * 256 + nums[5] as u16;
+    format!("{host}:{port}")
+        .parse()
+        .map_err(|_| "FTP PASV 地址无效".to_string())
+}
+
+/// 通过 FTP 上传静态缓存文件（被动模式）。
+fn ftp_upload_files(
+    target: &FtpTarget,
+    files: &[(std::path::PathBuf, String)],
+) -> Result<usize, String> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = format!("{}:{}", target.host, target.port);
+    let socket_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| format!("FTP 地址无效：{addr}"))?;
+    let stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(10))
+        .map_err(|err| format!("连接 FTP 失败：{err}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+    let mut reader = std::io::BufReader::new(stream);
+
+    let (code, _) = ftp_read_reply(&mut reader)?;
+    if code / 100 != 2 {
+        return Err(format!("FTP 握手失败：{code}"));
+    }
+    let (user_code, _) = ftp_send(&mut reader, &format!("USER {}", target.username))?;
+    if user_code == 331 || user_code == 332 {
+        let (pass_code, pass_text) = ftp_send(&mut reader, &format!("PASS {}", target.password))?;
+        if pass_code / 100 != 2 {
+            return Err(format!("FTP 登录失败：{pass_code} {pass_text}"));
+        }
+    } else if user_code / 100 != 2 {
+        return Err(format!("FTP 登录失败：{user_code}"));
+    }
+    let (type_code, type_text) = ftp_send(&mut reader, "TYPE I")?;
+    if type_code / 100 != 2 {
+        return Err(format!("FTP 切换二进制模式失败：{type_code} {type_text}"));
+    }
+    if !target.webroot.trim().is_empty() {
+        let webroot = target.webroot.trim_end_matches('/');
+        let (cwd_code, cwd_text) = ftp_send(&mut reader, &format!("CWD {webroot}"))?;
+        if cwd_code / 100 != 2 {
+            return Err(format!("FTP 进入目录 {webroot} 失败：{cwd_code} {cwd_text}"));
+        }
+    }
+
+    let mut uploaded = 0usize;
+    for (local, remote) in files {
+        let bytes =
+            std::fs::read(local).map_err(|err| format!("读取文件 {} 失败：{err}", local.display()))?;
+        let remote = remote.trim_start_matches('/').replace('\\', "/");
+        let mut current = String::new();
+        if let Some((dirs, _)) = remote.rsplit_once('/') {
+            for part in dirs.split('/').filter(|part| !part.is_empty()) {
+                current.push_str(part);
+                let _ = ftp_send(&mut reader, &format!("MKD {current}"));
+                current.push('/');
+            }
+        }
+
+        let (pasv_code, pasv_text) = ftp_send(&mut reader, "PASV")?;
+        if pasv_code != 227 {
+            return Err(format!("FTP PASV 失败：{pasv_code} {pasv_text}"));
+        }
+        let data_addr = ftp_parse_pasv(&pasv_text)?;
+        let mut data = TcpStream::connect_timeout(&data_addr, Duration::from_secs(10))
+            .map_err(|err| format!("连接 FTP 数据通道失败：{err}"))?;
+        let _ = data.set_read_timeout(Some(Duration::from_secs(20)));
+        let _ = data.set_write_timeout(Some(Duration::from_secs(20)));
+
+        let (stor_code, stor_text) = ftp_send(&mut reader, &format!("STOR {remote}"))?;
+        if stor_code != 150 && stor_code != 125 {
+            return Err(format!("FTP 上传 {remote} 失败：{stor_code} {stor_text}"));
+        }
+        data.write_all(&bytes)
+            .map_err(|err| format!("写入 FTP 数据通道失败：{err}"))?;
+        let _ = data.flush();
+        drop(data);
+
+        let (done_code, done_text) = ftp_read_reply(&mut reader)?;
+        if done_code / 100 != 2 {
+            return Err(format!(
+                "FTP 上传 {remote} 完成确认失败：{done_code} {done_text}"
+            ));
+        }
+        uploaded += 1;
+    }
+    let _ = ftp_send(&mut reader, "QUIT");
+    Ok(uploaded)
+}
+
 /// `POST /system/api/plugin/htmlcache/push`
-async fn manage_htmlcache_push(State(state): State<AppState>, headers: HeaderMap) -> Response {
+///
+/// 请求体可选：`{"paths": ["..."], "all": true}`；`paths` 为空时全量推送。
+/// 本地存储只做统计；FTP 走被动模式上传；其余远程存储类型需要额外的存储客户端。
+async fn manage_htmlcache_push(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("静态缓存推送需要存储客户端，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let payload: Value = if body.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}))
+    };
+    let paths: Vec<String> = payload
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let config = match plugin::html_cache_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    let files = collect_html_cache_push_files(&state, &paths);
+    if files.is_empty() {
+        return fail("没有找到需要推送的静态缓存文件");
+    }
+    let storage_type = config
+        .get("storage_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let storage_type = if storage_type.is_empty() {
+        "local"
+    } else {
+        storage_type
+    };
+    match storage_type {
+        "local" => {
+            let now = chrono::Local::now().timestamp();
+            let _ = plugin::html_cache_save(pool, &json!({ "last_push_time": now })).await;
+            let total = files.len();
+            ok(json!({
+                "total": total,
+                "pushed": total,
+                "failed": 0,
+                "storage_type": "local",
+                "last_push_time": now,
+            }))
+        }
+        "ftp" => {
+            let target = FtpTarget {
+                host: config
+                    .get("ftp_host")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                port: config
+                    .get("ftp_port")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(21) as u16,
+                username: config
+                    .get("ftp_username")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                password: config
+                    .get("ftp_password")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                webroot: config
+                    .get("ftp_webroot")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            };
+            if target.host.is_empty() || target.username.is_empty() {
+                return fail("请先配置 FTP 主机与用户名");
+            }
+            let total = files.len();
+            let result = tokio::task::spawn_blocking(move || ftp_upload_files(&target, &files)).await;
+            match result {
+                Ok(Ok(uploaded)) => {
+                    let now = chrono::Local::now().timestamp();
+                    let _ = plugin::html_cache_save(pool, &json!({ "last_push_time": now })).await;
+                    ok(json!({
+                        "total": total,
+                        "pushed": uploaded,
+                        "failed": total - uploaded,
+                        "storage_type": "ftp",
+                        "last_push_time": now,
+                    }))
+                }
+                Ok(Err(err)) => fail(err),
+                Err(err) => failed(err.into()),
+            }
+        }
+        other => fail(format!(
+            "静态缓存推送暂只支持 local 与 ftp，当前存储类型为 {other}"
+        )),
+    }
 }
 
 /// `GET /system/api/plugin/htmlcache/push/status`
@@ -9583,11 +13772,34 @@ async fn manage_aigenerate_setting_save(
 }
 
 /// `GET /system/api/aigenerate/checkapi`
+///
+/// 对齐 Go `CheckOpenAIAPIValid`：请求配置的 OpenAI 接口地址，
+/// 只要能拿到 HTTP 响应就算可达（401 等鉴权失败也算网络通）。
+/// 未配置接口地址时直接提示去配置，不再默认请求 OpenAI。
 async fn manage_aigenerate_checkapi(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("AI 接口连通性检测需要外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = site_setting::get_section(pool, "ai_generate")
+        .await
+        .ok()
+        .unwrap_or(Value::Null);
+    let Some(link) = config_string(&config, &["open_ai_api", "openai_api", "api_url"]) else {
+        return fail("未配置 AI 接口，请先在 AI 写作设置中填写 OpenAI 接口地址");
+    };
+    let request =
+        rustcms_ext::http::Request::get(&link).with_timeout(std::time::Duration::from_secs(10));
+    match rustcms_ext::http::send(&request).await {
+        Ok(_) => ok_msg("服务器可以正常访问 AI 接口"),
+        Err(err) => {
+            tracing::warn!("检测 AI 接口失败（{link}）：{err:#}");
+            let detail = anqi_short_text(&format!("{err:#}"), 120);
+            fail(format!("已配置 AI 接口但无法访问：{detail}"))
+        }
+    }
 }
 
 /// `GET /system/api/aigenerate/plans`
@@ -9598,13 +13810,216 @@ async fn manage_aigenerate_plans(State(state): State<AppState>, headers: HeaderM
     ok(json!([]))
 }
 
-/// `POST /system/api/aigenerate/article/{collect,start}`
-async fn manage_aigenerate_article(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// AI 写作请求体（对齐 Go `request.KeywordRequest` 的 `id` / `title`）。
+#[derive(Debug, Deserialize, Default)]
+struct AiGenerateKeywordBody {
+    #[serde(default)]
+    id: u32,
+    #[serde(default)]
+    title: String,
+}
+
+/// 读取 AI 写作配置（缺省时返回 `null`，各取值处再兜默认）。
+async fn ai_generate_config(pool: &sqlx::MySqlPool) -> Value {
+    site_setting::get_section(pool, "ai_generate")
+        .await
+        .ok()
+        .unwrap_or(Value::Null)
+}
+
+/// 解析该关键词要写入的分类：关键词自带分类 → 配置的 `category_id` →
+/// 配置的 `category_ids` 首个 → 第一个内容列表分类（对齐 Go 兜底逻辑）。
+async fn ai_generate_category(
+    pool: &sqlx::MySqlPool,
+    config: &Value,
+    keyword: &collector::Keyword,
+) -> Result<u32, String> {
+    if keyword.category_id > 0 {
+        return Ok(keyword.category_id);
+    }
+    if let Some(id) = config.get("category_id").and_then(Value::as_u64) {
+        if id > 0 {
+            return Ok(id as u32);
+        }
+    }
+    if let Some(id) = config
+        .get("category_ids")
+        .and_then(Value::as_array)
+        .and_then(|list| list.first())
+        .and_then(Value::as_u64)
+    {
+        if id > 0 {
+            return Ok(id as u32);
+        }
+    }
+    let fallback: Option<u32> =
+        sqlx::query_scalar("SELECT id FROM categories WHERE type = 1 ORDER BY sort ASC, id ASC LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| format!("查询分类失败：{err}"))?;
+    fallback.ok_or_else(|| "请先在 AI 写作配置里选择文档分类".to_string())
+}
+
+/// 生成单个关键词的文章并落库（对齐 Go `AnqiAiGenerateArticle` +
+/// `AnqiSyncAiPlanResult`）：云端 `/ai/generate` 异步提交，之后每 10 秒
+/// `/ai/syncplan` 轮询一次，最多 30 次（5 分钟）。
+///
+/// 返回 `Ok(None)` 表示同名文档已存在（视为已生成过，跳过）。
+async fn ai_generate_article_for_keyword(
+    pool: &sqlx::MySqlPool,
+    keyword: &collector::Keyword,
+) -> Result<Option<i64>, String> {
+    let config = ai_generate_config(pool).await;
+    let language = config_string(&config, &["language"]).unwrap_or_else(|| "zh".to_string());
+    let demand = config_string(&config, &["demand"]).unwrap_or_default();
+    let category_id = ai_generate_category(pool, &config, keyword).await?;
+
+    let payload = json!({
+        "keyword": keyword.title,
+        "language": language,
+        "demand": demand,
+        "async": true,
+    });
+    let result = anqi_cloud_post(pool, "/ai/generate", &payload)
+        .await?
+        .get("data")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let req_id = result.get("req_id").and_then(Value::as_i64).unwrap_or(0);
+    if req_id <= 0 {
+        return Err("云端未返回任务编号（req_id）".to_string());
+    }
+    let result = anqi_ai_wait_plan(pool, req_id, result).await?;
+
+    let title = result
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(keyword.title.as_str())
+        .to_string();
+    let content = result
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if content.trim().is_empty() {
+        return Err("云端未返回文章内容".to_string());
+    }
+
+    let input = ArchiveInput {
+        title,
+        content,
+        category_id,
+        keywords: keyword.title.clone(),
+        origin_url: keyword.title.clone(),
+        ..Default::default()
+    };
+    match archive_write::create(pool, &input).await {
+        Ok(saved) => Ok(Some(saved.id)),
+        // 文档标题已重复 = 该关键词已经生成过
+        Err(err) if err.is_invalid() && err.to_string().contains("文档标题已重复") => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// `POST /system/api/aigenerate/article/collect`
+///
+/// 按指定关键词触发一次 AI 写作（关键词可传 `title` 自动建档，或传 `id`）。
+async fn manage_aigenerate_article_collect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AiGenerateKeywordBody>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("AI 内容生成需要外呼，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(msg) = ensure_anqi_bound(pool).await {
+        return fail(msg);
+    }
+    let keyword = if !body.title.trim().is_empty() {
+        let title = body.title.trim();
+        match collector::ensure_keyword(pool, title).await {
+            Ok(id) => match collector::get_keyword(pool, id).await {
+                Ok(Some(item)) => item,
+                Ok(None) => return fail("关键词不存在"),
+                Err(err) => return failed(err),
+            },
+            Err(err) => return failed(err.into()),
+        }
+    } else {
+        match collector::get_keyword(pool, body.id).await {
+            Ok(Some(item)) => item,
+            Ok(None) => return fail("关键词不存在"),
+            Err(err) => return failed(err),
+        }
+    };
+
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        match ai_generate_article_for_keyword(&pool, &keyword).await {
+            Ok(Some(_)) => {
+                if let Err(err) = collector::touch_keyword(&pool, keyword.id, 1).await {
+                    tracing::warn!("更新关键词状态失败：{err:#}");
+                }
+            }
+            Ok(None) => {
+                if let Err(err) = collector::touch_keyword(&pool, keyword.id, 0).await {
+                    tracing::warn!("更新关键词状态失败：{err:#}");
+                }
+            }
+            Err(err) => tracing::warn!("AI 写作失败（{}）：{err}", keyword.title),
+        }
+    });
+    ok_msg("AI生成任务已触发")
 }
+
+/// `POST /system/api/aigenerate/article/start`
+///
+/// 批量触发生成：后台按序处理最多 5 个「从未生成过」的启用关键词。
+async fn manage_aigenerate_article_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(msg) = ensure_anqi_bound(pool).await {
+        return fail(msg);
+    }
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let keywords = match collector::pending_keywords(&pool, 5).await {
+            Ok(list) => list,
+            Err(err) => {
+                tracing::warn!("读取待生成关键词失败：{err:#}");
+                return;
+            }
+        };
+        for keyword in keywords {
+            match ai_generate_article_for_keyword(&pool, &keyword).await {
+                Ok(_) => {
+                    if let Err(err) = collector::touch_keyword(&pool, keyword.id, 1).await {
+                        tracing::warn!("更新关键词状态失败：{err:#}");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("AI 写作失败（{}）：{err}", keyword.title);
+                    // 云端/网络异常时直接结束本轮，避免把剩余关键词全部耗在失败上
+                    break;
+                }
+            }
+        }
+    });
+    ok_msg("AI生成任务已触发")
+}
+
 
 // ---------------------------- 城市分站 -------------------------------------
 
@@ -9814,6 +14229,85 @@ async fn manage_push_logs(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 }
 
+/// 查询串百分号编码（只保留 RFC 3986 未保留字符）。
+fn query_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// 向已配置的搜索引擎推送链接，返回（是否至少有一项成功，汇总信息）。
+async fn push_to_search_engines(
+    site: &str,
+    baidu_token: &str,
+    bing_key: &str,
+    google_json: &str,
+    urls: &[String],
+) -> (bool, String) {
+    let mut success_any = false;
+    let mut parts: Vec<String> = Vec::new();
+
+    if !baidu_token.is_empty() {
+        // 百度普通收录：POST 纯文本换行分隔的 URL 列表。
+        let endpoint = format!(
+            "http://data.zz.baidu.com/urls?site={}&token={}",
+            query_encode(site),
+            query_encode(baidu_token)
+        );
+        let request = rustcms_ext::http::Request::post(endpoint)
+            .with_header("Content-Type", "text/plain; charset=utf-8")
+            .with_body(rustcms_ext::http::Body::Bytes(urls.join("\n").into_bytes()));
+        match rustcms_ext::http::send(&request).await {
+            Ok(response) if response.status == 200 && !response.text().contains("\"error\"") => {
+                success_any = true;
+                parts.push(format!("百度推送 {} 条成功", urls.len()));
+            }
+            Ok(response) => parts.push(format!("百度推送失败：{}", response.text().trim())),
+            Err(err) => parts.push(format!("百度推送失败：{err}")),
+        }
+    }
+
+    if !bing_key.is_empty() {
+        // Bing URL 提交接口：JSON 里带 siteUrl + urlList。
+        let endpoint = format!(
+            "https://ssl.bing.com/webmaster/api.svc/json/SubmitUrlbatch?apikey={}",
+            query_encode(bing_key)
+        );
+        let request = rustcms_ext::http::Request::post(endpoint).with_json(json!({
+            "siteUrl": site,
+            "urlList": urls,
+        }));
+        match rustcms_ext::http::send(&request).await {
+            Ok(response) if response.is_success() => {
+                success_any = true;
+                parts.push(format!("Bing 推送 {} 条成功", urls.len()));
+            }
+            Ok(response) => parts.push(format!(
+                "Bing 推送失败（HTTP {}）：{}",
+                response.status,
+                response.text().trim()
+            )),
+            Err(err) => parts.push(format!("Bing 推送失败：{err}")),
+        }
+    }
+
+    if !google_json.trim().is_empty() {
+        parts.push("Google 推送需要服务账号 OAuth 签名，本包暂未实现".to_string());
+    }
+
+    if parts.is_empty() {
+        parts.push("未配置可用的搜索引擎推送账号".to_string());
+    }
+    (success_any, parts.join("；"))
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct PushUrlsBody {
     #[serde(default)]
@@ -9821,6 +14315,8 @@ struct PushUrlsBody {
 }
 
 /// `POST /system/api/plugin/push/push`
+///
+/// 按 `settings.push` 里配置的百度 / Bing 账号推送链接，并记录一条推送日志。
 async fn manage_push_urls(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9832,18 +14328,55 @@ async fn manage_push_urls(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if body.urls.is_empty() {
+    let urls: Vec<String> = body
+        .urls
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    if urls.is_empty() {
         return fail("请提供要推送的链接");
     }
-    // 记录一条失败日志，方便前端看到「推送未实现」而不是什么都没发生
+    let config = match plugin::push_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    let baidu_token = config["baidu_api"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let bing_key = config["bing_api"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let google_json = config["google_json"].as_str().unwrap_or_default().to_string();
+    if baidu_token.is_empty() && bing_key.is_empty() && google_json.trim().is_empty() {
+        return fail("请先设置搜索引擎推送账号");
+    }
+    let site = site_base_url(pool).await;
+    if (!baidu_token.is_empty() || !bing_key.is_empty()) && site.is_empty() {
+        return fail("请先设置站点主域名");
+    }
+
+    let count = urls.len();
+    let (success, message) =
+        push_to_search_engines(&site, &baidu_token, &bing_key, &google_json, &urls).await;
+
     let entry = json!({
         "time": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        "count": body.urls.len(),
-        "status": 0,
-        "msg": "推送需要 HTTP 客户端，尚未实现",
+        "count": count,
+        "status": if success { 1 } else { 0 },
+        "msg": message.clone(),
     });
     let _ = plugin::push_log_add(pool, entry).await;
-    fail("搜索引擎推送需要 HTTP 客户端，尚未实现")
+
+    if success {
+        ok(json!({ "count": count, "message": message }))
+    } else {
+        fail(message)
+    }
 }
 
 // ---------------------------- 存储配置 -------------------------------------
@@ -10094,7 +14627,7 @@ struct WechatReplyBody {
 
 /// `POST /system/api/plugin/wechat/message/reply`
 ///
-/// 回复内容会落库；真正推送到微信需要 access_token 与 HTTP 客户端，暂未实现。
+/// 回复落库；公众号已配置 AppID / AppSecret 时同时通过客服接口推送给用户。
 async fn manage_wechat_message_reply(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10109,7 +14642,7 @@ async fn manage_wechat_message_reply(
     match wechat::message_reply(pool, body.id, &body.reply).await {
         Ok(saved) => Json(json!({
             "code": 0,
-            "msg": "操作成功（回复已记录，推送到微信尚未实现）",
+            "msg": "回复成功",
             "data": saved,
         }))
         .into_response(),
@@ -10244,7 +14777,18 @@ async fn manage_wechat_menu_sync(State(state): State<AppState>, headers: HeaderM
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    fail("同步菜单到微信服务器需要 access_token 与 HTTP 客户端，尚未实现")
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    match wechat::menu_sync(pool).await {
+        Ok(count) => Json(json!({
+            "code": 0,
+            "msg": "同步成功",
+            "data": { "count": count },
+        }))
+        .into_response(),
+        Err(err) => model_error(err),
+    }
 }
 
 // ---------------------------- 订单 / 财务 ----------------------------------
@@ -11398,13 +15942,80 @@ async fn manage_sendmail_template_preview(
     ok(sendmail::render_preview(&subject, &content, &data))
 }
 
+/// 把邮件配置转换成 ext 的发信账号；未配置服务器或账号时返回 None。
+fn sendmail_smtp_account(config: &Value) -> Option<rustcms_ext::smtp::SmtpAccount> {
+    let server = config["server"].as_str().unwrap_or_default().trim();
+    let account = config["account"].as_str().unwrap_or_default().trim();
+    if server.is_empty() || account.is_empty() {
+        return None;
+    }
+    let use_ssl = match &config["use_ssl"] {
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_i64().unwrap_or(0) != 0,
+        Value::String(text) => matches!(text.trim(), "1" | "true" | "True" | "yes"),
+        _ => false,
+    };
+    let port = config["port"]
+        .as_i64()
+        .filter(|value| (1..=65535).contains(value))
+        .map(|value| value as u16)
+        .unwrap_or(if use_ssl { 465 } else { 25 });
+    let from_email = if account.contains('@') {
+        account.to_string()
+    } else {
+        format!("{account}@{server}")
+    };
+    let mut smtp = rustcms_ext::smtp::SmtpAccount::new(
+        server.to_string(),
+        port,
+        account.to_string(),
+        config["password"].as_str().unwrap_or_default().to_string(),
+    )
+    .with_sender(from_email, String::new());
+    if use_ssl {
+        smtp = smtp.with_tls(rustcms_ext::smtp::TlsMode::Implicit);
+    }
+    Some(smtp)
+}
+
+/// 用 ext 的 SMTP 客户端发一封信（阻塞调用，需放在 spawn_blocking 里）。
+fn ext_smtp_send(
+    account: &rustcms_ext::smtp::SmtpAccount,
+    to: &str,
+    subject: &str,
+    html: &str,
+) -> anyhow::Result<()> {
+    let config = rustcms_ext::smtp::SmtpConfig::single(account.clone());
+    rustcms_ext::smtp::send(&config, &rustcms_ext::smtp::Mail::new(to, subject, html)).map(|_| ())
+}
+
+/// 追加一条发送记录到 `<cache>/mail.log`（与 `sendmail::mail_log_list` 的格式一致）。
+fn append_mail_log(cache_dir: &std::path::Path, subject: &str, status: &str, address: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(cache_dir);
+    let line = json!({
+        "created_time": chrono::Utc::now().timestamp(),
+        "subject": subject,
+        "status": status,
+        "address": address,
+    })
+    .to_string();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_dir.join(sendmail::MAIL_LOG_FILE))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// `POST /system/api/plugin/sendmail/test`
 ///
-/// 真实发信需要 SMTP 客户端，本项目未实现（对齐 push 等接口的处理方式）。
+/// 发送一封测试邮件；收件人优先取请求体里的 recipient/to/email，缺省用配置里的 recipient。
 async fn manage_sendmail_test(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -11412,20 +16023,53 @@ async fn manage_sendmail_test(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    // Go 版先校验「请先设置邮件发送账户」；无 SMTP 客户端时保持同样的前置校验
-    let account = sendmail::config_get(pool)
-        .await
-        .ok()
-        .and_then(|value| {
-            value["account"]
-                .as_str()
+    let config = match sendmail::config_get(pool).await {
+        Ok(value) => value,
+        Err(err) => return failed(err),
+    };
+    let Some(account) = sendmail_smtp_account(&config) else {
+        return fail("请先设置邮件发送账户");
+    };
+    let recipient = ["recipient", "to", "email"]
+        .iter()
+        .find_map(|key| {
+            body.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
                 .map(str::to_string)
         })
-        .unwrap_or_default();
-    if account.is_empty() {
-        return fail("请先设置邮件发送账户");
+        .or_else(|| {
+            config
+                .get("recipient")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let Some(recipient) = recipient else {
+        return fail("请填写收件邮箱地址");
+    };
+
+    let cache_dir = state.with_config(|config| config.cache_dir());
+    let subject = "测试邮件";
+    let html = "<p>这是一封测试邮件，收到说明邮件发送配置正常。</p>";
+    let to = recipient.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        ext_smtp_send(&account, &to, subject, html)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            append_mail_log(&cache_dir, subject, "success", &recipient);
+            ok_msg("发送成功")
+        }
+        Ok(Err(err)) => {
+            append_mail_log(&cache_dir, subject, "failed", &recipient);
+            fail(format!("发送失败：{err}"))
+        }
+        Err(err) => failed(anyhow::anyhow!("发送任务异常：{err}")),
     }
-    fail("发送测试邮件需要 SMTP 客户端，尚未实现")
 }
 
 // ---------------------------- 网站备份 ---------------------------------------
@@ -15252,7 +19896,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        assert_eq!(body_json(res).await["code"], 0);
 
         // 还原
         for (key, raw) in backup {
@@ -15606,20 +20250,70 @@ mod tests {
             .unwrap();
         assert_eq!(body_json(res).await["code"], 1);
 
-        // 未实现的能力明确报错
-        for uri in [
-            "/system/api/design/download",
-            "/system/api/design/upload",
-            "/system/api/design/data/backup",
-            "/system/api/design/data/restore",
-        ] {
-            let res = app
-                .clone()
-                .oneshot(bearer_request("POST", uri, &token, Value::Null))
-                .await
-                .unwrap();
-            assert_eq!(body_json(res).await["code"], 1, "{uri} 应返回未实现");
-        }
+        // 打包下载：附件形式返回 zip
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "POST",
+                "/system/api/design/download",
+                &token,
+                json!({"package": package}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/zip")
+        );
+        assert!(
+            res.headers()
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.contains("attachment;"))
+                .unwrap_or(false),
+            "应带附件头"
+        );
+
+        // 上传非法压缩包：解压失败
+        let boundary = "designUploadBoundary";
+        let mut mp_body = Vec::new();
+        mp_body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        mp_body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"bad.zip\"\r\n\
+              Content-Type: application/octet-stream\r\n\r\n",
+        );
+        mp_body.extend_from_slice(b"not a zip");
+        mp_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/system/api/design/upload")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(mp_body))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(body_json(res).await["code"], 1);
+
+        // 演示数据恢复：没有 data.db 时明确报错
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "POST",
+                "/system/api/design/data/restore",
+                &token,
+                json!({"package": package}),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 1, "{body}");
+        assert_eq!(body["msg"], "没有可用的演示数据", "{body}");
 
         // 删除模板（移到 cache/.history）
         let res = app
@@ -15671,19 +20365,46 @@ mod tests {
         assert!(body["data"]["max_size"].as_u64().unwrap() > 0, "{body}");
         assert!(!body["data"]["skip_rules"].as_str().unwrap().is_empty());
 
-        // 在线检查 / 在线升级 / 上传升级包：明确未实现
-        for (method, uri) in [
-            ("GET", "/system/api/version/check"),
-            ("POST", "/system/api/version/upgrade"),
-            ("POST", "/system/api/version/upload-upgrade"),
-        ] {
-            let res = app
-                .clone()
-                .oneshot(bearer_request(method, uri, &token, Value::Null))
-                .await
-                .unwrap();
-            assert_eq!(body_json(res).await["code"], 1, "{uri} 应返回未实现");
-        }
+        // 在线版本检查：外呼失败也会按「已是最新」返回成功
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "GET",
+                "/system/api/version/check",
+                &token,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["code"], 0, "version/check 应返回成功");
+
+        // 在线升级：缺少版本号时明确报错
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "POST",
+                "/system/api/version/upgrade",
+                &token,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 1, "{body}");
+        assert_eq!(body["msg"], "缺少目标版本号", "{body}");
+
+        // 上传升级包：暂未实现
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "POST",
+                "/system/api/version/upload-upgrade",
+                &token,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["code"], 1);
 
         // 当前站点信息
         let res = app
@@ -15796,17 +20517,19 @@ mod tests {
         assert_eq!(body["code"], 1, "{body}");
         assert_eq!(body["msg"], "默认站点不能删除");
 
-        // 多站点切换登录未实现
+        // 切换登录：站点已删除时明确报错
         let res = app
             .oneshot(bearer_request(
                 "POST",
                 "/system/api/website/login",
                 &token,
-                json!({"site_id": 2}),
+                json!({"site_id": site_id}),
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 1, "{body}");
+        assert_eq!(body["msg"], "站点不存在", "{body}");
 
         drop_temp_admin(&pool).await;
     }
@@ -17340,7 +22063,7 @@ mod tests {
         assert_eq!(body["data"]["height"], 600, "{body}");
         assert_eq!(body["data"]["open"], true, "{body}");
 
-        // 渲染相关：明确未实现
+        // 预览：返回可直接查看的 SVG data URI
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -17351,7 +22074,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert!(
+            body["data"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("data:image/svg+xml;base64,"),
+            "{body}"
+        );
 
         let res = app
             .clone()
@@ -17363,7 +22094,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        assert_eq!(body_json(res).await["code"], 0);
 
         // 上传：字体只收 ttf
         let res = app
@@ -18710,19 +23441,7 @@ mod tests {
         assert_eq!(body["data"]["opacity"], 100, "{body}");
         assert_eq!(body["data"]["open"], true, "{body}");
 
-        // 渲染相关未实现
-        for uri in [
-            "/system/api/plugin/watermark/preview",
-            "/system/api/plugin/watermark/generate",
-        ] {
-            let res = app
-                .clone()
-                .oneshot(bearer_request("POST", uri, &token, Value::Null))
-                .await
-                .unwrap();
-            // preview 是 GET，这里用 POST 会落到 404/405，只要不是 200 即可
-            let _ = res.status();
-        }
+        // 未配置水印图片时预览应给出明确错误
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -18847,7 +23566,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        assert_eq!(body_json(res).await["code"], 0);
 
         // 还原
         for (key, raw) in backups {
@@ -19176,12 +23895,19 @@ mod tests {
                 .await
                 .unwrap();
             let body = body_json(res).await;
-            // plans 返回空数组；checkapi 明确未实现
+            // plans 返回空数组；checkapi 会外呼探测，通与不通都应给出明确提示
             if uri.ends_with("plans") {
                 assert_eq!(body["code"], 0, "{body}");
                 assert!(body["data"].as_array().unwrap().is_empty(), "{body}");
             } else {
-                assert_eq!(body["code"], 1, "{body}");
+                assert!(
+                    body["code"] == 0 || body["code"] == 1,
+                    "checkapi 返回异常: {body}"
+                );
+                assert!(
+                    body["msg"].as_str().unwrap_or_default().contains("OpenAI"),
+                    "{body}"
+                );
             }
         }
 
@@ -19195,7 +23921,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        assert_eq!(body_json(res).await["code"], 0);
 
         // 还原
         for (key, raw) in backups {
@@ -21758,7 +26484,7 @@ mod tests {
         let body = body_json(res).await;
         assert_eq!(body["msg"], "no pending approval for this tool_call_id");
 
-        // image：空提示词 / 未实现
+        // image：空提示词 / 参考图下载失败（用不可达地址避免测试外呼云端）
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -21779,11 +26505,13 @@ mod tests {
                 "POST",
                 "/system/api/anqi/ai/image",
                 &token,
-                json!({"prompt": "一只猫"}),
+                json!({"prompt": "一只猫", "image": "http://127.0.0.1:1/a.png"}),
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], -1);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], -1, "{body}");
+        assert!(body["msg"].as_str().unwrap().contains("下载参考图片失败"), "{body}");
 
         // image/confirm：舍弃（action=0）真实可用
         let res = app
@@ -21804,11 +26532,13 @@ mod tests {
                 "POST",
                 "/system/api/anqi/ai/image/confirm",
                 &token,
-                json!({"action": 1, "url": "https://example.com/a.png"}),
+                json!({"action": 1, "url": "http://127.0.0.1:1/a.png"}),
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], -1);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], -1, "{body}");
+        assert!(body["msg"].as_str().unwrap().contains("下载图片失败"), "{body}");
 
         // image/histories：历史在云端服务侧，恒空
         let res = app

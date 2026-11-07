@@ -47,6 +47,23 @@ pub async fn reroute(State(state): State<AppState>, req: Request) -> Response {
     // 客户端 IP 只从代理头取（直连场景拿不到 SocketAddr 时跳过 IP 黑名单检查）
     let headers = req.headers().clone();
     let ip = client_ip(&headers);
+
+    // controller.UseLimiter：限流 / 防刷（后台与静态资源在判定内部跳过）
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if let Some(block) =
+        crate::models::plugin::limiter_check(ip.as_deref(), user_agent, referer, req.uri().path())
+    {
+        let status = StatusCode::from_u16(block.status).unwrap_or(StatusCode::FORBIDDEN);
+        return (status, block.body).into_response();
+    }
+
     match tokio::time::timeout(HANDLER_TIMEOUT, pipeline(state, req, ip)).await {
         Ok(res) => res,
         Err(_) => (StatusCode::REQUEST_TIMEOUT, "Request Timeout").into_response(),

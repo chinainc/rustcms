@@ -710,9 +710,6 @@ impl SiteProvider {
 
     async fn system(&self, args: &Map<String, Value>) -> Result<Value> {
         let name = args.get("name").map(super::as_text).unwrap_or_default();
-        if name == "TemplateUrl" {
-            return Ok(Value::String("/template/default/".into()));
-        }
         let raw: Option<String> =
             sqlx::query_scalar("SELECT value FROM settings WHERE `key` = 'system'")
                 .fetch_optional(&self.pool)
@@ -720,6 +717,19 @@ impl SiteProvider {
         let system: Value = raw
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or(Value::Null);
+        if name == "TemplateUrl" {
+            // 与 Go 版 `tags.system` 一致：模板静态资源在 `/static/{TemplateName}/` 下。
+            let template = system
+                .get("template_name")
+                .map(super::as_text)
+                .unwrap_or_default();
+            let template = if template.trim().is_empty() {
+                "default".to_string()
+            } else {
+                template
+            };
+            return Ok(Value::String(format!("/static/{template}/")));
+        }
         let field = match name.as_str() {
             "SiteName" => "site_name",
             "SiteLogo" => "site_logo",

@@ -1,8 +1,8 @@
 //! 网站备份（`pluginBackup.go`、Go `provider/backup.go`）。
 //!
 //! 备份文件落 `<data>/backup/`：
-//! - dump 产出 `.sql`（Go 新格式是 zip 包含 database.sql + template/ + static/，
-//!   本项目无 zip 依赖，先落纯 SQL；zip 的导入接口保留、恢复明确报未实现）；
+//! - dump 产出 `.sql`；`.zip` 备份包（`database.sql` + `template/` + `static/`）
+//!   可以导入与恢复；
 //! - 备注存 sidecar 文件 `<备份文件名>.remark.json`（`{"remark": "..."}`）；
 //! - 备份/恢复任务的进度是进程内存态（Go 的全局 `backupStatus`），任务结束
 //!   3 秒后自动从状态查询中消失。
@@ -405,24 +405,35 @@ pub fn split_sql_statements(content: &str) -> (Vec<String>, usize) {
     (statements, skipped)
 }
 
-/// 从备份恢复数据库（Go `RestoreData` 的 SQL 部分）。
+/// 从备份恢复（Go `RestoreData`）。
 ///
-/// `.zip` 备份需要 zip 解包能力，明确未实现；`.sql` 逐语句执行
-/// （含 `_logs` 的语句跳过），进度按字节数推进。
-pub async fn restore(pool: &MySqlPool, backup_dir: &Path, name: &str) -> Result<(), ModelError> {
+/// `.sql` 逐语句执行；`.zip` 先还原包内 `template/` 与 `static/`，
+/// 再执行 `database.sql`（含 `_logs` 的语句跳过），进度按语句数推进。
+pub async fn restore(
+    pool: &MySqlPool,
+    backup_dir: &Path,
+    name: &str,
+    template_dir: &Path,
+    public_dir: &Path,
+) -> Result<(), ModelError> {
     update_status("restore", 0, format!("正在恢复 {name}"));
-    if name.ends_with(".zip") {
-        return Err(ModelError::invalid(
-            "zip 备份包恢复需要 zip 解包库，暂未实现；请使用 .sql 备份",
-        ));
-    }
     let path = sanitize_path(backup_dir, name)?;
     if !path.is_file() {
         return Err(ModelError::invalid("备份文件不存在"));
     }
+    if name.ends_with(".zip") {
+        return restore_from_zip(pool, &path, template_dir, public_dir).await;
+    }
     let content = std::fs::read_to_string(&path)
         .map_err(|err| ModelError::invalid(format!("读取备份失败: {err}")))?;
-    let (statements, _) = split_sql_statements(&content);
+    execute_sql(pool, &content).await?;
+    finish_status("restore", "恢复完成");
+    Ok(())
+}
+
+/// 逐条执行 SQL（`split_sql_statements` 已过滤 `_logs` 表语句）。
+async fn execute_sql(pool: &MySqlPool, content: &str) -> Result<(), ModelError> {
+    let (statements, _) = split_sql_statements(content);
     let total = statements.len().max(1);
     for (index, statement) in statements.iter().enumerate() {
         sqlx::query(statement)
@@ -437,6 +448,90 @@ pub async fn restore(pool: &MySqlPool, backup_dir: &Path, name: &str) -> Result<
             "正在恢复数据",
         );
     }
+    Ok(())
+}
+
+/// 校验包内相对路径：拒绝空段、`.`、`..` 与盘符。
+fn safe_relative_path(name: &str) -> Option<PathBuf> {
+    let normalized = name.replace('\\', "/");
+    let mut path = PathBuf::new();
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.contains(':') {
+            return None;
+        }
+        path.push(segment);
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+/// 把 zip 包内某个前缀的文件还原到目标目录。
+fn extract_zip_prefix(
+    archive: &rustcms_ext::packer::ZipArchive,
+    prefix: &str,
+    dest: &Path,
+) -> Result<(), ModelError> {
+    for entry in archive.entries() {
+        if entry.is_dir {
+            continue;
+        }
+        let Some(relative) = entry.name.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(relative) = safe_relative_path(relative) else {
+            continue;
+        };
+        let target = dest.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| ModelError::invalid(format!("创建目录失败: {err}")))?;
+        }
+        let data = archive
+            .read_entry(entry)
+            .map_err(|err| ModelError::invalid(format!("解压 {} 失败: {err}", entry.name)))?;
+        std::fs::write(&target, data)
+            .map_err(|err| ModelError::invalid(format!("写入 {} 失败: {err}", target.display())))?;
+    }
+    Ok(())
+}
+
+/// 恢复 `.zip` 备份包（`database.sql` + `template/` + `static/`）。
+async fn restore_from_zip(
+    pool: &MySqlPool,
+    path: &Path,
+    template_dir: &Path,
+    public_dir: &Path,
+) -> Result<(), ModelError> {
+    let bytes = std::fs::read(path)
+        .map_err(|err| ModelError::invalid(format!("读取备份失败: {err}")))?;
+    let archive = rustcms_ext::packer::ZipArchive::open(bytes)
+        .map_err(|err| ModelError::invalid(format!("zip 备份包解析失败: {err}")))?;
+
+    // 1. 模板文件还原到 template_dir
+    update_status("restore", 0, "正在还原模板文件");
+    extract_zip_prefix(&archive, "template/", template_dir)?;
+
+    // 2. 模板静态资源还原到 public/static/<模板目录名>
+    update_status("restore", 0, "正在还原静态资源");
+    let template_name = template_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let static_dir = public_dir.join("static").join(template_name);
+    extract_zip_prefix(&archive, "static/", &static_dir)?;
+
+    // 3. 最后还原数据库
+    let Some(entry) = archive
+        .entries()
+        .iter()
+        .find(|entry| entry.name == "database.sql")
+    else {
+        return Err(ModelError::invalid("zip 备份包内缺少 database.sql"));
+    };
+    let data = archive
+        .read_entry(entry)
+        .map_err(|err| ModelError::invalid(format!("解压 database.sql 失败: {err}")))?;
+    let content = String::from_utf8_lossy(&data);
+    execute_sql(pool, &content).await?;
     finish_status("restore", "恢复完成");
     Ok(())
 }

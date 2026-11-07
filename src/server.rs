@@ -24,6 +24,13 @@ pub async fn run(state: AppState) -> Result<()> {
     let port = state.with_config(|c| c.port());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+    // 进程内限流器只在内存里保存状态，重启后按 settings.limiter 重新装载
+    if let Some(pool) = state.db().cloned() {
+        if let Err(err) = crate::models::plugin::limiter_reload(&pool).await {
+            tracing::warn!("加载限流配置失败：{err:#}");
+        }
+    }
+
     let app = build_app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr)

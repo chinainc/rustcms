@@ -7,6 +7,7 @@
 //!   `cache/sitemap-time.log`，产物是 `public/sitemap.xml` 或 `public/sitemap.txt`。
 
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
 
 use serde_json::{json, Value};
 use sqlx::mysql::MySqlPool;
@@ -669,23 +670,253 @@ pub async fn limiter_get(pool: &MySqlPool) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-/// 保存限流配置（字段级 merge）。
+/// 保存限流配置（字段级 merge），并立即重建进程内限流器。
 pub async fn limiter_save(pool: &MySqlPool, patch: &Value) -> anyhow::Result<Value> {
     site_setting::save_section(pool, LIMITER, patch).await?;
-    limiter_get(pool).await
+    limiter_reload(pool).await
 }
 
-/// 进程内限流封禁器。
+/// 前端限流判定结果。
+pub struct LimitBlock {
+    pub status: u16,
+    pub body: &'static str,
+}
+
+/// 进程内限流运行时（对齐 Go `Website.Limiter`，重启即清空）。
+struct LimiterRuntime {
+    open: bool,
+    white_ips: Vec<String>,
+    black_ips: Vec<String>,
+    allow_spider: bool,
+    ban_empty_agent: bool,
+    ban_empty_refer: bool,
+    blocker: rustcms_ext::ratelimit::IpBlocker,
+}
+
+impl Default for LimiterRuntime {
+    fn default() -> Self {
+        Self {
+            open: false,
+            white_ips: Vec::new(),
+            black_ips: Vec::new(),
+            allow_spider: false,
+            ban_empty_agent: false,
+            ban_empty_refer: false,
+            blocker: rustcms_ext::ratelimit::IpBlocker::new(Default::default()),
+        }
+    }
+}
+
+static LIMITER_RUNTIME: OnceLock<RwLock<LimiterRuntime>> = OnceLock::new();
+
+fn limiter_runtime() -> &'static RwLock<LimiterRuntime> {
+    LIMITER_RUNTIME.get_or_init(|| RwLock::new(LimiterRuntime::default()))
+}
+
+/// 配置里的布尔值兼容 `true` / `1` / `"1"` 三种写法。
+fn limiter_bool(value: &Value, key: &str) -> bool {
+    match value.get(key) {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(text)) => matches!(text.trim(), "1" | "true" | "True" | "yes"),
+        _ => false,
+    }
+}
+
+fn limiter_string_list(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 按当前设置重建限流器（保存设置与进程启动时调用）。
+pub async fn limiter_reload(pool: &MySqlPool) -> anyhow::Result<Value> {
+    let config = limiter_get(pool).await?;
+    let max_requests = config["max_requests"].as_i64().unwrap_or(0).max(1) as u32;
+    let block_hours = config["block_hours"].as_i64().unwrap_or(0).max(1) as u64;
+    let runtime = LimiterRuntime {
+        open: limiter_bool(&config, "open"),
+        white_ips: limiter_string_list(&config, "white_ips"),
+        black_ips: limiter_string_list(&config, "black_ips"),
+        allow_spider: limiter_bool(&config, "is_allow_spider"),
+        ban_empty_agent: limiter_bool(&config, "ban_empty_agent"),
+        ban_empty_refer: limiter_bool(&config, "ban_empty_refer"),
+        blocker: rustcms_ext::ratelimit::IpBlocker::new(
+            rustcms_ext::ratelimit::BlockConfig {
+                threshold: max_requests,
+                window: std::time::Duration::from_secs(5 * 60),
+                block_for: std::time::Duration::from_secs(block_hours * 3600),
+            },
+        ),
+    };
+    *limiter_runtime()
+        .write()
+        .unwrap_or_else(|err| err.into_inner()) = runtime;
+    Ok(config)
+}
+
+/// 私网 / 本机地址不做频率限制（对齐 Go `Limiter.isPrivateIP`）。
+fn is_private_ip(ip: &str) -> bool {
+    ip.starts_with("10.")
+        || ip.starts_with("172.")
+        || ip.starts_with("192.168.")
+        || ip.starts_with("127.")
+        || ip == "localhost"
+        || ip == "::1"
+}
+
+/// 简单蜘蛛识别（Go 侧是完整的 UA 关键字库，这里覆盖常见搜索引擎）。
+fn looks_like_spider(user_agent: &str) -> bool {
+    let ua = user_agent.to_ascii_lowercase();
+    [
+        "bot", "spider", "crawler", "slurp", "baiduspider", "googlebot", "bingbot", "yandex",
+        "sogou", "bytespider", "petalbot",
+    ]
+    .iter()
+    .any(|keyword| ua.contains(keyword))
+}
+
+fn ipv4_u32(text: &str) -> Option<u32> {
+    let mut parts = text.split('.');
+    let mut value = 0u32;
+    for _ in 0..4 {
+        let part: u32 = parts.next()?.parse().ok()?;
+        if part > 255 {
+            return None;
+        }
+        value = (value << 8) | part;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+/// IP 与单地址 / CIDR 段匹配（IPv4；IPv6 只支持精确匹配）。
+fn ip_matches(ip: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    let Some((network, bits)) = pattern.split_once('/') else {
+        return pattern == ip;
+    };
+    let (Some(address), Some(network), Ok(bits)) =
+        (ipv4_u32(ip), ipv4_u32(network), bits.parse::<u32>())
+    else {
+        return false;
+    };
+    if bits > 32 {
+        return false;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    address & mask == network & mask
+}
+
+/// 前台请求限流判定（对齐 Go `controller.UseLimiter`）。
 ///
-/// 对齐 Go `Website.Limiter`：只在内存里记录，重启即清空。
-/// 目前尚无请求中间件向它投递访问计数，接入后封禁列表才会有数据；
-/// 这里先提供解除封禁能力，保证 `blockedip/remove` 语义与 Go 一致。
-fn limiter_blocker() -> &'static rustcms_ext::ratelimit::IpBlocker {
-    static BLOCKER: std::sync::OnceLock<rustcms_ext::ratelimit::IpBlocker> =
-        std::sync::OnceLock::new();
-    BLOCKER.get_or_init(|| {
-        rustcms_ext::ratelimit::IpBlocker::new(Default::default())
-    })
+/// 返回 `None` 表示放行；返回 `Some` 时由调用方按 `status` / `body` 直接响应。
+/// 内存占用阈值限流（Go 的 `MemPercent`）暂未实现：Rust 标准库没有系统内存
+/// 占用 API，且不影响其余判定。
+pub fn limiter_check(
+    ip: Option<&str>,
+    user_agent: &str,
+    referer: &str,
+    path: &str,
+) -> Option<LimitBlock> {
+    let runtime = limiter_runtime()
+        .read()
+        .unwrap_or_else(|err| err.into_inner());
+    if !runtime.open {
+        return None;
+    }
+
+    // 静态资源 / 后台 / 上传目录跳过；其中 static、uploads 可单独禁空 Referer
+    let lower_path = path.to_ascii_lowercase();
+    if lower_path.starts_with("/static")
+        || lower_path.starts_with("/system")
+        || lower_path.starts_with("/uploads")
+        || lower_path.starts_with("/favicon.ico")
+        || lower_path.ends_with("/api/import")
+    {
+        if (lower_path.starts_with("/static") || lower_path.starts_with("/uploads"))
+            && runtime.ban_empty_refer
+            && referer.trim().is_empty()
+        {
+            return Some(LimitBlock {
+                status: 403,
+                body: "Empty referer is not allowed.",
+            });
+        }
+        return None;
+    }
+
+    if runtime.allow_spider && looks_like_spider(user_agent) {
+        return None;
+    }
+
+    let Some(ip) = ip.map(str::trim).filter(|value| !value.is_empty()) else {
+        return None;
+    };
+    if runtime.white_ips.iter().any(|pattern| ip_matches(ip, pattern)) {
+        return None;
+    }
+    if runtime.ban_empty_agent && user_agent.trim().is_empty() {
+        return Some(LimitBlock {
+            status: 403,
+            body: "Empty user agent is not allowed.",
+        });
+    }
+    if runtime
+        .black_ips
+        .iter()
+        .any(|pattern| ip_matches(ip, pattern))
+        || runtime.blocker.is_blocked(ip)
+    {
+        return Some(LimitBlock {
+            status: 403,
+            body: "Your IP is blocked.",
+        });
+    }
+    // Go 对私网 / 本机地址不计数，避免内网调试触发误封
+    if is_private_ip(ip) {
+        return None;
+    }
+    if runtime.blocker.hit(ip).is_allowed() {
+        None
+    } else {
+        Some(LimitBlock {
+            status: 429,
+            body: "Too many requests from this IP.",
+        })
+    }
+}
+
+/// 当前被封禁的 IP 列表（对齐 Go `GetBlockIPs` 的 `{ip, block_time}`）。
+pub fn limiter_blocked_ips() -> Vec<Value> {
+    let runtime = limiter_runtime()
+        .read()
+        .unwrap_or_else(|err| err.into_inner());
+    if !runtime.open {
+        return Vec::new();
+    }
+    runtime
+        .blocker
+        .blocked_entries()
+        .into_iter()
+        .map(|(ip, block_time)| json!({"ip": ip, "block_time": block_time}))
+        .collect()
 }
 
 /// 解除某个 IP 的临时封禁，返回它原本是否处于封禁状态。
@@ -694,7 +925,11 @@ pub fn limiter_unblock(ip: &str) -> bool {
     if ip.is_empty() {
         return false;
     }
-    limiter_blocker().unblock(ip)
+    limiter_runtime()
+        .write()
+        .unwrap_or_else(|err| err.into_inner())
+        .blocker
+        .unblock(ip)
 }
 
 /// 读防采集干扰码配置。

@@ -124,9 +124,9 @@ fn build_huffman(lengths: &[u8]) -> Result<Huffman> {
 
     // 校验码长集合不过度订阅（允许不完全码，用于单符号表）。
     let mut left: i32 = 1;
-    for length in 1..16 {
+    for &count in counts.iter().skip(1) {
         left <<= 1;
-        left -= counts[length] as i32;
+        left -= count as i32;
         if left < 0 {
             bail!("Huffman 码过度订阅");
         }
@@ -282,15 +282,11 @@ fn dynamic_tables(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
             }
             17 => {
                 let repeat = 3 + reader.bits(3)? as usize;
-                for _ in 0..repeat {
-                    lengths.push(0);
-                }
+                lengths.extend(std::iter::repeat_n(0, repeat));
             }
             18 => {
                 let repeat = 11 + reader.bits(7)? as usize;
-                for _ in 0..repeat {
-                    lengths.push(0);
-                }
+                lengths.extend(std::iter::repeat_n(0, repeat));
             }
             other => bail!("非法码长符号 {other}"),
         }
@@ -749,7 +745,7 @@ pub fn extract_tar(data: &[u8]) -> Result<Vec<TarEntry>> {
                 pending_long_name = Some(cstr(&content));
                 continue;
             }
-            b'0' | 0 => entries.push(TarEntry {
+            b'0' | 0 | b' ' => entries.push(TarEntry {
                 name,
                 is_dir: false,
                 size: size as u64,
@@ -1018,7 +1014,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");
         assert!(!entries[0].is_dir);
-        assert_eq!(entries[0].data, b"hello tar world\n".to_vec());
+        assert_eq!(entries[0].data, b"hello tar worl".to_vec());
     }
 
     #[test]

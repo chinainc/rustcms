@@ -495,3 +495,62 @@ Go 侧有机器可读的端点目录 `provider/api_catalog.json`（403 条，含
 ### 已知简化（均有注释与测试说明）
 
 `HtmlToMarkdown` 简化版、sitemap 不分片、多站点单连接池、模板 zip 打包/上传、AI 对话与生图。
+
+---
+
+## 十八、A 类接线补全（2026-11-07）
+
+本轮把「已有 ext 能力、但 handler 仍占位」的缺口接上，并修正与实现脱节的测试。
+
+### 1. 升级包上传解压
+- `POST /system/api/version/upload-upgrade` 真实实现（原为「需 zip/tar 库」占位）。
+- 表单：`file`（按魔数识别 zip / tar.gz）、`version`、`force=1`；单路由 `DefaultBodyLimit` 放宽到 512MB + 1MB。
+- 对齐 Go `upgrade.go`：包内 `version.json` 可缺省（缺省且非强制时报错）、版本不高于当前且非强制时拒绝；
+  剥离公共顶层目录；跳过 `template/ public/ data/ uploads/ logs/ static/`、
+  `*.sh/*.bat/*.cmd/*.ps1`、`config.json/favicon.ico/version.json`；
+  解压上限 2GB / 20000 条；主程序写 `.new`，成功后备份并替换。
+- 在线升级 `version/upgrade` 复用同一 `install_upgrade_archive`（官方包固定 zip）。
+
+### 2. zip 备份恢复
+- `models::backup::restore` 增加 `template_dir` / `public_dir` 参数；`.zip` 先还原 `template/`
+  到模板目录、`static/` 到 `public/static/<模板目录名>`，再执行 `database.sql`。
+- 包内路径逐段校验，拒绝 `..`、绝对路径与盘符；`.sql` / `.zip` 共用 `execute_sql`
+  （`_logs` 语句仍跳过）。
+
+### 3. 限流器接线
+- `plugin` 新增进程内 `LimiterRuntime`（对齐 Go `Website.Limiter`）：
+  `open / white_ips / black_ips / max_requests / block_hours / is_allow_spider /
+  ban_empty_agent / ban_empty_refer`，名单支持 IPv4 CIDR。
+- `front::reroute` 在进入渲染管线前调用 `limiter_check`：私网放行、白名单放行、
+  黑名单/已封禁 403、超限 429；`/static`、`/uploads` 可单独禁空 Referer。
+- `GET /plugin/limiter/blockedips` 返回真实的 `{ip, block_time}` 列表；
+  `POST /plugin/limiter/blockedip/remove` 走真实封禁器。
+- 服务启动时按 `settings.limiter` 装载；保存设置后立即重建（重启后内存封禁列表清空，与 Go 一致）。
+- `crates/ext` 的 `IpBlocker` 补 `is_blocked` / `blocked_entries`。
+
+### 4. 测试与基建
+- sendmail 测试改为「把服务器指向 127.0.0.1:1 → 断言发送失败」，不再断言旧的「未实现」文案。
+- 升级上传测试覆盖：缺文件、非法格式、低版本 zip（版本校验在落盘前拒绝）。
+- `xml_fields` 修复 CDATA 与嵌套容器解析（此前 `<xml>…</xml>` 会把整段吞成 `xml` 字段）。
+- `test_pool` 支持 `RUSTCMS_TEST_CONFIG`，受限环境可把测试配置放在仓库内。
+- 模板 `system.TemplateUrl` 统一为 `/static/<template_name>/`（与 Go `tags.system` 一致）。
+
+### 5. 验证结果（2026-11-07）
+- `cargo check --offline --all-targets`：通过，0 告警。
+- `cargo test --offline --no-run`：通过（约 2m30s）。
+- `crates/ext`：42 项非网络测试全绿；7 项回环网络测试（HTTP/SMTP 本地监听）因本机沙箱
+  禁止 `127.0.0.1` 连接而未执行，非代码缺陷。
+- 主 crate：**320 passed / 5 failed**。5 项均为环境限制：3 项依赖 MySQL
+  （沙箱无法连 `127.0.0.1:3306`）、1 项依赖 `E:/CodeBuddy/clientFiles`（仓库外不可写）、
+  1 项是依赖数据库的首页渲染。
+- 构建环境备注：本机 gcc 的 cc1/库搜索路径失效，编译前需把
+  `mingw64/libexec/gcc/x86_64-w64-mingw32/16.2.0` 加入 `PATH`、
+  把 `mingw64/x86_64-w64-mingw32/lib` 等加入 `LIBRARY_PATH`；
+  `RUST_MIN_STACK` 必须写字节数（如 `67108864`）。
+
+### 6. 仍存缺口（非本轮范围）
+- 备份 **dump 仍只产 `.sql`**：zip 备份包可恢复，但生成侧尚未打 `template/` + `static/`。
+- 微信消息推送 / 授权码换用户信息 / 小程序二维码、Google 推送 OAuth、PayPal capture
+  等外呼仍未接线。
+- 支付宝 RSA2 验签、小程序 AES 解密、GraphQL、水印与更多图像格式需要新增 crate，离线环境不可。
+- `tags/`（tera 已替代）、`library/`、`crond/`、`pkg/` 仍按既有结论不移植。

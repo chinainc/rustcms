@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Multipart, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -1434,7 +1434,8 @@ fn manage_router() -> Router<AppState> {
         .route("/version/upgrade", post(manage_version_upgrade))
         .route(
             "/version/upload-upgrade",
-            post(manage_version_upload_upgrade),
+            post(manage_version_upload_upgrade)
+                .layer(DefaultBodyLimit::max(UPGRADE_UPLOAD_MAX_SIZE as usize + 1024 * 1024)),
         )
         .route("/siteinfo", get(manage_current_site_info))
         .route("/website/list", get(manage_website_list))
@@ -7460,13 +7461,209 @@ struct VersionUpgradeBody {
     trial_version: String,
 }
 
-/// 解压升级包并覆盖程序目录。
+/// 升级包内的 version.json（字段与 Go `upgradeManifest` 一致）。
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)] // date / note 只为与 Go 清单字段对齐，当前响应不使用
+struct UpgradeManifest {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    sql: Vec<String>,
+}
+
+/// 升级结果（字段名与 Go `upgradeStats` 一致）。
+#[derive(Debug, Default, Serialize)]
+struct UpgradeStats {
+    version: String,
+    files: usize,
+    skipped: usize,
+    bytes: u64,
+    sql: Vec<String>,
+}
+
+/// 解压后总体积上限（2GB，防 zip bomb）与条目数上限（与 Go 一致）。
+const UPGRADE_UNPACK_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const UPGRADE_MAX_FILE_COUNT: usize = 20_000;
+
+/// 按文件魔数识别升级包格式：`zip` / `tar.gz` / 空串（对齐 Go `detectUpgradeArchive`）。
+fn detect_upgrade_archive(body: &[u8]) -> &'static str {
+    if body.starts_with(b"PK") {
+        "zip"
+    } else if body.starts_with(&[0x1f, 0x8b]) {
+        "tar.gz"
+    } else {
+        ""
+    }
+}
+
+/// 去掉包内公共顶层目录（如 `rustcms-v3.7.0/`）后的相对路径。
+fn relative_upgrade_name(raw: &str, prefix: &str) -> String {
+    let normalized = raw.replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    let mut name = normalized.trim_start_matches('/').to_string();
+    if !prefix.is_empty() {
+        if let Some(rest) = name.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/')) {
+            name = rest.to_string();
+        }
+    }
+    name.trim().to_string()
+}
+
+/// 计算包内所有条目的唯一顶层目录；有根级文件或顶层不唯一时返回空串。
+fn upgrade_common_prefix(names: &[String]) -> String {
+    let mut prefix: Option<String> = None;
+    for raw in names {
+        let normalized = raw.replace('\\', "/");
+        let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+        let name = normalized.trim_start_matches('/');
+        if name.is_empty() {
+            continue;
+        }
+        let Some((first, _rest)) = name.split_once('/') else {
+            return String::new();
+        };
+        match &prefix {
+            None => prefix = Some(first.to_string()),
+            Some(existing) if existing != first => return String::new(),
+            _ => {}
+        }
+    }
+    prefix.unwrap_or_default()
+}
+
+/// 不覆盖的文件：模板、静态资源、用户数据、日志与脚本（对齐 Go `shouldSkipUpgradeFile`）。
+fn should_skip_upgrade_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const PREFIXES: [&str; 6] = ["template/", "public/", "data/", "uploads/", "logs/", "static/"];
+    if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
+        return true;
+    }
+    if [".sh", ".bat", ".cmd", ".ps1"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    matches!(lower.as_str(), "config.json" | "favicon.ico" | "version.json")
+}
+
+/// 判断包内条目是否是主程序（当前可执行名 + Go 版命名兼容）。
+fn is_upgrade_executable(name: &str, exe_name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    base == exe_name.to_ascii_lowercase()
+        || matches!(
+            base.as_str(),
+            "rustcms"
+                | "rustcms.exe"
+                | "anqicms"
+                | "anqicms.exe"
+                | "anqicms-server"
+                | "anqicms-server.exe"
+        )
+}
+
+/// 读取包内 `version.json`（根目录或唯一顶层目录下，最多一层前缀）。
+fn read_upgrade_manifest(body: &[u8], kind: &str) -> Option<UpgradeManifest> {
+    let data = match kind {
+        "zip" => {
+            let archive = rustcms_ext::packer::ZipArchive::open(body.to_vec()).ok()?;
+            let entry = archive.entries().iter().find(|entry| {
+                if entry.is_dir {
+                    return false;
+                }
+                let normalized = entry.name.replace('\\', "/");
+                let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+                let name = normalized.trim_matches('/');
+                name.rsplit('/').next() == Some("version.json") && name.matches('/').count() <= 1
+            })?;
+            archive.read_entry(entry).ok()?
+        }
+        "tar.gz" => {
+            let entries = rustcms_ext::packer::extract_tar_gz(body).ok()?;
+            entries
+                .into_iter()
+                .find(|entry| {
+                    let normalized = entry.name.replace('\\', "/");
+                    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+                    normalized.trim_matches('/').rsplit('/').next() == Some("version.json")
+                })?
+                .data
+        }
+        _ => return None,
+    };
+    serde_json::from_slice(&data).ok()
+}
+
+/// 解压升级包并覆盖程序目录（`zip` / `tar.gz`）。
 ///
-/// 与 Go 一致：跳过模板 / 静态资源 / 脚本 / favicon，主程序先写 `.new`，
-/// 再把正在运行的程序改名备份后替换；包内路径拒绝 `..` 与绝对路径。
-fn install_upgrade_zip(body: &[u8], exec_dir: &std::path::Path) -> Result<(), ModelError> {
-    let archive = rustcms_ext::packer::ZipArchive::open(body.to_vec())
-        .map_err(|err| ModelError::invalid(format!("升级包解压失败：{err}")))?;
+/// 与 Go 一致：剥掉包内公共顶层目录，跳过模板 / 静态资源 / 用户数据 / 日志 / 脚本，
+/// 主程序先写 `.new`，全部成功后再把正在运行的程序改名备份并替换；包内路径拒绝
+/// 绝对路径、盘符与 `..`。在线升级（官方包）也复用本函数。
+fn install_upgrade_archive(
+    body: &[u8],
+    kind: &str,
+    exec_dir: &std::path::Path,
+) -> Result<UpgradeStats, ModelError> {
+    struct UpgradeEntry {
+        name: String,
+        is_dir: bool,
+        data: Vec<u8>,
+    }
+
+    let entries: Vec<UpgradeEntry> = match kind {
+        "zip" => {
+            let archive = rustcms_ext::packer::ZipArchive::open(body.to_vec())
+                .map_err(|err| ModelError::invalid(format!("升级包解压失败：{err}")))?;
+            let mut list = Vec::with_capacity(archive.entries().len());
+            for entry in archive.entries() {
+                let data = if entry.is_dir {
+                    Vec::new()
+                } else {
+                    archive.read_entry(entry).map_err(|err| {
+                        ModelError::invalid(format!("解压 {} 失败：{err}", entry.name))
+                    })?
+                };
+                list.push(UpgradeEntry {
+                    name: entry.name.clone(),
+                    is_dir: entry.is_dir,
+                    data,
+                });
+            }
+            list
+        }
+        "tar.gz" => rustcms_ext::packer::extract_tar_gz(body)
+            .map_err(|err| ModelError::invalid(format!("升级包解压失败：{err}")))?
+            .into_iter()
+            .map(|entry| UpgradeEntry {
+                name: entry.name,
+                is_dir: entry.is_dir,
+                data: entry.data,
+            })
+            .collect(),
+        other => return Err(ModelError::invalid(format!("无法识别的升级包格式：{other}"))),
+    };
+
+    if entries.len() > UPGRADE_MAX_FILE_COUNT {
+        return Err(ModelError::invalid(format!(
+            "升级包条目超过 {UPGRADE_MAX_FILE_COUNT} 个，已中止"
+        )));
+    }
+    let total_bytes: u64 = entries
+        .iter()
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| entry.data.len() as u64)
+        .sum();
+    if total_bytes > UPGRADE_UNPACK_MAX_SIZE {
+        return Err(ModelError::invalid("解压后体积超过上限，已中止"));
+    }
+
+    let names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let prefix = upgrade_common_prefix(&names);
+
     let exe = std::env::current_exe()
         .map_err(|err| ModelError::invalid(format!("取程序路径失败：{err}")))?;
     let exe_name = exe
@@ -7476,46 +7673,55 @@ fn install_upgrade_zip(body: &[u8], exec_dir: &std::path::Path) -> Result<(), Mo
     let exe_path = exec_dir.join(&exe_name);
     let new_exe_path = exec_dir.join(format!("{exe_name}.new"));
 
-    for entry in archive.entries() {
-        if entry.is_dir {
+    let mut stats = UpgradeStats::default();
+    for entry in entries {
+        let name = relative_upgrade_name(&entry.name, &prefix);
+        if name.is_empty() {
             continue;
         }
-        let name = entry.name.replace('\\', "/");
-        if name.contains("template/")
-            || name.contains("static/")
-            || name.contains(".sh")
-            || name.contains(".bat")
-            || name.contains("favicon.ico")
-        {
-            continue;
-        }
-        // 防路径穿越：拒绝绝对路径、盘符与上级目录
+        // 防路径穿越：拒绝绝对路径、盘符、空段与上级目录
         if name.starts_with('/')
-            || name.starts_with('.')
             || name.contains(':')
-            || name.split('/').any(|segment| segment == "..")
+            || name
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
         {
+            stats.skipped += 1;
             continue;
         }
-        let target = if name == exe_name {
+        if entry.is_dir {
+            let target = exec_dir.join(&name);
+            std::fs::create_dir_all(&target).map_err(|err| {
+                ModelError::invalid(format!("创建目录 {} 失败：{err}", target.display()))
+            })?;
+            continue;
+        }
+        if should_skip_upgrade_file(&name) {
+            stats.skipped += 1;
+            continue;
+        }
+        let target = if is_upgrade_executable(&name, &exe_name) {
             new_exe_path.clone()
         } else {
             exec_dir.join(&name)
         };
-        let Ok(bytes) = archive.read_entry(entry) else {
-            continue;
-        };
         if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|err| {
+                ModelError::invalid(format!("创建目录 {} 失败：{err}", parent.display()))
+            })?;
         }
-        let _ = std::fs::write(&target, bytes);
-        if name == exe_name {
+        std::fs::write(&target, &entry.data).map_err(|err| {
+            ModelError::invalid(format!("写入 {} 失败：{err}", target.display()))
+        })?;
+        if is_upgrade_executable(&name, &exe_name) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
             }
         }
+        stats.files += 1;
+        stats.bytes += entry.data.len() as u64;
     }
 
     // 替换主程序：先备份旧程序，失败时回滚
@@ -7528,7 +7734,12 @@ fn install_upgrade_zip(body: &[u8], exec_dir: &std::path::Path) -> Result<(), Mo
             let _ = std::fs::rename(&old_exe_path, &exe_path);
         }
     }
-    Ok(())
+    Ok(stats)
+}
+
+/// 在线升级（官方包固定为 zip）入口。
+fn install_upgrade_zip(body: &[u8], exec_dir: &std::path::Path) -> Result<(), ModelError> {
+    install_upgrade_archive(body, "zip", exec_dir).map(|_| ())
 }
 
 /// `POST /system/api/version/upgrade`
@@ -7594,14 +7805,142 @@ async fn manage_version_upgrade(
 }
 
 /// `POST /system/api/version/upload-upgrade`
+///
+/// 兼容 Go 的上传升级：表单文件 `file`（zip / tar.gz，按魔数识别），可选
+/// `version` 与 `force=1`；包内带 `version.json` 时可省略版本号。
 async fn manage_version_upload_upgrade(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut multipart: Multipart,
 ) -> Response {
-    if let Err(res) = require_admin(&state, &headers).await {
-        return *res;
+    let current = match require_admin(&state, &headers).await {
+        Ok(found) => found,
+        Err(res) => return *res,
+    };
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+
+    let mut uploaded: Option<(String, Vec<u8>)> = None;
+    let mut version = String::new();
+    let mut force = false;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or_default().to_string();
+                match name.as_str() {
+                    "file" => {
+                        let filename = field
+                            .file_name()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "upgrade".to_string());
+                        match field.bytes().await {
+                            Ok(bytes) => uploaded = Some((filename, bytes.to_vec())),
+                            Err(err) => return fail(format!("读取升级包失败：{err}")),
+                        }
+                    }
+                    "version" => match field.text().await {
+                        Ok(text) => version = text.trim().to_string(),
+                        Err(err) => return fail(format!("读取版本号失败：{err}")),
+                    },
+                    "force" => match field.text().await {
+                        Ok(text) => {
+                            force = matches!(text.trim(), "1" | "true" | "True" | "yes")
+                        }
+                        Err(err) => return fail(format!("读取 force 参数失败：{err}")),
+                    },
+                    _ => {
+                        let _ = field.bytes().await;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(err) => return fail(format!("解析上传内容失败：{err}")),
+        }
     }
-    fail("升级包上传解压尚未实现（需 zip/tar 库）")
+
+    let Some((filename, body)) = uploaded else {
+        return fail("请选择要上传的升级包");
+    };
+    if body.is_empty() {
+        return fail("升级包是空文件");
+    }
+    if body.len() as u64 > UPGRADE_UPLOAD_MAX_SIZE {
+        return fail(format!(
+            "升级包最大 {} MB，当前 {:.1} MB",
+            UPGRADE_UPLOAD_MAX_SIZE >> 20,
+            body.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+
+    let kind = detect_upgrade_archive(&body);
+    if kind.is_empty() {
+        return fail("无法识别的升级包格式，仅支持 zip 与 tar.gz");
+    }
+
+    // 包内 version.json 可缺省；读取失败与 Go 一样按「没有清单」处理
+    let manifest = read_upgrade_manifest(&body, kind);
+    if version.is_empty() {
+        if let Some(item) = &manifest {
+            version = item.version.trim().to_string();
+        }
+    }
+    if version.is_empty() && !force {
+        return fail("升级包内没有 version.json，请填写版本号或勾选强制升级");
+    }
+    if !force
+        && !version.is_empty()
+        && version_compare(&version, statistic::VERSION) != std::cmp::Ordering::Greater
+    {
+        return fail(format!(
+            "包版本 {version} 不高于当前版本 {}；如确认要覆盖安装，请勾选「强制升级」",
+            statistic::VERSION
+        ));
+    }
+
+    let exec_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+    {
+        Some(dir) => dir,
+        None => return fail("版本更新失败"),
+    };
+    let mut stats = match install_upgrade_archive(&body, kind, &exec_dir) {
+        Ok(stats) => stats,
+        Err(err) => return model_error(err),
+    };
+    stats.version = version.clone();
+    if let Some(item) = manifest {
+        if !item.sql.is_empty() {
+            stats.sql = item.sql;
+        }
+    }
+
+    let ip = client_ip(&headers, peer);
+    log_action(
+        pool,
+        &current,
+        &ip,
+        &format!(
+            "上传升级包升级：{} -> {}（{}，{} 个文件，{:.1} MB）",
+            statistic::VERSION,
+            version,
+            filename,
+            stats.files,
+            body.len() as f64 / (1024.0 * 1024.0)
+        ),
+    )
+    .await;
+
+    let mut msg = format!(
+        "升级完成：写入 {} 个文件，跳过 {} 个；请重启服务后生效",
+        stats.files, stats.skipped
+    );
+    if !stats.sql.is_empty() {
+        msg.push_str(&format!("。包内附带 {} 个 SQL，需要另行执行", stats.sql.len()));
+    }
+    Json(json!({"code": 0, "msg": msg, "data": stats})).into_response()
 }
 
 // ---------------------------- 多站点 ---------------------------------------
@@ -12226,12 +12565,12 @@ async fn manage_limiter_setting_save(
 
 /// `GET /system/api/plugin/limiter/blockedips`
 ///
-/// 限流器本身未实现，因此屏蔽列表恒为空。
+/// 返回进程内封禁列表（`{ip, block_time}`，对齐 Go `GetBlockIPs`）。
 async fn manage_limiter_blocked(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    ok(json!([]))
+    ok(json!(plugin::limiter_blocked_ips()))
 }
 
 /// 解除 IP 封禁请求体。
@@ -16156,11 +16495,15 @@ async fn manage_backup_restore(
         return model_error(err);
     }
     let dir = backup_dir(&state);
+    let template_dir = state.with_config(|config| std::path::PathBuf::from(config.template_dir.clone()));
+    let public_dir = state.with_config(|config| config.public_dir());
     let admin = current.clone();
     let ip = client_ip(&headers, peer);
     let restore_name = name.clone();
     tokio::spawn(async move {
-        if let Err(err) = backup::restore(&pool, &dir, &restore_name).await {
+        if let Err(err) =
+            backup::restore(&pool, &dir, &restore_name, &template_dir, &public_dir).await
+        {
             backup::finish_status("restore", format!("{err}"));
         }
         log_action(&pool, &admin, &ip, "从备份恢复数据").await;
@@ -20393,18 +20736,75 @@ mod tests {
         assert_eq!(body["code"], 1, "{body}");
         assert_eq!(body["msg"], "缺少目标版本号", "{body}");
 
-        // 上传升级包：暂未实现
+        // 上传升级包：缺文件 / 非压缩格式 / 低版本 zip（版本校验在落盘前拦下）
+        fn multipart_upgrade(payload: Vec<u8>, boundary: &str, token: &str) -> Request<Body> {
+            let peer: SocketAddr = "127.0.0.1:50000".parse().expect("客户端地址格式错误");
+            Request::builder()
+                .method("POST")
+                .uri("/system/api/version/upload-upgrade")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .extension(ConnectInfo(peer))
+                .body(Body::from(payload))
+                .unwrap()
+        }
+        let boundary = "rustcms-upgrade-boundary";
+        let payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"version\"\r\n\r\n1.0.0\r\n--{boundary}--\r\n"
+        )
+        .into_bytes();
         let res = app
             .clone()
-            .oneshot(bearer_request(
-                "POST",
-                "/system/api/version/upload-upgrade",
-                &token,
-                Value::Null,
-            ))
+            .oneshot(multipart_upgrade(payload, boundary, &token))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
+        assert_eq!(body_json(res).await["msg"], "请选择要上传的升级包");
+
+        let payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bad.zip\"\r\nContent-Type: application/octet-stream\r\n\r\nplain text\r\n--{boundary}--\r\n"
+        )
+        .into_bytes();
+        let res = app
+            .clone()
+            .oneshot(multipart_upgrade(payload, boundary, &token))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 1, "{body}");
+        assert_eq!(
+            body["msg"], "无法识别的升级包格式，仅支持 zip 与 tar.gz",
+            "{body}"
+        );
+
+        let mut writer = rustcms_ext::packer::ZipWriter::new();
+        writer
+            .add_file("version.json", br#"{"version":"0.0.1"}"#)
+            .unwrap();
+        writer.add_file("data/keep.txt", b"keep").unwrap();
+        let zip = writer.finish();
+        let mut payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upgrade.zip\"\r\nContent-Type: application/zip\r\n\r\n"
+        )
+        .into_bytes();
+        payload.extend_from_slice(&zip);
+        payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let res = app
+            .clone()
+            .oneshot(multipart_upgrade(payload, boundary, &token))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 1, "{body}");
+        assert!(
+            body["msg"]
+                .as_str()
+                .unwrap()
+                .contains("不高于当前版本"),
+            "{body}"
+        );
 
         // 当前站点信息
         let res = app
@@ -25484,7 +25884,18 @@ mod tests {
             "纯文本应转 HTML：{body}"
         );
 
-        // 测试发信：账户已设置 → 未实现提示
+        // 测试发信：把服务器指向本地关闭端口（避免真实外呼），应返回发送失败
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "POST",
+                "/system/api/plugin/sendmail/setting",
+                &token,
+                json!({"server": "127.0.0.1", "port": 1, "use_ssl": 0}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["code"], 0);
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -25497,7 +25908,10 @@ mod tests {
             .unwrap();
         let body = body_json(res).await;
         assert_eq!(body["code"], 1, "{body}");
-        assert_eq!(body["msg"], "发送测试邮件需要 SMTP 客户端，尚未实现");
+        assert!(
+            body["msg"].as_str().unwrap().contains("发送失败"),
+            "{body}"
+        );
 
         // 发送记录列表（文件可能不存在，接口应返回空而不是报错）
         let res = app

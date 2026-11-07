@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 令牌桶配置。
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +248,20 @@ impl IpBlocker {
         }
     }
 
+    /// 某个 IP 当前是否处于封禁状态。
+    pub fn is_blocked(&self, ip: &str) -> bool {
+        let now = Instant::now();
+        let states = match self.states.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        states
+            .get(ip)
+            .and_then(|state| state.blocked_until)
+            .map(|until| now < until)
+            .unwrap_or(false)
+    }
+
     /// 解除某个 IP 的封禁，返回是否原本处于封禁状态。
     pub fn unblock(&self, ip: &str) -> bool {
         let mut states = match self.states.lock() {
@@ -284,6 +298,32 @@ impl IpBlocker {
             .map(|(ip, _)| ip.clone())
             .collect();
         list.sort();
+        list
+    }
+
+    /// 当前封禁中的 `(IP, 解封 Unix 时间戳)` 列表，按解封时间倒序。
+    ///
+    /// 对齐 Go `Limiter.GetBlockIPs` 返回的 `BlockIP{ip, block_time}`。
+    pub fn blocked_entries(&self) -> Vec<(String, u64)> {
+        let now = Instant::now();
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let states = match self.states.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut list: Vec<(String, u64)> = states
+            .iter()
+            .filter_map(|(ip, state)| {
+                state.blocked_until.filter(|until| now < *until).map(|until| {
+                    let remaining = until.saturating_duration_since(now).as_secs();
+                    (ip.clone(), wall.saturating_add(remaining))
+                })
+            })
+            .collect();
+        list.sort_by(|left, right| right.1.cmp(&left.1));
         list
     }
 
@@ -391,9 +431,31 @@ mod tests {
         blocker.hit_at("7.7.7.7", now);
         blocker.hit_at("7.7.7.7", now);
         assert!(blocker.blocked_ips().contains(&"7.7.7.7".to_string()));
+        assert!(blocker.is_blocked("7.7.7.7"));
         assert!(blocker.unblock("7.7.7.7"));
+        assert!(!blocker.is_blocked("7.7.7.7"));
         assert!(blocker.blocked_ips().is_empty());
         assert_eq!(blocker.hit_at("7.7.7.7", now), Verdict::Throttled);
+    }
+
+    #[test]
+    fn blocker_reports_unblock_deadline() {
+        let blocker = IpBlocker::new(BlockConfig {
+            threshold: 1,
+            window: Duration::from_secs(60),
+            block_for: Duration::from_secs(300),
+        });
+        let now = Instant::now();
+        assert_eq!(blocker.hit_at("6.6.6.6", now), Verdict::Throttled);
+        assert_eq!(blocker.hit_at("6.6.6.6", now), Verdict::Blocked);
+        let entries = blocker.blocked_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "6.6.6.6");
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(entries[0].1 >= wall + 290, "{entries:?}");
     }
 
     #[test]

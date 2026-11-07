@@ -1398,12 +1398,25 @@ fn xml_fields(xml: &str) -> HashMap<String, String> {
             continue;
         }
         let close = format!("</{name}>");
-        let Some(end) = xml[cursor + 1..].find(&close) else {
+        let value_start = cursor + 1;
+        let Some(end) = xml[value_start..].find(&close) else {
             break;
         };
-        let value = &xml[cursor + 1..cursor + 1 + end];
+        let raw_value = &xml[value_start..value_start + end];
+        // 嵌套容器（值以 `<` 开头但不是 CDATA）：进入内部继续解析，不记录自身
+        let value = if let Some(inner) = raw_value
+            .strip_prefix("<![CDATA[")
+            .and_then(|rest| rest.strip_suffix("]]>"))
+        {
+            inner
+        } else if raw_value.starts_with('<') {
+            index = value_start;
+            continue;
+        } else {
+            raw_value
+        };
         out.insert(name.to_string(), xml_decode(value));
-        index = cursor + 1 + end + close.len();
+        index = value_start + end + close.len();
     }
     out
 }

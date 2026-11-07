@@ -207,11 +207,16 @@ pub(crate) async fn db_lock() -> tokio::sync::MutexGuard<'static, ()> {
 
 /// 测试辅助：连接仓库根目录 `config.json` 里配置的数据库。
 ///
+/// 可用 `RUSTCMS_TEST_CONFIG` 指定其它配置文件（CI/受限环境不便在仓库外写文件）；
 /// 连不上（或没有配置文件）时返回 `None`，调用方直接跳过用例，
 /// 这样在没有数据库的机器上 `cargo test` 也不会红。
 #[cfg(test)]
 pub(crate) async fn test_pool() -> Option<sqlx::MySqlPool> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.json");
+    let path = std::env::var_os("RUSTCMS_TEST_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.json")
+        });
     let raw = std::fs::read_to_string(&path).ok()?;
     let cfg: crate::config::ServerJson = serde_json::from_str(&raw).ok()?;
     if !cfg.mysql.is_configured() {

@@ -1088,7 +1088,7 @@ mod tests {
                     }),
                     "system" => Ok(match args.get("name").map(as_text).as_deref() {
                         Some("SiteName") => Value::String("淘码网".into()),
-                        Some("TemplateUrl") => Value::String("/template/default/".into()),
+                        Some("TemplateUrl") => Value::String("/static/default/".into()),
                         _ => Value::Null,
                     }),
                     "tr" => Ok(Value::String(

@@ -618,6 +618,14 @@ mod tests {
             let mut reader = BufReader::new(socket.try_clone().expect("clone"));
             let mut log: Vec<String> = Vec::new();
             let mut index = 0usize;
+            if index < responses.len() {
+                let greeting = responses[index];
+                index += 1;
+                socket
+                    .write_all(format!("{greeting}\r\n").as_bytes())
+                    .expect("write greeting");
+                socket.flush().expect("flush greeting");
+            }
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).expect("read") == 0 {
@@ -626,6 +634,14 @@ mod tests {
                 let line = line.trim_end_matches(['\r', '\n']).to_string();
                 log.push(line.clone());
                 if line == "DATA" {
+                    if index < responses.len() {
+                        let resp = responses[index];
+                        index += 1;
+                        socket
+                            .write_all(format!("{resp}\r\n").as_bytes())
+                            .expect("write 354");
+                        socket.flush().expect("flush 354");
+                    }
                     loop {
                         let mut body_line = String::new();
                         if reader.read_line(&mut body_line).expect("read body") == 0 {

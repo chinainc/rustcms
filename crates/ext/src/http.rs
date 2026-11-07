@@ -551,8 +551,10 @@ fn native_send_blocking(request: &Request) -> Result<Response> {
     }
 }
 
+type HttpResponseParts = (u16, Vec<(String, String)>, Vec<u8>);
+
 /// 原生后端的一次请求-响应。
-fn native_round_trip(request: &Request) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+fn native_round_trip(request: &Request) -> Result<HttpResponseParts> {
     let parsed = parse_url(&request.url)?;
     if parsed.scheme != "http" {
         bail!("原生后端仅支持 http://（https 请安装 curl，或改用 curl 后端）");
@@ -597,7 +599,7 @@ fn native_round_trip(request: &Request) -> Result<(u16, Vec<(String, String)>, V
 }
 
 /// 解析原始响应字节。
-fn parse_response_bytes(raw: &[u8]) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+fn parse_response_bytes(raw: &[u8]) -> Result<HttpResponseParts> {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -701,11 +703,37 @@ mod tests {
             let mut received = String::new();
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buffer = [0u8; 4096];
-                if let Ok(count) = stream.read(&mut buffer) {
-                    received = String::from_utf8_lossy(&buffer[..count]).to_string();
+                let mut total = Vec::new();
+                let mut expected_len: Option<usize> = None;
+                while let Ok(count) = stream.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    total.extend_from_slice(&buffer[..count]);
+                    if expected_len.is_none() {
+                        if let Some(pos) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&total[..pos]);
+                            let cl = head.lines().find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                if lower.starts_with("content-length:") {
+                                    lower["content-length:".len()..].trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            }).unwrap_or(0);
+                            expected_len = Some(pos + 4 + cl);
+                        }
+                    }
+                    if let Some(exp) = expected_len {
+                        if total.len() >= exp {
+                            break;
+                        }
+                    }
                 }
+                received = String::from_utf8_lossy(&total).to_string();
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
             received
         });

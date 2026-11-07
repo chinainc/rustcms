@@ -588,3 +588,37 @@ Go 侧有机器可读的端点目录 `provider/api_catalog.json`（403 条，含
 ### 4. 说明
 - 工作区曾出现外部进程的全库 `anqi` → `rust` 改名（含 API 路径、settings key、
   `auth.anqicms.com` 域名改写），会破坏与 Go 版的数据/接口兼容，本轮已回滚，未纳入提交。
+
+---
+
+## 二十、sitemap 分片与 HTML 缓存前台命中（2026-11-07）
+
+### 1. sitemap 分片
+- `plugin::sitemap_build` 改为与 Go `BuildSitemap` 相同的分片结构：
+  - `sitemap-category.{type}`：首页 + 栏目 / 单页（`exclude_*` 源头过滤）；
+  - `sitemap-archive-{N}.{type}`：文档按 `page_size` 分片；
+  - `sitemap-tag-{N}.{type}`：标签按 `page_size` 分片，`exclude_tag` 时整体跳过；
+  - `sitemap.{type}`：index（xml 为 `<sitemapindex>`，txt 每行一个子文件 URL）。
+- txt 子文件为 CRLF 连接的 loc（无末尾换行）；xml 子文件带 `anqi-style.xsl` 引用，
+  index 带 `anqi-index.xsl`。
+- 生成前清理同类型旧分片，避免分页减少后残留。
+- `sitemap-time.log` 内容改为 Unix 秒（Go 口径），mtime 继续被 `sitemap_time` 读取。
+- 前台 `sitemap*` 文件缺失时自动重建并返回（含子文件请求）。
+- 与 Go 差异：不生成空尾页；XML 暂不输出 `lastmod` 与多语言 `xhtml:link`。
+
+### 2. HTML 缓存前台命中
+- 后台 build 已能本地生成到 `<cache>/html`；本轮补齐前台读取与回填：
+  - 首页用 `index_cache`、详情用 `detail_cache`、列表 / 栏目 / 单页 / 标签用 `category_cache`；
+  - 已登录会员、`Cache-Control: no-cache`、搜索 / 404 等不缓存；
+  - 命中且未过期直接返回缓存 HTML；渲染成功后写回同路径。
+- 缓存路径与 Go `transToLocalPath` 一致：`/` → `/index.html`，无扩展 → `<path>/index.html`，
+  带扩展原样；query 统一忽略（与 Rust 后台 build 既有约定一致）。
+- 未实现：移动端 `cache/mobile`、query 独立缓存、内存二级缓存、远程推送（沿用既有口径）。
+
+### 3. 测试与验证
+- 新增 `sitemap_writes_sharded_formats`（纯离线：txt CRLF、xml urlset/sitemapindex、index 内容）。
+- 新增 `html_cache_paths_match_go`（纯离线：路径规则）。
+- `sitemap_config_and_build` 更新为 index + 子文件断言。
+- `cargo check --all-targets`：0 告警；`cargo test --no-run`：通过。
+- 主 crate：**324 passed / 5 failed**，失败项仍是环境限制（沙箱 MySQL、`clientFiles`、
+  依赖 DB 的首页渲染）。

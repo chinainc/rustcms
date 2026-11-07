@@ -329,7 +329,11 @@ async fn auto_build_sitemap(state: &AppState, path: &str) -> Option<Response> {
         .await
         .ok()?;
     let kind = config["type"].as_str().unwrap_or("txt");
-    if !path.ends_with(&format!("sitemap.{kind}")) {
+    let file_name = path.trim_start_matches('/');
+    if file_name.contains('/')
+        || !file_name.starts_with("sitemap")
+        || !file_name.ends_with(&format!(".{kind}"))
+    {
         return None;
     }
     if crate::models::plugin::sitemap_build(&pool, &public_dir, &cache_dir)
@@ -338,7 +342,7 @@ async fn auto_build_sitemap(state: &AppState, path: &str) -> Option<Response> {
     {
         return None;
     }
-    let bytes = std::fs::read(public_dir.join(format!("sitemap.{kind}"))).ok()?;
+    let bytes = std::fs::read(public_dir.join(file_name)).ok()?;
     Some(
         ([(
             header::CONTENT_TYPE,
@@ -398,9 +402,13 @@ impl FrontCtx {
             )
                 .into_response());
         }
-        // sitemap.xml / sitemap.txt：文件存在时已被上面的逻辑服务；
+        // sitemap.xml / sitemap.txt 及子文件：文件存在时已被上面的逻辑服务；
         // 不存在时按 settings.sitemap 自动生成一次（Go 的 PluginSitemap 分支）
-        if path.ends_with("sitemap.xml") || path.ends_with("sitemap.txt") {
+        let sitemap_name = path.trim_start_matches('/');
+        if !sitemap_name.contains('/')
+            && sitemap_name.starts_with("sitemap")
+            && (sitemap_name.ends_with(".xml") || sitemap_name.ends_with(".txt"))
+        {
             return auto_build_sitemap(state, path).await;
         }
 
@@ -519,7 +527,13 @@ impl FrontCtx {
         }
 
         let matched = self.parse_route(mode).await;
-        match matched {
+        let cache_ttl = self.html_cache_ttl(&matched).await;
+        if let Some(ttl) = cache_ttl {
+            if let Some(res) = self.read_html_cache(ttl).await {
+                return res;
+            }
+        }
+        let res = match matched {
             RouteMatch::Index => self.render_index().await,
             RouteMatch::ArchiveIndex { module, page } => {
                 self.render_module_page(&module, page).await
@@ -541,7 +555,119 @@ impl FrontCtx {
             )
                 .into_response(),
             RouteMatch::NotFound => self.not_found().await,
+        };
+        if cache_ttl.is_some() {
+            return self.write_html_cache(res).await;
         }
+        res
+    }
+
+    /// 当前页面类型对应的 HTML 缓存 TTL（秒）；不缓存返回 None。
+    ///
+    /// 对齐 Go `LoadCachedHtml`：未开启、登录用户、`Cache-Control: no-cache`、
+    /// 以及不在缓存范围内的页面（搜索 / 404 等）都跳过。
+    async fn html_cache_ttl(&self, matched: &RouteMatch) -> Option<u64> {
+        if self.front_user.is_some() {
+            return None;
+        }
+        let no_cache = self
+            .headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("no-cache"))
+            })
+            .unwrap_or(false);
+        if no_cache {
+            return None;
+        }
+        let key = match matched {
+            RouteMatch::Index => "index_cache",
+            RouteMatch::Archive { .. } => "detail_cache",
+            RouteMatch::ArchiveIndex { .. }
+            | RouteMatch::Category { .. }
+            | RouteMatch::Page { .. }
+            | RouteMatch::TagIndex { .. }
+            | RouteMatch::Tag { .. } => "category_cache",
+            _ => return None,
+        };
+        let config = crate::models::plugin::html_cache_get(&self.pool)
+            .await
+            .ok()?;
+        let open = match config.get("open") {
+            Some(Value::Bool(flag)) => *flag,
+            Some(Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
+            Some(Value::String(text)) => matches!(text.as_str(), "1" | "true" | "True"),
+            _ => false,
+        };
+        if !open {
+            return None;
+        }
+        let ttl = config.get(key).and_then(Value::as_i64).unwrap_or(0);
+        (ttl > 0).then_some(ttl as u64)
+    }
+
+    /// 缓存文件路径（`<cache>/html/<local_path>`）；非法路径返回 None。
+    fn html_cache_path(&self) -> Option<std::path::PathBuf> {
+        let local = crate::models::plugin::html_cache_local_path(&self.path);
+        let rel = local.trim_start_matches('/');
+        if rel.is_empty()
+            || rel
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == ".." || segment.contains('\\'))
+        {
+            return None;
+        }
+        let cache_dir = self.state.with_config(|config| config.cache_dir());
+        Some(crate::models::plugin::html_cache_root(&cache_dir).join(rel))
+    }
+
+    /// 命中未过期的缓存文件时直接返回 HTML。
+    async fn read_html_cache(&self, ttl: u64) -> Option<Response> {
+        let file = self.html_cache_path()?;
+        let modified = std::fs::metadata(&file).ok()?.modified().ok()?;
+        let age = std::time::SystemTime::now().duration_since(modified).ok()?;
+        if age.as_secs() > ttl {
+            return None;
+        }
+        let bytes = std::fs::read(&file).ok()?;
+        Some(html_response(String::from_utf8_lossy(&bytes).to_string()))
+    }
+
+    /// 渲染成功后把 HTML 写入缓存（只缓存 200 + `text/html`）。
+    async fn write_html_cache(&self, res: Response) -> Response {
+        if res.status() != StatusCode::OK {
+            return res;
+        }
+        let is_html = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("text/html"))
+            .unwrap_or(false);
+        if !is_html {
+            return res;
+        }
+        let Some(file) = self.html_cache_path() else {
+            return res;
+        };
+        let (parts, body) = res.into_parts();
+        let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("读取渲染结果失败：{err}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "页面读取失败").into_response();
+            }
+        };
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(err) = std::fs::write(&file, &bytes) {
+            tracing::warn!("写入静态缓存失败：{err}");
+        }
+        Response::from_parts(parts, axum::body::Body::from(bytes))
     }
 
     // -- 路由解析（对齐 controller.ParseRoute 的规则顺序） ------------------

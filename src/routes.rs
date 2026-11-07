@@ -12994,28 +12994,12 @@ async fn manage_htmlcache_config_save(
 
 /// 静态缓存输出目录：`<cache>/html`（与 clean 接口保持一致）。
 fn html_cache_root(state: &AppState) -> std::path::PathBuf {
-    state
-        .with_config(|config| config.cache_dir())
-        .join("html")
+    plugin::html_cache_root(&state.with_config(|config| config.cache_dir()))
 }
 
 /// 把站点内链接转成缓存文件相对路径，等价 Go 的 `transToLocalPath`。
 fn html_cache_local_path(link: &str) -> String {
-    let path = link.split(['?', '#']).next().unwrap_or("");
-    let path = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-    if path.ends_with('/') {
-        return format!("{path}index.html");
-    }
-    let base = path.rsplit('/').next().unwrap_or("");
-    if base.contains('.') {
-        path
-    } else {
-        format!("{path}/index.html")
-    }
+    plugin::html_cache_local_path(link)
 }
 
 /// 写入静态缓存文件。

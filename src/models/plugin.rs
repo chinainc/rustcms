@@ -144,7 +144,16 @@ fn id_set(value: Option<&Value>) -> std::collections::HashSet<u32> {
         .unwrap_or_default()
 }
 
-/// 生成 sitemap 文件，返回写入的 URL 数量。
+/// 生成 sitemap 分片与 index，返回写入的内容 URL 总数。
+///
+/// 结构对齐 Go `BuildSitemap`：
+/// - `sitemap-category.{type}`：首页 + 栏目 / 单页；
+/// - `sitemap-archive-{N}.{type}`：文档按 `page_size` 分片；
+/// - `sitemap-tag-{N}.{type}`：标签按 `page_size` 分片（`exclude_tag` 时跳过）；
+/// - `sitemap.{type}`：index，列出上面的子文件。
+///
+/// 与 Go 的差异：不生成空尾页；XML 暂不输出 `lastmod` 与多语言
+/// `xhtml:link`（Rust 侧多语言渲染尚未移植）。
 pub async fn sitemap_build(
     pool: &MySqlPool,
     public_dir: &Path,
@@ -156,6 +165,15 @@ pub async fn sitemap_build(
         .and_then(Value::as_str)
         .unwrap_or("txt")
         .to_string();
+    let page_size = config
+        .get("page_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(1) as usize;
+    let exclude_tag = config
+        .get("exclude_tag")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let exclude_modules = id_set(config.get("exclude_module_ids"));
     let exclude_categories = id_set(config.get("exclude_category_ids"));
     let exclude_pages = id_set(config.get("exclude_page_ids"));
@@ -187,10 +205,8 @@ pub async fn sitemap_build(
         .map(|item| (item.id, item.url_token.clone()))
         .collect();
 
-    let mut urls: Vec<String> = Vec::new();
-    urls.push(format!("{base}/"));
-
-    // 栏目 + 单页
+    // 首页 + 栏目 / 单页 → sitemap-category
+    let mut category_urls: Vec<String> = vec![format!("{base}/")];
     for item in &categories {
         if item.status != 1 {
             continue;
@@ -199,32 +215,36 @@ pub async fn sitemap_build(
             if exclude_pages.contains(&item.id) {
                 continue;
             }
-            urls.push(format!(
+            category_urls.push(format!(
                 "{base}{}",
                 url::page_url(mode, &item.url_token, 1)
             ));
             continue;
         }
-        if item.kind != 1 || exclude_categories.contains(&item.id) {
+        if item.kind != 1
+            || exclude_categories.contains(&item.id)
+            || exclude_modules.contains(&item.module_id)
+        {
             continue;
         }
         let module_token = module_tokens
             .get(&item.module_id)
             .cloned()
             .unwrap_or_default();
-        urls.push(format!(
+        category_urls.push(format!(
             "{base}{}",
             url::category_url(mode, &item.url_token, &module_token, item.id, 1)
         ));
     }
 
-    // 内容
+    // 内容 → sitemap-archive-N
     let rows: Vec<(i64, u32, String)> =
         sqlx::query_as("SELECT id, category_id, url_token FROM archives ORDER BY id ASC")
             .fetch_all(pool)
             .await
             .map_err(|err| ModelError::invalid(format!("查询内容失败: {err}")))?;
 
+    let mut archive_urls: Vec<String> = Vec::new();
     for (id, category_id, token) in rows {
         if exclude_categories.contains(&category_id) {
             continue;
@@ -243,38 +263,132 @@ pub async fn sitemap_build(
             .get(&category_id)
             .cloned()
             .unwrap_or_default();
-        urls.push(format!(
+        archive_urls.push(format!(
             "{base}{}",
             url::archive_url(mode, &catname, &module_token, id, &token, category_id, 1)
         ));
     }
 
+    // 标签 → sitemap-tag-N
+    let mut tag_urls: Vec<String> = Vec::new();
+    if !exclude_tag {
+        let tags: Vec<(u32, String)> =
+            sqlx::query_as("SELECT id, url_token FROM tags WHERE status = 1 ORDER BY id ASC")
+                .fetch_all(pool)
+                .await
+                .map_err(|err| ModelError::invalid(format!("查询标签失败: {err}")))?;
+        for (id, token) in tags {
+            tag_urls.push(format!("{base}{}", url::tag_url(mode, id, &token, 1)));
+        }
+    }
+
     std::fs::create_dir_all(public_dir)
         .map_err(|err| ModelError::invalid(format!("写入失败: {err}")))?;
+    remove_old_sitemap_files(public_dir, &kind);
 
+    let mut children: Vec<String> = Vec::new();
+    let category_name = format!("sitemap-category.{kind}");
+    write_sitemap_urlset(public_dir, &category_name, &kind, &base, &category_urls)?;
+    children.push(format!("{base}/{category_name}"));
+
+    for (index, chunk) in archive_urls.chunks(page_size).enumerate() {
+        let name = format!("sitemap-archive-{}.{kind}", index + 1);
+        write_sitemap_urlset(public_dir, &name, &kind, &base, chunk)?;
+        children.push(format!("{base}/{name}"));
+    }
+    for (index, chunk) in tag_urls.chunks(page_size).enumerate() {
+        let name = format!("sitemap-tag-{}.{kind}", index + 1);
+        write_sitemap_urlset(public_dir, &name, &kind, &base, chunk)?;
+        children.push(format!("{base}/{name}"));
+    }
+    write_sitemap_index(public_dir, &kind, &base, &children)?;
+
+    // 生成时间：内容为 Unix 秒（Go `UpdateSitemapTime`），mtime 同样被 sitemap_time 读取
+    let _ = std::fs::create_dir_all(cache_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(cache_dir.join("sitemap-time.log"), stamp.to_string());
+
+    Ok(category_urls.len() + archive_urls.len() + tag_urls.len())
+}
+
+/// 删除同类型的旧 sitemap 产物，避免分页数量变化后残留过期子文件。
+fn remove_old_sitemap_files(public_dir: &Path, kind: &str) {
+    let Ok(entries) = std::fs::read_dir(public_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("sitemap") || !name.ends_with(&format!(".{kind}")) {
+            continue;
+        }
+        if name.starts_with("sitemap-archive-")
+            || name.starts_with("sitemap-tag-")
+            || name == format!("sitemap-category.{kind}")
+            || name == format!("sitemap.{kind}")
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 写一个 `urlset` 子文件（xml 带 stylesheet；txt 为 CRLF 连接的 loc 列表）。
+fn write_sitemap_urlset(
+    public_dir: &Path,
+    name: &str,
+    kind: &str,
+    base: &str,
+    urls: &[String],
+) -> Result<(), ModelError> {
     let body = if kind == "xml" {
-        let mut output = String::from(
+        let mut output = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+             <?xml-stylesheet type=\"text/xsl\" href=\"{}/anqi-style.xsl\" ?>\n\
+             <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+             xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">\n",
+            xml_escape(base)
         );
-        for link in &urls {
+        for link in urls {
             output.push_str(&format!("  <url><loc>{}</loc></url>\n", xml_escape(link)));
         }
         output.push_str("</urlset>\n");
         output
     } else {
-        urls.join("\n")
+        urls.join("\r\n")
     };
+    std::fs::write(public_dir.join(name), body)
+        .map_err(|err| ModelError::invalid(format!("写入 {name} 失败: {err}")))
+}
 
+/// 写 sitemap index（xml 为 `sitemapindex`；txt 每行一个子文件 URL）。
+fn write_sitemap_index(
+    public_dir: &Path,
+    kind: &str,
+    base: &str,
+    children: &[String],
+) -> Result<(), ModelError> {
+    let body = if kind == "xml" {
+        let mut output = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <?xml-stylesheet type=\"text/xsl\" href=\"{}/anqi-index.xsl\" ?>\n\
+             <sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+            xml_escape(base)
+        );
+        for link in children {
+            output.push_str(&format!(
+                "  <sitemap><loc>{}</loc></sitemap>\n",
+                xml_escape(link)
+            ));
+        }
+        output.push_str("</sitemapindex>\n");
+        output
+    } else {
+        children.join("\r\n")
+    };
     std::fs::write(public_dir.join(format!("sitemap.{kind}")), body)
-        .map_err(|err| ModelError::invalid(format!("写入失败: {err}")))?;
-
-    // 记录生成时间
-    let _ = std::fs::create_dir_all(cache_dir);
-    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let _ = std::fs::write(cache_dir.join("sitemap-time.log"), stamp);
-
-    Ok(urls.len())
+        .map_err(|err| ModelError::invalid(format!("写入 sitemap.{kind} 失败: {err}")))
 }
 
 /// 读取 sitemap 配置并补上最新的生成时间与地址（供接口回包用）。
@@ -611,6 +725,32 @@ fn normalize_storage_url(raw: &str) -> String {
         raw.to_string()
     } else {
         format!("{raw}/")
+    }
+}
+
+/// 静态缓存输出目录：`<cache>/html`（与后台 build / clean 接口一致）。
+pub fn html_cache_root(cache_dir: &Path) -> std::path::PathBuf {
+    cache_dir.join("html")
+}
+
+/// 把站点内链接转成缓存文件相对路径（等价 Go `transToLocalPath`）。
+///
+/// 与 Go 的差异：不区分 query 与移动端，统一落到 PC 的 `<cache>/html/<path>`。
+pub fn html_cache_local_path(link: &str) -> String {
+    let path = link.split(['?', '#']).next().unwrap_or("");
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if path.ends_with('/') {
+        return format!("{path}index.html");
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    if base.contains('.') {
+        path
+    } else {
+        format!("{path}/index.html")
     }
 }
 
@@ -1004,6 +1144,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sitemap_writes_sharded_formats() {
+        let dir =
+            std::env::temp_dir().join(format!("rustcms-sitemap-format-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let urls = vec!["https://a/1".to_string(), "https://a/2".to_string()];
+
+        write_sitemap_urlset(&dir, "sitemap-archive-1.txt", "txt", "https://a", &urls).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sitemap-archive-1.txt")).unwrap(),
+            "https://a/1\r\nhttps://a/2"
+        );
+
+        let children = vec!["https://a/sitemap-archive-1.txt".to_string()];
+        write_sitemap_index(&dir, "txt", "https://a", &children).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sitemap.txt")).unwrap(),
+            "https://a/sitemap-archive-1.txt"
+        );
+
+        write_sitemap_urlset(&dir, "sitemap-archive-1.xml", "xml", "https://a", &urls[..1])
+            .unwrap();
+        let xml = std::fs::read_to_string(dir.join("sitemap-archive-1.xml")).unwrap();
+        assert!(xml.contains("<urlset"), "{xml}");
+        assert!(xml.contains("<loc>https://a/1</loc>"), "{xml}");
+
+        let children = vec!["https://a/sitemap-archive-1.xml".to_string()];
+        write_sitemap_index(&dir, "xml", "https://a", &children).unwrap();
+        let index = std::fs::read_to_string(dir.join("sitemap.xml")).unwrap();
+        assert!(index.contains("<sitemapindex"), "{index}");
+        assert!(index.contains("<sitemap><loc>"), "{index}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn html_cache_paths_match_go() {
+        assert_eq!(html_cache_local_path("/"), "/index.html");
+        assert_eq!(html_cache_local_path("/news"), "/news/index.html");
+        assert_eq!(html_cache_local_path("/news/"), "/news/index.html");
+        assert_eq!(html_cache_local_path("/news/1.html"), "/news/1.html");
+        assert_eq!(html_cache_local_path("/news?page=2"), "/news/index.html");
+    }
+
     #[tokio::test]
     async fn sitemap_config_and_build() {
         let _guard = db_lock().await;
@@ -1026,7 +1211,9 @@ mod tests {
         match built {
             Ok(count) => {
                 assert!(count >= 1);
-                assert!(public.join("sitemap.txt").is_file());
+                let index = std::fs::read_to_string(public.join("sitemap.txt")).unwrap();
+                assert!(index.contains("sitemap-category.txt"), "{index}");
+                assert!(public.join("sitemap-category.txt").is_file());
                 assert!(sitemap_time(&cache) > 0);
             }
             // 站点未配置 base_url 时返回明确错误
@@ -1036,8 +1223,10 @@ mod tests {
         // xml 模式
         sitemap_save(&pool, &json!({"type": "xml"})).await.unwrap();
         if let Ok(_) = sitemap_build(&pool, &public, &cache).await {
-            let raw = std::fs::read_to_string(public.join("sitemap.xml")).unwrap();
-            assert!(raw.contains("<urlset"), "{raw}");
+            let index = std::fs::read_to_string(public.join("sitemap.xml")).unwrap();
+            assert!(index.contains("<sitemapindex"), "{index}");
+            let category = std::fs::read_to_string(public.join("sitemap-category.xml")).unwrap();
+            assert!(category.contains("<urlset"), "{category}");
         }
 
         match backup {

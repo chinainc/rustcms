@@ -554,3 +554,37 @@ Go 侧有机器可读的端点目录 `provider/api_catalog.json`（403 条，含
   等外呼仍未接线。
 - 支付宝 RSA2 验签、小程序 AES 解密、GraphQL、水印与更多图像格式需要新增 crate，离线环境不可。
 - `tags/`（tera 已替代）、`library/`、`crond/`、`pkg/` 仍按既有结论不移植。
+
+---
+
+## 十九、备份 zip 生成与 sitemap 自动生成（2026-11-07）
+
+### 1. 备份 dump 产出 zip
+- `models::backup::dump` 改为生成 `<时间戳>.zip`，包含 `database.sql` + `template/` + `static/`
+  （与 Go `BackupData` 一致）；跳过 `_logs` 表；`template/` 来自当前模板目录，
+  `static/` 来自 `public/static/<模板目录名>`。
+- `dump` 增加 `template_dir` / `public_dir` 参数；`setting::migrate_db`、后台备份、
+  设计市场初始化三处调用同步更新。
+- 顺带修掉旧实现的分片写盘 bug（`append` 后的尾块 `fs::write` 会覆盖前文）。
+- zip 条目暂用 stored（ext 未实现 deflate 压缩），功能等价，体积大于 Go 的 Deflate 包。
+- 旧 `.sql` 备份仍可恢复；列表 / 备注 / 导入继续兼容 `.sql` 与 `.zip`。
+
+### 2. 前台 sitemap 自动生成
+- `front::serve_file` 增加旧路径重写：`/archive*`、`/tag*`、`/category*` 的 `.xml/.txt`
+  改写为 `/sitemap-...`（Go `FileServe`）。
+- `sitemap.xml` / `sitemap.txt` 文件不存在时，按 `settings.sitemap` 的 `type` 自动调用
+  `plugin::sitemap_build` 并返回产物；未配置 `settings.sitemap` 时保持原 404 行为。
+- 与 Go 的差异：仍不按 `page_size` 分片，只产出单个 `sitemap.{type}`。
+
+### 3. 测试与验证
+- `dump_writes_real_database_sql` → `dump_writes_real_database_zip`：断言 zip 内
+  `database.sql` + `template/index.html` + `static/app.css`（需真实库）。
+- 新增 `packs_directory_into_zip_entries`（纯离线，覆盖目录打包与条目名）。
+- 新增 `rewrites_legacy_sitemap_paths`，并在静态文件测试里覆盖 `/archive/x.txt` 的实际服务。
+- `cargo test --no-run`：通过（约 3m）；主 crate **322 passed / 5 failed**，5 项与上一轮
+  相同的环境限制（沙箱 MySQL、`clientFiles` 不可写、依赖 DB 的首页渲染）。
+- `cargo check --all-targets`：0 告警。
+
+### 4. 说明
+- 工作区曾出现外部进程的全库 `anqi` → `rust` 改名（含 API 路径、settings key、
+  `auth.anqicms.com` 域名改写），会破坏与 Go 版的数据/接口兼容，本轮已回滚，未纳入提交。

@@ -132,9 +132,14 @@ async fn ensure_column(
 ///
 /// **先整库备份再执行变更**：备份失败就直接返回，不做任何 DDL。
 /// 变更都是幂等的：补齐模块自定义字段表，并给 `users` 补上会员中心的 `api_token` 列。
-pub async fn migrate_db(pool: &MySqlPool, backup_dir: &std::path::Path) -> Result<Value, ModelError> {
+pub async fn migrate_db(
+    pool: &MySqlPool,
+    backup_dir: &std::path::Path,
+    template_dir: &std::path::Path,
+    public_dir: &std::path::Path,
+) -> Result<Value, ModelError> {
     // 1. 先备份，拿到文件名后才允许往下走
-    let backup_file = super::backup::dump(pool, backup_dir).await?;
+    let backup_file = super::backup::dump(pool, backup_dir, template_dir, public_dir).await?;
 
     // 2. 模块自定义字段表：缺失则建表，缺列则补列
     let modules = super::module::list(pool).await?;

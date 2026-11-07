@@ -302,9 +302,58 @@ struct FrontCtx {
     ip: Option<String>,
 }
 
+/// `controller.FileServe` 的旧 sitemap 重定向：
+/// `/archive*.xml|txt`、`/tag*.xml|txt`、`/category*.xml|txt` → `/sitemap-...`。
+fn rewrite_legacy_sitemap_path(path: &str) -> Option<String> {
+    let legacy = path.starts_with("/archive")
+        || path.starts_with("/tag")
+        || path.starts_with("/category");
+    (legacy && (path.ends_with(".xml") || path.ends_with(".txt")))
+        .then(|| format!("/sitemap-{}", path.trim_start_matches('/')))
+}
+
+/// sitemap 文件不存在时按配置自动生成（Go `FileServe` 的 `PluginSitemap` 分支）。
+///
+/// 与 Go 一致：只有 `settings.sitemap` 已配置时才生成，生成后重新读取产物。
+/// 与 Go 的差异：Rust 版 sitemap 不分片，只产出 `sitemap.{type}`。
+async fn auto_build_sitemap(state: &AppState, path: &str) -> Option<Response> {
+    let pool = state.db().cloned()?;
+    // Go 的 PluginSitemap 为 nil（未配置）时不自动生成
+    crate::models::setting::get_raw(&pool, crate::models::plugin::SITEMAP)
+        .await
+        .ok()
+        .flatten()?;
+    let cache_dir = state.with_config(|config| config.cache_dir());
+    let public_dir = state.with_config(|config| config.public_dir());
+    let config = crate::models::plugin::sitemap_get(&pool, &cache_dir)
+        .await
+        .ok()?;
+    let kind = config["type"].as_str().unwrap_or("txt");
+    if !path.ends_with(&format!("sitemap.{kind}")) {
+        return None;
+    }
+    if crate::models::plugin::sitemap_build(&pool, &public_dir, &cache_dir)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    let bytes = std::fs::read(public_dir.join(format!("sitemap.{kind}"))).ok()?;
+    Some(
+        ([(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static(content_type(path)),
+        )], bytes)
+            .into_response(),
+    )
+}
+
 impl FrontCtx {
     /// `controller.FileServe`：public/ 下的静态文件直接回；未命中继续路由。
     async fn serve_file(state: &AppState, path: &str) -> Option<Response> {
+        // 旧 sitemap 路径先改写（/archive*.xml|txt → /sitemap-archive*.xml|txt）
+        let rewritten = rewrite_legacy_sitemap_path(path);
+        let path = rewritten.as_deref().unwrap_or(path);
         // 目录类请求交给路由（Go：uri 以 / 结尾不 serve 文件）
         if path == "/" || path.ends_with('/') {
             return None;
@@ -350,7 +399,10 @@ impl FrontCtx {
                 .into_response());
         }
         // sitemap.xml / sitemap.txt：文件存在时已被上面的逻辑服务；
-        // 自动生成未移植（后台 plugin/sitemap/build 可手动生成），此处直接落空。
+        // 不存在时按 settings.sitemap 自动生成一次（Go 的 PluginSitemap 分支）
+        if path.ends_with("sitemap.xml") || path.ends_with("sitemap.txt") {
+            return auto_build_sitemap(state, path).await;
+        }
 
         None
     }
@@ -1226,6 +1278,24 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_legacy_sitemap_paths() {
+        assert_eq!(
+            rewrite_legacy_sitemap_path("/archive/a.xml").as_deref(),
+            Some("/sitemap-archive/a.xml")
+        );
+        assert_eq!(
+            rewrite_legacy_sitemap_path("/tag/b.txt").as_deref(),
+            Some("/sitemap-tag/b.txt")
+        );
+        assert_eq!(
+            rewrite_legacy_sitemap_path("/category/c.xml").as_deref(),
+            Some("/sitemap-category/c.xml")
+        );
+        assert!(rewrite_legacy_sitemap_path("/archive/list").is_none());
+        assert!(rewrite_legacy_sitemap_path("/article/a.xml").is_none());
+    }
+
+    #[test]
     fn parses_query_params() {
         let params = query_params("q=%E6%9C%BA%E6%A2%B0&page=2&flag");
         assert_eq!(params["q"], "机械");
@@ -1271,6 +1341,13 @@ mod tests {
         let text = body_text(res).await;
         assert!(text.contains("User-agent: *"), "{text}");
         assert!(text.contains("Disallow: /system"), "{text}");
+
+        // 旧 sitemap 路径重写：/archive/x.txt → public/sitemap-archive/x.txt
+        std::fs::create_dir_all(base.join("sitemap-archive")).unwrap();
+        std::fs::write(base.join("sitemap-archive/x.txt"), "loc").unwrap();
+        let res = get(app.clone(), "/archive/x.txt").await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "loc");
 
         // 目录请求不 serve 文件
         let res = get(app, "/css/").await.unwrap();

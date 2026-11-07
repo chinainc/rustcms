@@ -6507,7 +6507,10 @@ async fn manage_setting_migrate_db(State(state): State<AppState>, headers: Heade
         return fail(NO_DB);
     };
     let dir = backup_dir(&state);
-    match setting::migrate_db(pool, &dir).await {
+    let template_dir =
+        state.with_config(|config| std::path::PathBuf::from(config.template_dir.clone()));
+    let public_dir = state.with_config(|config| config.public_dir());
+    match setting::migrate_db(pool, &dir, &template_dir, &public_dir).await {
         Ok(report) => Json(json!({
             "code": 0,
             "msg": "数据库表结构已更新",
@@ -7000,7 +7003,10 @@ async fn manage_design_data_restore(
         if let Err(err) = backup::new_task("backup") {
             return model_error(err);
         }
-        if let Err(err) = backup::dump(pool, &backup_dir(&state)).await {
+        let template_dir =
+            state.with_config(|config| std::path::PathBuf::from(config.template_dir.clone()));
+        if let Err(err) = backup::dump(pool, &backup_dir(&state), &template_dir, &public_dir).await
+        {
             backup::finish_status("backup", format!("{err}"));
             return model_error(err);
         }
@@ -16445,10 +16451,13 @@ async fn manage_backup_dump(
         return model_error(err);
     }
     let dir = backup_dir(&state);
+    let template_dir =
+        state.with_config(|config| std::path::PathBuf::from(config.template_dir.clone()));
+    let public_dir = state.with_config(|config| config.public_dir());
     let admin = current.clone();
     let ip = client_ip(&headers, peer);
     tokio::spawn(async move {
-        if let Err(err) = backup::dump(&pool, &dir).await {
+        if let Err(err) = backup::dump(&pool, &dir, &template_dir, &public_dir).await {
             backup::finish_status("backup", format!("{err}"));
         }
         log_action(&pool, &admin, &ip, "备份数据").await;

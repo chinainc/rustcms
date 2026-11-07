@@ -275,13 +275,22 @@ fn row_values(row: &MySqlRow, casts: &[bool], quoted: &[bool]) -> Result<Vec<Str
     Ok(values)
 }
 
-/// 备份库到 `<backup_dir>/<时间戳>.sql`（Go `BackupData` 的 SQL 部分）。
+/// 备份整站到 `<backup_dir>/<时间戳>.zip`（Go `BackupData`）。
 ///
-/// 跳过表名含 `_logs` 的表；进度按表数推进（0→99）。返回备份文件名。
-pub async fn dump(pool: &MySqlPool, backup_dir: &Path) -> Result<String, ModelError> {
+/// 包内含 `database.sql`、`template/`、`static/`；跳过表名含 `_logs` 的表。
+/// 进度按表数推进（0→99）。返回备份文件名。
+///
+/// zip 条目使用 stored（ext 只实现了解压，没有 deflate 压缩），功能等价，
+/// 但体积会大于 Go 的 Deflate 包。
+pub async fn dump(
+    pool: &MySqlPool,
+    backup_dir: &Path,
+    template_dir: &Path,
+    public_dir: &Path,
+) -> Result<String, ModelError> {
     std::fs::create_dir_all(backup_dir)
         .map_err(|err| ModelError::invalid(format!("创建备份目录失败: {err}")))?;
-    let file_name = chrono::Local::now().format("%Y%m%d%H%M%S.sql").to_string();
+    let file_name = chrono::Local::now().format("%Y%m%d%H%M%S.zip").to_string();
     let target = backup_dir.join(&file_name);
 
     let tables: Vec<String> = sqlx::query_scalar("SHOW TABLES")
@@ -352,26 +361,70 @@ pub async fn dump(pool: &MySqlPool, backup_dir: &Path) -> Result<String, ModelEr
             sql.push_str(";\n");
         }
         sql.push('\n');
+    }
 
-        // 分批落盘，避免大库把内存撑爆
-        if sql.len() > 4 * 1024 * 1024 {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&target)
-                .map_err(|err| ModelError::invalid(format!("写备份文件失败: {err}")))?;
-            use std::io::Write;
-            file.write_all(sql.as_bytes())
-                .map_err(|err| ModelError::invalid(format!("写备份文件失败: {err}")))?;
-            sql.clear();
-        }
-    }
-    if !sql.is_empty() {
-        std::fs::write(&target, sql.as_bytes())
-            .map_err(|err| ModelError::invalid(format!("写备份文件失败: {err}")))?;
-    }
+    let mut writer = rustcms_ext::packer::ZipWriter::new();
+    writer
+        .add_file("database.sql", sql.as_bytes())
+        .map_err(|err| ModelError::invalid(format!("写入 backup database.sql 失败: {err}")))?;
+
+    update_status("backup", 99, "正在备份模板文件");
+    add_dir_to_zip(&mut writer, "template/", template_dir)?;
+
+    update_status("backup", 99, "正在备份静态文件");
+    let template_name = template_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let static_dir = public_dir.join("static").join(template_name);
+    add_dir_to_zip(&mut writer, "static/", &static_dir)?;
+
+    std::fs::write(&target, writer.finish())
+        .map_err(|err| ModelError::invalid(format!("写备份文件失败: {err}")))?;
     finish_status("backup", format!("备份完成：{file_name}"));
     Ok(file_name)
+}
+
+/// 把目录下的所有文件加入 zip（条目名带 `prefix`，目录本身不记录条目）。
+fn add_dir_to_zip(
+    writer: &mut rustcms_ext::packer::ZipWriter,
+    prefix: &str,
+    dir: &Path,
+) -> Result<(), ModelError> {
+    fn walk(
+        writer: &mut rustcms_ext::packer::ZipWriter,
+        base: &Path,
+        current: &Path,
+        prefix: &str,
+    ) -> Result<(), ModelError> {
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(base) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if path.is_dir() {
+                walk(writer, base, &path, prefix)?;
+                continue;
+            }
+            let data = std::fs::read(&path).map_err(|err| {
+                ModelError::invalid(format!("读取 {} 失败: {err}", path.display()))
+            })?;
+            writer
+                .add_file(&format!("{prefix}{relative}"), &data)
+                .map_err(|err| {
+                    ModelError::invalid(format!("写入备份条目 {relative} 失败: {err}"))
+                })?;
+        }
+        Ok(())
+    }
+    if dir.is_dir() {
+        walk(writer, dir, dir, prefix)?;
+    }
+    Ok(())
 }
 
 /// 把 SQL 文本切成单条语句（Go 恢复逻辑的纯函数版）：
@@ -662,21 +715,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dump_writes_real_database_sql() {
-        // 需要真实库：dump 出的 SQL 应包含 DROP/CREATE/INSERT 且跳过 _logs 表
+    async fn dump_writes_real_database_zip() {
+        // 需要真实库：zip 内应含 database.sql（DROP/CREATE/INSERT，跳过 _logs）+ template/ + static/
         let Some(pool) = super::super::test_pool().await else {
             return;
         };
         let _guard = super::super::db_lock().await;
-        let dir = std::env::temp_dir().join(format!("rustcms-backup-dump-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = std::env::temp_dir().join(format!("rustcms-backup-dump-{}", std::process::id()));
+        let dir = base.join("backup");
+        let template_dir = base.join("template").join("default");
+        let public_dir = base.join("public");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(template_dir.join("index.html"), "tpl").unwrap();
+        std::fs::create_dir_all(public_dir.join("static").join("default")).unwrap();
+        std::fs::write(public_dir.join("static").join("default").join("app.css"), "css").unwrap();
 
         new_task("backup").unwrap();
-        let name = dump(&pool, &dir).await.unwrap();
-        assert!(name.ends_with(".sql"));
+        let name = dump(&pool, &dir, &template_dir, &public_dir).await.unwrap();
+        assert!(name.ends_with(".zip"));
         assert!(get_status().unwrap().finished);
 
-        let content = std::fs::read_to_string(dir.join(&name)).unwrap();
+        let archive = rustcms_ext::packer::ZipArchive::open(std::fs::read(dir.join(&name)).unwrap())
+            .unwrap();
+        assert!(archive.find("database.sql").is_some(), "应含 database.sql");
+        assert!(
+            archive.find("template/index.html").is_some(),
+            "应含模板文件"
+        );
+        assert!(
+            archive.find("static/app.css").is_some(),
+            "应含模板静态文件"
+        );
+        let content = String::from_utf8(archive.read_by_name("database.sql").unwrap()).unwrap();
         assert!(content.contains("DROP TABLE IF EXISTS `settings`"), "应包含 settings 表");
         assert!(content.contains("CREATE TABLE"), "应包含建表语句");
         // _logs 表被跳过
@@ -684,6 +755,25 @@ mod tests {
         let (statements, _skipped) = split_sql_statements(&content);
         assert!(statements.len() > 3, "应有建表+插入语句");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn packs_directory_into_zip_entries() {
+        let root = std::env::temp_dir().join(format!("rustcms-pack-dir-{}", std::process::id()));
+        let dir = root.join("tpl");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("sub").join("b.txt"), "b").unwrap();
+
+        let mut writer = rustcms_ext::packer::ZipWriter::new();
+        add_dir_to_zip(&mut writer, "template/", &dir).unwrap();
+        let archive = rustcms_ext::packer::ZipArchive::open(writer.finish()).unwrap();
+        assert!(archive.find("template/a.txt").is_some());
+        assert!(archive.find("template/sub/b.txt").is_some());
+        assert_eq!(archive.entries().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

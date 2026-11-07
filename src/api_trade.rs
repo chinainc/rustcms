@@ -1213,21 +1213,235 @@ async fn alipay_notify(State(state): State<AppState>, body: String) -> Response 
     }
 }
 
-/// `POST /paypal/pay`：PayPal Webhook 通知。
-async fn paypal_notify(State(state): State<AppState>, body: String) -> Response {
-    let form = parse_form(&body);
-    let token = form.get("token").cloned().unwrap_or_default();
+/// `POST /paypal/pay`：PayPal Webhook / 返回页通知。
+///
+/// Go 版从 query 取 `token`（支付单号），再用 PayPal client 对
+/// `payment.terrace_id` 执行 capture。这里同样先按 `token` 查支付单，
+/// 已支付直接成功；未支付则换取 OAuth token 后调用 capture，成功后更新
+/// `payments` / `orders` / 会员收尾。
+async fn paypal_notify(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: String,
+) -> Response {
+    let mut token = q
+        .get("token")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        // 兼容旧调用把 token 放在表单里的情况
+        let form = parse_form(&body);
+        token = form.get("token").cloned().unwrap_or_default();
+    }
     if token.trim().is_empty() {
         return fail("支付参数错误");
     }
+    paypal_capture_payment(&state, token.trim()).await
+}
+
+/// 按支付单号执行 PayPal capture 并落库。
+async fn paypal_capture_payment(state: &AppState, payment_id: &str) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match trade::payment_by_id(pool, token.trim()).await {
-        Ok(Some(_)) => fail("PayPal 支付回调尚未实现（需要 PayPal 订单查询与 capture）"),
-        Ok(None) => fail("支付单不存在"),
-        Err(err) => failed(err),
+    let payment = match trade::payment_by_id(pool, payment_id).await {
+        Ok(Some(payment)) => payment,
+        Ok(None) => return fail("支付单不存在"),
+        Err(err) => return failed(err),
+    };
+    if payment.paid_time > 0 {
+        return ok_msg("success");
     }
+    if payment.terrace_id.trim().is_empty() {
+        return fail("支付单缺少 PayPal 订单号");
+    }
+
+    let (client_id, client_secret, sandbox) = match paypal_account(pool, &payment).await {
+        Ok(account) => account,
+        Err(err) => return fail(err),
+    };
+    let access_token = match paypal_access_token(&client_id, &client_secret, sandbox).await {
+        Ok(token) => token,
+        Err(err) => return fail(err),
+    };
+    let (status, response) =
+        match paypal_capture(&access_token, sandbox, payment.terrace_id.trim()).await {
+            Ok(value) => value,
+            Err(err) => return fail(err),
+        };
+    if status != "COMPLETED" {
+        return fail(format!("PayPal 订单未完成：{status}"));
+    }
+
+    let buyer_id = response
+        .get("payer")
+        .and_then(|value| value.get("payer_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let buyer_info = response
+        .get("payment_source")
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    if let Err(err) = sqlx::query(
+        "UPDATE payments SET pay_way = 'paypal', paid_time = ?, status = 1, buyer_id = ?, \
+         buyer_info = ?, updated_time = ? WHERE id = ?",
+    )
+    .bind(now)
+    .bind(&buyer_id)
+    .bind(&buyer_info)
+    .bind(now)
+    .bind(payment.id)
+    .execute(pool)
+    .await
+    {
+        return failed(err.into());
+    }
+
+    if let Ok(Some(order)) = trade::load_order(pool, &payment.order_id).await {
+        let _ = sqlx::query("UPDATE orders SET payment_id = ? WHERE id = ?")
+            .bind(&payment.payment_id)
+            .bind(order.id)
+            .execute(pool)
+            .await;
+        if let Err(err) = trade::success_paid_order(pool, &order, &payment).await {
+            return failed(err.into());
+        }
+    }
+    ok_msg("success")
+}
+
+/// 读取 PayPal 账户配置：优先支付单上的账户，回退第一个启用的 paypal 账户。
+async fn paypal_account(
+    pool: &sqlx::mysql::MySqlPool,
+    payment: &trade::Payment,
+) -> Result<(String, String, bool), String> {
+    let mut raw: Option<String> = None;
+    if payment.payment_account_id > 0 {
+        raw = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(pay_config, '') FROM payment_accounts WHERE id = ? LIMIT 1",
+        )
+        .bind(payment.payment_account_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| format!("读取 PayPal 支付账户失败：{err}"))?;
+    }
+    if raw.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        raw = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(pay_config, '') FROM payment_accounts \
+             WHERE pay_way = 'paypal' AND status = 1 ORDER BY id ASC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| format!("读取 PayPal 支付账户失败：{err}"))?;
+    }
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Err("请先配置 PayPal 支付账户".to_string());
+    };
+    let config: Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("PayPal 支付账户配置解析失败：{err}"))?;
+    let client_id = config
+        .get("app_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let client_secret = config
+        .get("app_secret")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err("PayPal 支付账户缺少 client_id / client_secret".to_string());
+    }
+    let sandbox = match config.get("sandbox") {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(text)) => matches!(text.as_str(), "1" | "true" | "True"),
+        _ => false,
+    };
+    Ok((client_id, client_secret, sandbox))
+}
+
+/// PayPal OAuth：Basic(client_id:secret) + `grant_type=client_credentials`。
+async fn paypal_access_token(
+    client_id: &str,
+    client_secret: &str,
+    sandbox: bool,
+) -> Result<String, String> {
+    let base = if sandbox {
+        "https://api-m.sandbox.paypal.com"
+    } else {
+        "https://api-m.paypal.com"
+    };
+    let basic = rustcms_ext::smtp::base64_encode(
+        format!("{client_id}:{client_secret}").as_bytes(),
+    );
+    let request = rustcms_ext::http::Request::post(format!("{base}/v1/oauth2/token"))
+        .with_header("Authorization", format!("Basic {basic}"))
+        .with_header("Accept", "application/json")
+        .with_form(vec![(
+            "grant_type".to_string(),
+            "client_credentials".to_string(),
+        )]);
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| format!("PayPal OAuth 请求失败：{err}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "PayPal OAuth 失败（HTTP {}）：{}",
+            response.status,
+            response.text().trim()
+        ));
+    }
+    let value: Value = response
+        .json()
+        .map_err(|err| format!("PayPal OAuth 响应解析失败：{err}"))?;
+    value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "PayPal OAuth 未返回 access_token".to_string())
+}
+
+/// 调用 `/v2/checkout/orders/{id}/capture`，返回订单状态与响应 JSON。
+async fn paypal_capture(
+    access_token: &str,
+    sandbox: bool,
+    order_id: &str,
+) -> Result<(String, Value), String> {
+    let base = if sandbox {
+        "https://api-m.sandbox.paypal.com"
+    } else {
+        "https://api-m.paypal.com"
+    };
+    let request = rustcms_ext::http::Request::post(format!(
+        "{base}/v2/checkout/orders/{order_id}/capture"
+    ))
+    .with_header("Authorization", format!("Bearer {access_token}"))
+    .with_header("Content-Type", "application/json");
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| format!("PayPal capture 请求失败：{err}"))?;
+    let text = response.text();
+    let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+    if !response.is_success() {
+        return Err(format!(
+            "PayPal capture 失败（HTTP {}）：{}",
+            response.status,
+            text.trim()
+        ));
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((status, value))
 }
 
 /// `GET /paypal/cancel`：PayPal 取消支付的返回页。

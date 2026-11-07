@@ -655,6 +655,83 @@ pub async fn push_text(pool: &MySqlPool, openid: &str, content: &str) -> Result<
     Ok(true)
 }
 
+/// 网页授权：用 `code` 换 `access_token` 与 `openid`（Go `GetAccessTokenByCode`）。
+pub async fn oauth_access_token(
+    app_id: &str,
+    app_secret: &str,
+    code: &str,
+) -> Result<(String, String), ModelError> {
+    let url = format!(
+        "{API_BASE}/sns/oauth2/access_token?appid={}&secret={}&code={}&grant_type=authorization_code",
+        url_encode(app_id),
+        url_encode(app_secret),
+        url_encode(code)
+    );
+    let value = send_json(Request::get(url)).await?;
+    if let Some(message) = wechat_error(&value) {
+        return Err(ModelError::invalid(message));
+    }
+    let token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ModelError::invalid("微信授权未返回 access_token"))?;
+    let openid = value
+        .get("openid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ModelError::invalid("微信授权未返回 openid"))?;
+    Ok((token.to_string(), openid.to_string()))
+}
+
+/// 网页授权：读取微信用户资料（Go `GetSNSUserInfo`）。
+pub async fn oauth_user_info(access_token: &str, openid: &str) -> Result<Value, ModelError> {
+    let url = format!(
+        "{API_BASE}/sns/userinfo?access_token={}&openid={}&lang=zh_CN",
+        url_encode(access_token),
+        url_encode(openid)
+    );
+    let value = send_json(Request::get(url)).await?;
+    if let Some(message) = wechat_error(&value) {
+        return Err(ModelError::invalid(message));
+    }
+    Ok(value)
+}
+
+/// 生成小程序码（`/wxa/getwxacode`），返回 PNG 字节。
+pub async fn weapp_qrcode_image(
+    app_id: &str,
+    app_secret: &str,
+    path: &str,
+) -> Result<Vec<u8>, ModelError> {
+    let token = access_token(app_id, app_secret).await?;
+    let url = format!(
+        "{API_BASE}/wxa/getwxacode?access_token={}",
+        url_encode(&token)
+    );
+    let response = http::send(&Request::post(url).with_json(json!({ "path": path })))
+        .await
+        .map_err(|err| ModelError::invalid(format!("调用微信接口失败: {err}")))?;
+    if !response.is_success() {
+        return Err(ModelError::invalid(format!(
+            "微信接口返回 HTTP {}",
+            response.status
+        )));
+    }
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.starts_with("image") {
+        return Ok(response.body);
+    }
+    // 失败时微信返回 JSON（errcode / errmsg）
+    let value: Value = response
+        .json()
+        .map_err(|err| ModelError::invalid(format!("微信接口响应解析失败: {err}")))?;
+    Err(ModelError::invalid(
+        wechat_error(&value).unwrap_or_else(|| "微信接口未返回二维码图片".to_string()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

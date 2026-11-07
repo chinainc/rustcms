@@ -892,6 +892,12 @@ async fn wechat_message(
     }
 
     let _ = interact::save_wechat_message(pool, &from, &content, &reply, reply_time).await;
+    // 自动回复推送到微信（Go `ReplyWechatMessage`）：未配置 AppID/Secret 时静默跳过
+    if !reply.trim().is_empty() {
+        if let Err(err) = crate::models::wechat::push_text(pool, &from, &reply).await {
+            tracing::warn!("推送微信客服消息失败：{err}");
+        }
+    }
     (StatusCode::OK, "success").into_response()
 }
 
@@ -928,7 +934,63 @@ async fn wechat_auth(
         return fail("未配置微信公众号 AppID");
     }
     if !q_str(&q, "code").is_empty() {
-        return fail_unsupported("未实现：换取微信用户信息需要调用微信接口");
+        let code = q_str(&q, "code");
+        let app_secret = config
+            .get("app_secret")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if app_secret.is_empty() {
+            return fail("未配置微信公众号 AppSecret");
+        }
+        let (access_token, openid) = match crate::models::wechat::oauth_access_token(
+            &app_id,
+            &app_secret,
+            &code,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => return fail(err.to_string()),
+        };
+        let info = match crate::models::wechat::oauth_user_info(&access_token, &openid).await {
+            Ok(value) => value,
+            Err(err) => return fail(err.to_string()),
+        };
+        let nickname = info.get("nickname").and_then(Value::as_str).unwrap_or("");
+        let avatar = info
+            .get("headimgurl")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let union_id = info.get("unionid").and_then(Value::as_str).unwrap_or("");
+        let gender = info.get("sex").and_then(Value::as_i64).unwrap_or(0) as i32;
+        let user_id =
+            match interact::save_wechat_user(pool, &openid, union_id, nickname, avatar, gender).await
+            {
+                Ok(id) => id,
+                Err(err) => return failed(err),
+            };
+
+        let state_value = q_str(&q, "state");
+        if state_value == "code" {
+            // Go `WechatAuthApi`：state=code 时下发验证码并推送到微信
+            let verify_code = generate_verify_code(&openid);
+            let message = format!("验证码：{verify_code}，30分钟内有效");
+            if let Err(err) = crate::models::wechat::push_text(pool, &openid, &message).await {
+                tracing::warn!("推送微信验证码失败：{err}");
+            }
+            return ok(json!({
+                "openid": openid,
+                "user_id": user_id,
+                "verify_code": verify_code,
+            }));
+        }
+        return ok(json!({
+            "openid": openid,
+            "user_id": user_id,
+            "user": info,
+        }));
     }
     let state_value = q_str(&q, "state");
     let redirect_uri = format!("{}/api/wechat/auth", site_base_url(&headers));
@@ -1216,7 +1278,69 @@ async fn weapp_qrcode(State(state): State<AppState>, headers: HeaderMap, body: B
         Ok(Some(code_url)) => {
             Json(json!({ "code": 0, "msg": "", "data": code_url })).into_response()
         }
-        Ok(None) => fail_unsupported("未实现：生成小程序二维码需要调用微信接口"),
+        Ok(None) => {
+            let config = interact::weapp_config(pool)
+                .await
+                .unwrap_or_else(|_| json!({}));
+            let app_id = config
+                .get("app_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let app_secret = config
+                .get("app_secret")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if app_id.is_empty() || app_secret.is_empty() {
+                return fail("请先配置小程序 AppID 和 AppSecret");
+            }
+            let bytes =
+                match crate::models::wechat::weapp_qrcode_image(&app_id, &app_secret, path).await {
+                    Ok(bytes) => bytes,
+                    Err(err) => return fail(err.to_string()),
+                };
+
+            // 与 Go `CreateWeappQrcode` 一致：uploads/qrcode/<md5 前3>/<3..6>/<6..>.png
+            let md5 = crate::models::attachment::md5_hex(&bytes);
+            let file_name = format!("{md5}.png");
+            let relative = format!(
+                "uploads/qrcode/{}/{}/{}",
+                &md5[0..3],
+                &md5[3..6],
+                &md5[6..]
+            );
+            let public_dir = state.with_config(|config| config.public_dir());
+            let file = public_dir.join(&relative);
+            if let Some(parent) = file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(err) = std::fs::write(&file, &bytes) {
+                return fail(format!("保存小程序二维码失败：{err}"));
+            }
+            let _ = crate::models::attachment::insert(
+                pool,
+                &file_name,
+                &relative,
+                bytes.len() as u64,
+                &md5,
+                0,
+                0,
+                0,
+                0,
+                "",
+            )
+            .await;
+            let code_url = format!("/{relative}");
+            if let Err(err) =
+                interact::save_weapp_qrcode(pool, user_id, path, &code_url).await
+            {
+                return failed(err);
+            }
+            Json(json!({ "code": 0, "msg": "", "data": code_url })).into_response()
+        }
         Err(err) => failed(err),
     }
 }

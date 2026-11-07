@@ -622,3 +622,44 @@ Go 侧有机器可读的端点目录 `provider/api_catalog.json`（403 条，含
 - `cargo check --all-targets`：0 告警；`cargo test --no-run`：通过。
 - 主 crate：**324 passed / 5 failed**，失败项仍是环境限制（沙箱 MySQL、`clientFiles`、
   依赖 DB 的首页渲染）。
+
+---
+
+## 二十一、外呼类接线（2026-11-07）
+
+本轮补齐「接口保留 + 明确未实现提示」里的外呼动作；无凭据环境下只验证参数校验与错误路径。
+
+### 1. 微信公众号
+- 消息回调：自动回复落库后调用 `wechat::push_text` 推送到客服接口
+  （未配置 AppID/Secret 时静默跳过）。
+- 网页授权：新增 `wechat::oauth_access_token` / `oauth_user_info`；`/api/wechat/auth`
+  带 `code` 时换 token + 拉用户资料并 upsert `user_wechats`；`state=code` 时生成验证码并推送。
+- 小程序码：新增 `wechat::weapp_qrcode_image`（`/wxa/getwxacode`），生成后落
+  `uploads/qrcode/<md5 前3>/<3..6>/<6..>.png`，写 `attachments` 与 `weapp_qrcodes`，
+  返回可访问 URL。
+
+### 2. Google 推送
+- `push_to_search_engines` 的 Google 分支改为真实实现：解析服务账号 JSON，
+  RS256 JWT（`jsonwebtoken`）+ `urn:ietf:params:oauth:grant-type:jwt-bearer` 换 token，
+  再逐条 POST `indexing.googleapis.com/v3/urlNotifications:publish`（`URL_UPDATED`）。
+- 缺少 `client_email` / `private_key`、私钥格式错误均返回明确文案；单条失败汇总返回。
+
+### 3. PayPal capture
+- `/api/paypal/pay` 改为从 query（兼容表单）取 `token`，查支付单：已支付直接成功；
+  否则按 `payment_account_id`（回退第一个启用 paypal 账户）读 `pay_config`，
+  Basic OAuth 换 token，调用 `POST /v2/checkout/orders/{id}/capture`。
+- `COMPLETED` 后更新 `payments`（pay_way/paid_time/buyer_id/buyer_info/status）与
+  `orders.payment_id`，并调用 `trade::success_paid_order`。
+- 失败路径：账户未配置、缺订单号、OAuth/capture 非 2xx、订单状态非 COMPLETED 均返回明确文案。
+
+### 4. 测试与验证
+- 新增 `google_oauth_rejects_invalid_service_account`（纯离线：非法 JSON、缺 private_key、坏私钥）。
+- 微信/PayPal 成功路径需要真实凭据，未在本机验证；参数与错误路径由编译与代码审查覆盖。
+- `cargo check --all-targets`：0 告警；`cargo test --no-run`：通过；
+  主 crate **325 passed / 5 failed**（环境限制同上）。
+
+### 5. 已知差异
+- PayPal 下单（Go `createPaypalPayment`）仍未移植，本轮只补 capture；capture 依赖
+  库里已有 `terrace_id`。
+- 微信 auth 未实现 Go 的 `union_id` 自动关联已有会员；只 upsert 微信资料并保留原 `user_id`。
+- 小程序码使用 `/wxa/getwxacode`（与 Go 一致），未使用 `getwxacodeunlimit`。

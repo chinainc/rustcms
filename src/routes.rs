@@ -14628,13 +14628,126 @@ async fn push_to_search_engines(
     }
 
     if !google_json.trim().is_empty() {
-        parts.push("Google 推送需要服务账号 OAuth 签名，本包暂未实现".to_string());
+        match google_push_urls(google_json, urls).await {
+            Ok((count, errors)) if errors.is_empty() => {
+                success_any = true;
+                parts.push(format!("Google 推送 {count} 条成功"));
+            }
+            Ok((count, errors)) => {
+                if count > 0 {
+                    success_any = true;
+                }
+                parts.push(format!(
+                    "Google 推送 {count} 条成功，{} 条失败：{}",
+                    errors.len(),
+                    errors.join("；")
+                ));
+            }
+            Err(err) => parts.push(format!("Google 推送失败：{err}")),
+        }
     }
 
     if parts.is_empty() {
         parts.push("未配置可用的搜索引擎推送账号".to_string());
     }
     (success_any, parts.join("；"))
+}
+
+/// 用服务账号 JWT 换 Google OAuth token，并逐条调用 Indexing API。
+///
+/// 对齐 Go `PushGoogleIndexing`：请求体只有 `url` + `type: URL_UPDATED`，
+/// 响应只记录状态码与原始 body；任一成功即视为部分成功。
+async fn google_push_urls(
+    google_json: &str,
+    urls: &[String],
+) -> Result<(usize, Vec<String>), String> {
+    let token = google_oauth_token(google_json).await?;
+    let mut success = 0usize;
+    let mut errors = Vec::new();
+    for url in urls {
+        let request =
+            rustcms_ext::http::Request::post("https://indexing.googleapis.com/v3/urlNotifications:publish")
+                .with_header("Authorization", format!("Bearer {token}"))
+                .with_json(json!({ "url": url, "type": "URL_UPDATED" }));
+        match rustcms_ext::http::send(&request).await {
+            Ok(response) if response.is_success() => success += 1,
+            Ok(response) => errors.push(format!(
+                "{url}（HTTP {}）：{}",
+                response.status,
+                response.text().trim()
+            )),
+            Err(err) => errors.push(format!("{url}：{err}")),
+        }
+    }
+    Ok((success, errors))
+}
+
+/// 服务账号 JSON → Google OAuth access_token（RS256 JWT + jwt-bearer）。
+async fn google_oauth_token(google_json: &str) -> Result<String, String> {
+    let account: Value = serde_json::from_str(google_json)
+        .map_err(|err| format!("Google 服务账号 JSON 解析失败：{err}"))?;
+    let email = account
+        .get("client_email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Google 服务账号 JSON 缺少 client_email".to_string())?;
+    let private_key = account
+        .get("private_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Google 服务账号 JSON 缺少 private_key".to_string())?;
+    let token_uri = account
+        .get("token_uri")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("https://oauth2.googleapis.com/token");
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "iss": email,
+        "scope": "https://www.googleapis.com/auth/indexing",
+        "aud": token_uri,
+        "iat": now,
+        "exp": now + 3600,
+    });
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    if let Some(kid) = account
+        .get("private_key_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        header.kid = Some(kid.to_string());
+    }
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes())
+        .map_err(|err| format!("Google 私钥解析失败：{err}"))?;
+    let assertion = jsonwebtoken::encode(&header, &claims, &key)
+        .map_err(|err| format!("Google JWT 签名失败：{err}"))?;
+
+    let request = rustcms_ext::http::Request::post(token_uri).with_form(vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+        ),
+        ("assertion".to_string(), assertion),
+    ]);
+    let response = rustcms_ext::http::send(&request)
+        .await
+        .map_err(|err| format!("Google OAuth 请求失败：{err}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "Google OAuth 失败（HTTP {}）：{}",
+            response.status,
+            response.text().trim()
+        ));
+    }
+    let value: Value = response
+        .json()
+        .map_err(|err| format!("Google OAuth 响应解析失败：{err}"))?;
+    value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "Google OAuth 未返回 access_token".to_string())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -16785,6 +16898,22 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn google_oauth_rejects_invalid_service_account() {
+        let err = google_oauth_token("not-json").await.unwrap_err();
+        assert!(err.contains("JSON 解析失败"), "{err}");
+
+        let err = google_oauth_token(r#"{"client_email":"a@b.c"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.contains("private_key"), "{err}");
+
+        let err = google_oauth_token(r#"{"client_email":"a@b.c","private_key":"bad"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.contains("私钥解析失败"), "{err}");
     }
 
     #[tokio::test]

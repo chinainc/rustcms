@@ -721,6 +721,87 @@ pub async fn weapp_qrcode(
     Ok(row)
 }
 
+/// 写入 / 更新公众号用户资料（`user_wechats`），返回绑定的 `user_id`（未绑定为 0）。
+pub async fn save_wechat_user(
+    pool: &MySqlPool,
+    openid: &str,
+    union_id: &str,
+    nickname: &str,
+    avatar_url: &str,
+    gender: i32,
+) -> anyhow::Result<u32> {
+    let now = chrono::Utc::now().timestamp();
+    let existing: Option<u32> =
+        sqlx::query_scalar("SELECT user_id FROM user_wechats WHERE openid = ? LIMIT 1")
+            .bind(openid)
+            .fetch_optional(pool)
+            .await?;
+    if let Some(user_id) = existing {
+        sqlx::query(
+            "UPDATE user_wechats SET updated_time = ?, nickname = ?, avatar_url = ?, gender = ?, \
+             union_id = ?, platform = 'wechat', status = 1 WHERE openid = ?",
+        )
+        .bind(now)
+        .bind(nickname)
+        .bind(avatar_url)
+        .bind(gender)
+        .bind(union_id)
+        .bind(openid)
+        .execute(pool)
+        .await?;
+        return Ok(user_id);
+    }
+    sqlx::query(
+        "INSERT INTO user_wechats (created_time, updated_time, user_id, nickname, avatar_url, \
+         gender, openid, union_id, platform, status) \
+         VALUES (?, ?, 0, ?, ?, ?, ?, ?, 'wechat', 1)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(nickname)
+    .bind(avatar_url)
+    .bind(gender)
+    .bind(openid)
+    .bind(union_id)
+    .execute(pool)
+    .await?;
+    Ok(0)
+}
+
+/// 保存小程序二维码（`weapp_qrcodes`）：同一用户 + path 只保留一条。
+pub async fn save_weapp_qrcode(
+    pool: &MySqlPool,
+    user_id: u32,
+    path: &str,
+    code_url: &str,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let updated = sqlx::query(
+        "UPDATE weapp_qrcodes SET code_url = ?, updated_time = ? WHERE user_id = ? AND path = ?",
+    )
+    .bind(code_url)
+    .bind(now)
+    .bind(user_id)
+    .bind(path)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        sqlx::query(
+            "INSERT INTO weapp_qrcodes (created_time, updated_time, user_id, path, code_url) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .bind(path)
+        .bind(code_url)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// 公众号消息落库（对应 Go 的 `model.WechatMessage`）。
 pub async fn save_wechat_message(
     pool: &MySqlPool,

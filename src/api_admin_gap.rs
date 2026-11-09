@@ -1,6 +1,6 @@
 //! 后台 API 缺口补齐（批次 E）。
 //!
-//! 对应 Go 版 `route/manage.go` 里 Rust 侧尚未覆盖的后台端点：
+//! 覆盖后台路由表里此前尚未实现的后台端点：
 //! 找回密码三步、内容导入（上传 / 状态 / Excel 模板）、
 //! `archive` 的删除图片 / 补 alt / 定时计划 / 发布 / 标签、
 //! 附件远程地址登记、锚文本导入、`htmlcache` 证书上传、`setting/convert/webp`。
@@ -9,8 +9,8 @@
 //! `merge` 进来；本文件不改动 `routes.rs`。
 //!
 //! 鉴权口径：
-//! - `/system/api/password/*`（找回密码）在 Go 版里**没有**挂后台令牌中间件，
-//!   因为它是「还没登录的后台管理员」用来重置账号密码的，所以这里也不鉴权；
+//! - `/system/api/password/*`（找回密码）**不**挂后台令牌中间件，
+//! 因为它是「还没登录的后台管理员」用来重置账号密码的，所以这里也不鉴权；
 //! - 其余端点一律先 `require_admin`，失败直接返回那个错误响应。
 //!
 //! 实现口径：
@@ -72,7 +72,7 @@ pub fn router() -> Router<AppState> {
         .route("/system/api/setting/convert/webp", post(setting_convert_webp))
 }
 
-/// 带提示语的成功信封（Go 版不少接口是 `code:0` + `msg` + `data`）。
+/// 带提示语的成功信封（既有实现不少接口是 `code:0` + `msg` + `data`）。
 fn ok_data_msg(data: impl serde::Serialize, msg: impl Into<String>) -> Response {
     axum::Json(json!({ "code": 0, "msg": msg.into(), "data": data })).into_response()
 }
@@ -90,7 +90,7 @@ struct PasswordChooseBody {
 
 /// `POST /system/api/password/choose`
 ///
-/// 选定验证方式并生成一次性令牌（Go：`FindPasswordChooseWay`）。
+/// 选定验证方式并生成一次性令牌（既有实现：`FindPasswordChooseWay`）。
 async fn password_choose(
     State(state): State<AppState>,
     Json(body): Json<PasswordChooseBody>,
@@ -113,7 +113,7 @@ async fn password_choose(
 
 /// `GET|POST /system/api/password/verify`
 ///
-/// 校验找回密码的验证结果（Go：`FindPasswordVerify`）。
+/// 校验找回密码的验证结果（既有实现：`FindPasswordVerify`）。
 /// - 文件方式：读 `<public>/<token>.txt`，内容必须等于令牌；
 /// - DNS 方式：用系统 `nslookup` 查询 `_rustcms.<域名>` 的 TXT 记录并比对令牌。
 async fn password_verify(State(state): State<AppState>) -> Response {
@@ -158,7 +158,7 @@ struct PasswordResetBody {
 
 /// `POST /system/api/password/reset`
 ///
-/// 验证通过后重置超级管理员（`admins.id = 1`）的账号与密码（Go：`FindPasswordReset`）。
+/// 验证通过后重置超级管理员（`admins.id = 1`）的账号与密码（既有实现：`FindPasswordReset`）。
 async fn password_reset(
     State(state): State<AppState>,
     Json(body): Json<PasswordResetBody>,
@@ -199,7 +199,7 @@ async fn password_reset(
             }
         }
         Ok(None) => {
-            // Go 版：管理员不存在时按 id = 1 直接保存（等价于新建）
+            // 既有实现：管理员不存在时按 id = 1 直接保存（等价于新建）
             if let Err(err) = admin::create(pool, &user_name, &hash, 1, 1).await {
                 return failed(err);
             }
@@ -217,9 +217,9 @@ async fn password_reset(
 
 /// `POST /system/api/archive/import`
 ///
-/// 上传 zip / xlsx 批量导入文档（对齐 Go：`QuickImportArchive`）。
+/// 上传 zip / xlsx 批量导入文档（既有的取参口径：`QuickImportArchive`）。
 /// - zip：逐个读取 `.html/.htm/.txt/.md` 文本条目，文件名作标题（`title_type=1`
-///   时改用 `<title>` / 首行），正文原样写入；
+/// 时改用 `<title>` / 首行），正文原样写入；
 /// - xlsx：读取第一个工作表，首行为表头（支持中文 / 英文字段名），逐行建文档。
 ///
 /// 说明：zip 里的图片与分片上传暂不处理；导入同步执行并返回成功条数。
@@ -240,6 +240,8 @@ async fn archive_import(
     let mut category_id = 0u32;
     let mut title_type = 0u32;
     let mut chunks = 0u32;
+    let mut chunk = 0u32;
+    let mut md5_value = String::new();
     let mut has_file = false;
     let mut bytes: Option<Vec<u8>> = None;
 
@@ -286,6 +288,22 @@ async fn archive_import(
                     .and_then(|value| value.trim().parse::<u32>().ok())
                     .unwrap_or(0);
             }
+            "chunk" => {
+                chunk = field
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+            }
+            "md5" => {
+                md5_value = field
+                    .text()
+                    .await
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .unwrap_or_default();
+            }
             _ => {
                 let _ = field.bytes().await;
             }
@@ -302,7 +320,22 @@ async fn archive_import(
         return fail("无法获取上传文件名");
     }
     if chunks > 0 {
-        return fail("暂不支持分片上传，请关闭分片后重新导入");
+        let dir = state.with_config(|config| config.cache_dir()).join("tmp");
+        let Some(part) = bytes.as_deref() else {
+            return fail("无法获取上传文件");
+        };
+        match merge_chunks(&dir, &md5_value, chunk, chunks, part) {
+            // 合并后的完整内容直接进 `bytes`，后续只按内容解析，不再回写
+            // `file_size`（那是「本次请求分片大小」，合并后会失真）。
+            Ok(Some(merged)) => {
+                bytes = Some(merged);
+            }
+            // 还缺分片：与既有接口契约一致返回空消息，由前端继续上传
+            Ok(None) => {
+                return Json(json!({ "code": 0, "msg": "" })).into_response();
+            }
+            Err(err) => return fail(err),
+        }
     }
     if category_id == 0 {
         return fail("请选择导入的分类");
@@ -349,6 +382,85 @@ async fn archive_import(
         "succeed": succeed,
         "failed": failed_rows,
     }))
+}
+
+/// 单个导入任务允许的最大分片数（防异常 chunks 参数）。
+const MAX_UPLOAD_CHUNKS: u32 = 10_000;
+/// 分片临时文件保留时长（与既有接口契约一致为 6 小时）。
+const CHUNK_EXPIRE_SECS: u64 = 6 * 3600;
+
+/// 写入一个分片；齐全时按序合并并删除分片文件。
+///
+/// 与 `UploadByChunks` 一致：临时目录 `<cache>/tmp`，文件名
+/// `<md5(md5 参数)>_<chunk>.part`；返回 `Ok(None)` 表示还缺分片。
+fn merge_chunks(
+    dir: &Path,
+    md5_value: &str,
+    chunk: u32,
+    chunks: u32,
+    data: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    if md5_value.is_empty() {
+        return Err("分片上传缺少 md5 参数".to_string());
+    }
+    if !md5_value.chars().all(|value| value.is_ascii_hexdigit()) {
+        return Err("md5 参数不合法".to_string());
+    }
+    if chunks == 0 || chunks > MAX_UPLOAD_CHUNKS {
+        return Err("分片数量不合法".to_string());
+    }
+    if chunk >= chunks {
+        return Err("分片序号超出范围".to_string());
+    }
+    std::fs::create_dir_all(dir).map_err(|err| format!("创建分片临时目录失败：{err}"))?;
+    cleanup_old_chunks(dir);
+
+    let key = crate::models::attachment::md5_hex(md5_value.as_bytes());
+    let part = dir.join(format!("{key}_{chunk}.part"));
+    std::fs::write(&part, data).map_err(|err| format!("写入分片失败：{err}"))?;
+
+    let mut parts = Vec::with_capacity(chunks as usize);
+    for index in 0..chunks {
+        let path = dir.join(format!("{key}_{index}.part"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        parts.push(path);
+    }
+
+    let mut merged = Vec::new();
+    for path in &parts {
+        let data = std::fs::read(path).map_err(|err| format!("读取分片失败：{err}"))?;
+        merged.extend_from_slice(&data);
+    }
+    for path in &parts {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(Some(merged))
+}
+
+/// 清理超过 6 小时的 `.part` 残留。
+fn cleanup_old_chunks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("part") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let expired = now
+            .duration_since(modified)
+            .map(|elapsed| elapsed.as_secs() > CHUNK_EXPIRE_SECS)
+            .unwrap_or(false);
+        if expired {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// 从 zip 中取出文本条目（支持 html / htm / txt / md）并转成文档参数。
@@ -587,7 +699,7 @@ fn unescape_xml(text: &str) -> String {
 
 /// `GET /system/api/archive/import/status`
 ///
-/// 查询批量导入任务进度（Go：`GetQuickImportArchiveStatus`）。
+/// 查询批量导入任务进度（既有实现：`GetQuickImportArchiveStatus`）。
 /// 当前导入是同步完成的，这里固定返回一个可读的空闲态，避免 `data: null`
 /// 让前端无法展示状态。
 async fn archive_import_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -614,7 +726,7 @@ struct ExcelTemplateBody {
 
 /// `POST /system/api/archive/import/exceltemplate`
 ///
-/// 生成批量导入用的 Excel 模板（Go：`GetQuickImportExcelTemplate`）。
+/// 生成批量导入用的 Excel 模板（既有实现：`GetQuickImportExcelTemplate`）。
 /// 返回的是 xlsx 二进制（`Content-Disposition: attachment`），不是 JSON。
 async fn archive_import_excel_template(
     State(state): State<AppState>,
@@ -697,7 +809,7 @@ struct ArchiveImageDeleteBody {
 
 /// `POST /system/api/archive/delete/image`
 ///
-/// 删除文档相册里的指定图片（Go：`ArchiveDeleteImage`）。
+/// 删除文档相册里的指定图片（既有实现：`ArchiveDeleteImage`）。
 async fn archive_delete_image(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -721,7 +833,7 @@ async fn archive_delete_image(
 
 /// `POST /system/api/archive/fill-img-alt`
 ///
-/// 全站回填图片 alt（Go：`ArchiveFillImgAlt`）：只补空 alt，不覆盖已有值。
+/// 全站回填图片 alt（既有实现：`ArchiveFillImgAlt`）：只补空 alt，不覆盖已有值。
 async fn archive_fill_img_alt(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -756,7 +868,7 @@ struct ArchivePlanBody {
 
 /// `POST /system/api/archive/plan`
 ///
-/// 批量设置定时发布计划（Go：`UpdateArchiveReleasePlan`）。
+/// 批量设置定时发布计划（既有实现：`UpdateArchiveReleasePlan`）。
 async fn archive_plan(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -791,7 +903,7 @@ struct ArchiveIdBody {
 
 /// `POST /system/api/archive/release`
 ///
-/// 发布指定的草稿文档（Go：`ArchiveRelease`）：草稿 → 正式表，发布时间取当前时间。
+/// 发布指定的草稿文档（既有实现：`ArchiveRelease`）：草稿 → 正式表，发布时间取当前时间。
 async fn archive_release(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -806,7 +918,7 @@ async fn archive_release(
     if body.id <= 0 {
         return fail("文档不存在");
     }
-    // Go 版只发布草稿：正式表里的内容没有草稿行，直接报「文档不存在」
+    // 既有实现只发布草稿：正式表里的内容没有草稿行，直接报「文档不存在」
     let draft: Option<i64> = sqlx::query_scalar("SELECT id FROM archive_drafts WHERE id = ?")
         .bind(body.id)
         .fetch_optional(pool)
@@ -833,7 +945,7 @@ struct ArchiveTagsBody {
 
 /// `POST /system/api/archive/tags`
 ///
-/// 批量修改文档标签（Go：`UpdateArchiveTags`）。
+/// 批量修改文档标签（既有实现：`UpdateArchiveTags`）。
 async fn archive_tags(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -867,7 +979,7 @@ struct AttachmentAddUrlBody {
 
 /// `POST /system/api/attachment/addurl`
 ///
-/// 按远程 URL 批量登记附件（Go：`AttachmentAddRemoteUrl`）。
+/// 按远程 URL 批量登记附件（既有实现：`AttachmentAddRemoteUrl`）。
 async fn attachment_addurl(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -898,10 +1010,10 @@ struct AnchorFromTitleBody {
     ids: Vec<u32>,
 }
 
-/// `POST /system/api/anchor/addfromtitle`（Go 版真实路径是
+/// `POST /system/api/anchor/addfromtitle`（既有实现真实路径是
 /// `/system/api/plugin/anchor/addfromtitle`，两个路径都注册）。
 ///
-/// 批量把标题导入锚文本（Go：`PluginAnchorAddFromTitle`）。
+/// 批量把标题导入锚文本（既有实现：`PluginAnchorAddFromTitle`）。
 async fn anchor_add_from_title(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -923,11 +1035,11 @@ async fn anchor_add_from_title(
     }
 }
 
-/// `POST /system/api/plugin/htmlcache/upload`（Go 版真实路径，路由表里另有
+/// `POST /system/api/plugin/htmlcache/upload`（既有实现真实路径，路由表里另有
 /// `/system/api/htmlcache/upload` 兼容别名，两者行为一致）。
 ///
-/// 上传 SSH 私钥证书，用于 SSH 方式推送静态缓存（Go：`PluginHtmlCacheUploadFile`）。
-/// Go 版在写盘之后还会把私钥文件名回写进 `html_cache` 设置并记一条后台操作日志，
+/// 上传 SSH 私钥证书，用于 SSH 方式推送静态缓存（既有实现：`PluginHtmlCacheUploadFile`）。
+/// 既有实现在写盘之后还会把私钥文件名回写进 `html_cache` 设置并记一条后台操作日志，
 /// 这里保持同样口径。
 async fn htmlcache_upload(
     State(state): State<AppState>,
@@ -974,7 +1086,7 @@ async fn htmlcache_upload(
         return failed(err.into());
     }
 
-    // 回写 `html_cache.ssh_private_key`（Go 版 `SaveSettingValue(HtmlCacheSettingKey, ...)`），
+    // 回写 `html_cache.ssh_private_key`（`SaveSettingValue(HtmlCacheSettingKey, ...)` 的语义），
     // 并记一条后台操作日志；两者失败都不影响上传结果。
     if let Some(pool) = state.db() {
         if let Err(err) =
@@ -1020,8 +1132,8 @@ fn client_ip_of(headers: &HeaderMap, peer: SocketAddr) -> String {
 
 /// `POST /system/api/setting/convert/webp`
 ///
-/// 批量把附件图片转换成 WebP（对齐 Go：`ConvertImageToWebp`）。
-/// Go 版同样依赖外置 `cwebp` 命令；本项目的内置图片引擎只支持 PNG/BMP 解码、
+/// 批量把附件图片转换成 WebP（既有的取参口径：`ConvertImageToWebp`）。
+/// 既有实现同样依赖外置 `cwebp` 命令；本项目的内置图片引擎只支持 PNG/BMP 解码、
 /// 不具备 WebP 编码能力，因此这里复用系统 `cwebp`，不引入新依赖。
 async fn setting_convert_webp(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {

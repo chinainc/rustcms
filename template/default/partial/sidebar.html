@@ -1,0 +1,32 @@
+<div class="sidebar">
+    <div class="side">
+        <h2>产品中心</h2>
+        <div class="side-item">
+            <div class="accordion">
+                {% categoryList productCategories with moduleId="2" parentId="0" %}
+                {% for item in productCategories %}
+                <button class="accordion-item">{{item.Title}}</button>
+                <div class="accordion-item-content">
+                    <ul class="ind-pro-nav-ul">
+                        {% if item.HasChildren %}
+                        {% categoryList subCategories with moduleId="2" parentId=item.Id %}
+                        {% for inner in subCategories %}
+                        <li><a href="{{inner.Link}}" title="{{inner.Title}}">{{inner.Title}}</a></li>
+                        {% endfor %}
+                        {% endcategoryList %}
+                        {% else %}
+                        {% archiveList products with type="list" categoryId=item.Id limit="8" %}
+                        {% for inner in products %}
+                        <li><a href="{{inner.Link}}" title="{{inner.Title}}">{{inner.Title}}</a></li>
+                        {% endfor %}
+                        {% endarchiveList %}
+                        {% endif %}
+                    </ul>
+                </div>
+                {% endfor %}
+                {% endcategoryList %}
+            </div>
+        </div>
+    </div>
+    </div>
+</div>

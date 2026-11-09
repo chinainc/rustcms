@@ -1,6 +1,6 @@
 //! 路由表。
 //!
-//! 响应信封与 Go 版一致：`{"code":0,"msg":"","data":...}`，
+//! 响应信封：`{"code":0,"msg":"","data":...}`，
 //! `code` 取 `config.StatusOK(0)` / `config.StatusFailed(1)`。
 
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use crate::auth;
 use crate::login_guard;
 use crate::models::archive_write::{self, ArchiveInput};
 use crate::models::{
-    admin, anchor, anqi, archive, archive_admin, attachment, backup, category, collector,
+    admin, anchor, cloud, archive, archive_admin, attachment, backup, category, collector,
     commission, comment, design, diy, extra, guestbook, link, llms, material, menu, module,
     multilang, nav, order, payment, place, plugin, redirect, replace, retailer, sensitive,
     sendmail, setting, site_setting, skill, statistic, subscriber, tag, titleimage, transfer,
@@ -29,12 +29,12 @@ use crate::state::AppState;
 /// 组装应用路由。
 ///
 /// `/api`、`/system/api` 的精确路由优先；其余路径全部落入前台管线
-/// `front::reroute`（对齐 Go 的 `/{path:path}` 兜底入口）。
+/// `front::reroute`（`/{path:path}` 兜底入口）。
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/preview/list/:cid", get(preview_list))
         .nest("/api", api_router())
-        // Go 版后台接口的真实前缀是 `/system/api/...`（见 route/manage.go）
+        // 后台接口的真实前缀是 `/system/api/...`
         .nest("/system/api", manage_router())
         // 前台交互 API（批次 A/B/C/D）与后台缺口（批次 E），各自独立文件。
         .merge(crate::api_content::router())
@@ -112,6 +112,13 @@ pub(crate) fn model_error(err: ModelError) -> Response {
 
 /// 取出 `Authorization: Bearer <token>`。
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    // 管理端把令牌放在 `admin` 请求头里；同时兼容标准 Bearer 头。
+    if let Some(raw) = headers.get("admin").and_then(|value| value.to_str().ok()) {
+        let token = raw.trim().trim_matches('"').trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = raw.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
@@ -184,7 +191,7 @@ struct LoginRequest {
     remember: bool,
 }
 
-/// 账号 / IP 被锁定时的提示（文案取自 Go 版词条 `AdministratorHasBeenTemporarilyLocked`）。
+/// 账号 / IP 被锁定时的提示（文案取自既有词条 `AdministratorHasBeenTemporarilyLocked`）。
 const LOCKED: &str = "管理员已被临时锁定，请稍后重试";
 
 /// 取客户端 IP：优先反向代理头，其次 TCP 对端地址。
@@ -209,7 +216,7 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
 
 /// 管理员对外返回的内容：序列化字段 + 计算出来的 `is_super`。
 ///
-/// `is_super` 对应 Go 版 `Admin.IsSuper`（主站点 + 1 号用户组），本项目单站点，
+/// `is_super` 对应既有实现 `Admin.IsSuper`（主站点 + 1 号用户组），本项目单站点，
 /// 因此只看 `group_id`。
 fn admin_payload(found: &admin::Admin) -> Value {
     let mut value = serde_json::to_value(found).unwrap_or(Value::Null);
@@ -228,7 +235,7 @@ async fn log_login(pool: &sqlx::MySqlPool, admin_id: u32, ip: &str, status: u8, 
 
 /// `POST /api/admin/login`
 ///
-/// 与 Go 版一致的顺序：先看 IP 是否被锁 → 校验参数 → 查账号（不存在则累计 IP 失败数）
+/// 与既有接口契约一致的顺序：先看 IP 是否被锁 → 校验参数 → 查账号（不存在则累计 IP 失败数）
 /// → 看账号是否被锁 / 被禁用 → 校验密码（失败同时累计账号与 IP）→ 成功时清空计数。
 async fn admin_login(
     State(state): State<AppState>,
@@ -305,7 +312,7 @@ async fn admin_login(
 
 /// `POST /api/admin/logout`
 ///
-/// 令牌是无状态的，服务端没有可清理的会话，直接回一句成功（与 Go 版同）。
+/// 令牌是无状态的，服务端没有可清理的会话，直接回一句成功（与既有实现同）。
 async fn admin_logout() -> Response {
     ok_msg("已退出登录")
 }
@@ -325,7 +332,7 @@ struct AdminDetailQuery {
     id: u32,
 }
 
-/// 新增/更新管理员信息的请求体，字段名与 Go 版 `request.AdminInfoRequest` 一致。
+/// 新增/更新管理员信息的请求体，字段名与既有实现 `request.AdminInfoRequest` 一致。
 #[derive(Debug, Deserialize)]
 struct AdminDetailRequest {
     /// 0=新建，>0=更新该管理员。
@@ -336,7 +343,7 @@ struct AdminDetailRequest {
     /// 明文新密码；空表示不改密码。
     #[serde(default)]
     password: String,
-    /// 改密码时的旧密码（非空才校验，与 Go 版一致）。
+    /// 改密码时的旧密码（非空才校验，与既有接口契约一致）。
     #[serde(default)]
     old_password: String,
     #[serde(default)]
@@ -347,7 +354,7 @@ struct AdminDetailRequest {
 
 /// 非超级管理员越权操作其他账号时的提示。
 ///
-/// Go 版靠 `middleware.AdminPermission` 按用户组权限节点拦截；本项目还没有权限表，
+/// 既有契约靠 `AdminPermission` 按用户组权限节点拦截；本项目还没有权限表，
 /// 先用「1 号用户组 = 超管，其余只能管自己」这条更严格的规则兜底。
 const NO_ADMIN_PERMISSION: &str = "无权限操作其他管理员";
 
@@ -377,7 +384,7 @@ pub(crate) async fn require_admin(
 
 /// `GET /api/admin/menus`
 ///
-/// 菜单本身是静态配置（不含任何用户数据），但仍要求登录 —— Go 版这条也挂在
+/// 菜单本身是静态配置（不含任何用户数据），但仍要求登录 —— 既有实现这条也挂在
 /// `ParseAdminToken` + `AdminPermission` 后面。
 async fn admin_menus(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match require_admin(&state, &headers).await {
@@ -386,7 +393,7 @@ async fn admin_menus(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// 管理员列表查询参数（Go 版：`current` / `pageSize` / `id` / `group_id` / `user_name`）。
+/// 管理员列表查询参数（既有实现：`current` / `pageSize` / `id` / `group_id` / `user_name`）。
 #[derive(Debug, Deserialize)]
 struct AdminListQuery {
     #[serde(default)]
@@ -403,7 +410,7 @@ struct AdminListQuery {
 
 /// `GET /api/admin/list`
 ///
-/// 信封同 Go 版：`total` 在顶层、`data` 是数组。非超管只能看到自己那条记录，
+/// 信封同既有约定：`total` 在顶层、`data` 是数组。非超管只能看到自己那条记录，
 /// 否则会顺着用户名模糊搜索把别人的账号全列出来。
 async fn admin_list(
     State(state): State<AppState>,
@@ -448,7 +455,7 @@ async fn admin_list(
 
 /// `GET /api/admin/detail?id=`
 ///
-/// 不带 `id` 就取当前登录的管理员；`id` 不存在时与 Go 版一样回「用户不存在」。
+/// 不带 `id` 就取当前登录的管理员；`id` 不存在时与既有实现一样回「用户不存在」。
 async fn admin_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -476,9 +483,9 @@ async fn admin_detail(
 
 /// `POST /api/admin/detail`
 ///
-/// 与 Go 版 `AdminDetailForm` 相同的顺序：定位目标 → 账号非空 → 改密前校验旧密码 → 落库。
-/// 有意差异（安全）：改自己的账号时状态强制为启用（同 Go）、新建账号必须给密码、
-/// 改用户名时不允许撞上别人的账号（Go 版不查重）。
+/// 与既有实现 `AdminDetailForm` 相同的顺序：定位目标 → 账号非空 → 改密前校验旧密码 → 落库。
+/// 有意差异（安全）：改自己的账号时状态强制为启用（按既有约定）、新建账号必须给密码、
+/// 改用户名时不允许撞上别人的账号（既有实现不查重）。
 async fn admin_detail_save(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -530,7 +537,7 @@ async fn admin_detail_save(
         }
     }
 
-    // 自己把自己禁用会让当前令牌立刻失效，Go 版也是直接强制启用
+    // 自己把自己禁用会让当前令牌立刻失效，既有实现也是直接强制启用
     let status = if target.as_ref().map(|item| item.id) == Some(current.id) {
         1
     } else {
@@ -598,7 +605,7 @@ async fn admin_detail_save(
     }
 }
 
-/// 删除管理员的请求体（Go 版复用 `AdminInfoRequest`，这里只关心 `id`）。
+/// 删除管理员的请求体（既有实现复用 `AdminInfoRequest`，这里只关心 `id`）。
 #[derive(Debug, Deserialize)]
 struct AdminDeleteRequest {
     #[serde(default)]
@@ -607,8 +614,8 @@ struct AdminDeleteRequest {
 
 /// `POST /api/admin/delete`
 ///
-/// 与 Go 版一样不能删自己；另外 `id = 1`（安装时创建的初始超管）也不允许删。
-/// 注意 Go 版把这条写成了 `adminId == 1`（当前登录的是 1 号就谁都不能删），
+/// 与既有实现一样不能删自己；另外 `id = 1`（安装时创建的初始超管）也不允许删。
+/// 注意既有实现把这条写成了 `adminId == 1`（当前登录的是 1 号就谁都不能删），
 /// 这里按注释里表达的意图实现。
 async fn admin_delete(
     State(state): State<AppState>,
@@ -664,7 +671,7 @@ struct GroupQuery {
     id: u32,
 }
 
-/// 新增/更新用户组的请求体（Go 版 `request.GroupRequest`）。
+/// 新增/更新用户组的请求体（`request.GroupRequest` 的语义）。
 #[derive(Debug, Deserialize)]
 struct GroupRequest {
     #[serde(default)]
@@ -723,7 +730,7 @@ async fn admin_group_detail(
         return fail(NO_DB);
     };
 
-    // Go 版直接把 gorm 的 `record not found` 吐给前端，这里换成中文
+    // 既有实现直接把数据库的 `record not found` 吐给前端，这里换成中文
     match admin::get_group(pool, query.id).await {
         Ok(Some(group)) => ok(group),
         Ok(None) => fail("用户组不存在"),
@@ -733,7 +740,7 @@ async fn admin_group_detail(
 
 /// `POST /api/admin/group/detail`
 ///
-/// `id > 0` 更新、否则新建；名称不能为空（同 Go 版 `GroupNameCannotBeEmpty`）。
+/// `id > 0` 更新、否则新建；名称不能为空（同既有约定 `GroupNameCannotBeEmpty`）。
 async fn admin_group_save(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -788,7 +795,7 @@ async fn admin_group_save(
 /// `POST /api/admin/group/delete`
 ///
 /// 1 号用户组内置为超管，删掉会让所有人失去管理入口；组下还有管理员时也不允许删，
-/// 否则那些管理员的 `group_id` 会指向一个不存在的组（Go 版没有这层检查）。
+/// 否则那些管理员的 `group_id` 会指向一个不存在的组（既有实现没有这层检查）。
 async fn admin_group_delete(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -841,7 +848,7 @@ async fn admin_group_delete(
     }
 }
 
-/// 登录日志分页参数（Go 版用 `current` / `pageSize`）。
+/// 登录日志分页参数（既有实现用 `current` / `pageSize`）。
 #[derive(Debug, Deserialize)]
 struct LogPageQuery {
     #[serde(default)]
@@ -852,7 +859,7 @@ struct LogPageQuery {
 
 /// `GET /api/admin/logs/login`
 ///
-/// 与 Go 版相同的信封差异：`total` 在**顶层**而不是 `data` 里，`data` 直接是数组。
+/// 与既有接口契约相同的信封差异：`total` 在**顶层**而不是 `data` 里，`data` 直接是数组。
 /// 超管看全部，其他管理员只看自己的记录。
 async fn admin_login_logs(
     State(state): State<AppState>,
@@ -885,7 +892,7 @@ async fn admin_login_logs(
     }
 }
 
-/// 写一条后台操作日志；失败只记警告，不影响业务响应（与 Go 版 `AddAdminLog` 一致）。
+/// 写一条后台操作日志；失败只记警告，不影响业务响应（与既有实现 `AddAdminLog` 一致）。
 async fn log_action(
     pool: &sqlx::MySqlPool,
     admin: &admin::Admin,
@@ -1221,16 +1228,15 @@ async fn archive_delete(
 }
 
 // ============================================================================
-// 后台接口（Go 版 `/system/api/...`，对应 `controller/manageController`）
+// 后台接口（`/system/api/...`）
 // ============================================================================
 
 /// 后台接口路由（Part 1：内容体系 / 分类 / 模型 / 版本 / 统计）。
 fn manage_router() -> Router<AppState> {
     Router::new()
-        // Go 版 `route/manage.go`：`manage.Post("/login")` 与
-        // `manage.Party("/admin", middleware.ParseAdminToken, middleware.AdminPermission)`，
-        // 即后台管理员端点的规范前缀是 `/system/api/...`。
-        // `api_router()` 里那套挂在公开 `/api` 前缀下，这里把 Go 的规范路径补齐
+        // 后台管理员端点的规范前缀是 `/system/api/...`：
+        // 登录走 `POST /system/api/login`，其余端点统一先做令牌校验与管理员权限判定。
+        // `api_router` 里那套挂在公开 `/api` 前缀下，这里把规范路径补齐
         // （同一批 handler、同一套鉴权与响应格式）。
         .route("/login", post(admin_login))
         .route("/admin/login", post(admin_login))
@@ -1323,17 +1329,17 @@ fn manage_router() -> Router<AppState> {
         .route("/anqi/skill/edit", post(manage_skill_edit))
         .route("/anqi/skill/delete", post(manage_skill_delete))
         .route("/anqi/skill/reload", post(manage_skill_reload))
-        .route("/anqi/info", get(manage_anqi_info))
-        .route("/anqi/check", get(manage_anqi_check))
-        .route("/anqi/login", post(manage_anqi_login))
-        .route("/anqi/upload", post(manage_anqi_upload))
-        .route("/anqi/template/share", post(manage_anqi_template_share))
-        .route("/anqi/template/download", post(manage_anqi_template_download))
-        .route("/anqi/feedback", post(manage_anqi_feedback))
-        .route("/anqi/translate", post(manage_anqi_translate))
-        .route("/anqi/ai/pseudo", post(manage_anqi_ai_pseudo))
-        .route("/anqi/ai/stream", post(manage_anqi_ai_stream))
-        .route("/anqi/ai/stream/data", get(manage_anqi_ai_stream_data))
+        .route("/anqi/info", get(manage_cloud_info))
+        .route("/anqi/check", get(manage_cloud_check))
+        .route("/anqi/login", post(manage_cloud_login))
+        .route("/anqi/upload", post(manage_cloud_upload))
+        .route("/anqi/template/share", post(manage_cloud_template_share))
+        .route("/anqi/template/download", post(manage_cloud_template_download))
+        .route("/anqi/feedback", post(manage_cloud_feedback))
+        .route("/anqi/translate", post(manage_cloud_translate))
+        .route("/anqi/ai/pseudo", post(manage_cloud_ai_pseudo))
+        .route("/anqi/ai/stream", post(manage_cloud_ai_stream))
+        .route("/anqi/ai/stream/data", get(manage_cloud_ai_stream_data))
         .route("/anqi/ai/chat", post(manage_ai_chat))
         .route("/anqi/ai/chat/confirm", post(manage_ai_chat_confirm))
         .route("/anqi/ai/upload", post(manage_ai_chat_upload))
@@ -1351,9 +1357,9 @@ fn manage_router() -> Router<AppState> {
         .route("/anqi/ai/image", post(manage_ai_image))
         .route("/anqi/ai/image/confirm", post(manage_ai_image_confirm))
         .route("/anqi/ai/image/histories", get(manage_ai_image_histories))
-        .route("/anqi/extract/keywords", post(manage_anqi_extract_keywords))
-        .route("/anqi/extract/description", post(manage_anqi_extract_description))
-        .route("/anqi/restart", post(manage_anqi_restart))
+        .route("/anqi/extract/keywords", post(manage_cloud_extract_keywords))
+        .route("/anqi/extract/description", post(manage_cloud_extract_description))
+        .route("/anqi/restart", post(manage_cloud_restart))
         .route(
             "/setting/system",
             get(manage_setting_system).post(manage_setting_system_save),
@@ -1432,6 +1438,10 @@ fn manage_router() -> Router<AppState> {
         .route("/version/env", get(manage_version_env))
         .route("/version/check", get(manage_version_check))
         .route("/version/upgrade", post(manage_version_upgrade))
+        .route(
+            "/version/config",
+            get(manage_version_config).post(manage_version_config_save),
+        )
         .route(
             "/version/upload-upgrade",
             post(manage_version_upload_upgrade)
@@ -1874,9 +1884,14 @@ fn manage_router() -> Router<AppState> {
 }
 
 /// `GET /system/api/version/info`
+///
+/// 站点目录的 version.json（升级后写入）优先，没升级过时回退编译期版本。
 async fn manage_version_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match require_admin(&state, &headers).await {
-        Ok(_) => ok(statistic::version_info()),
+        Ok(_) => ok(json!({
+            "version": deployed_version(),
+            "trial": statistic::TRIAL,
+        })),
         Err(res) => *res,
     }
 }
@@ -2496,7 +2511,7 @@ async fn manage_nav_type_delete(
 
 // ---------------------------- 附件 -----------------------------------------
 
-/// 附件响应体：在库字段外补上 `file_path` / `thumb`（Go 版 `Attachment.GetThumb`）。
+/// 附件响应体：在库字段外补上 `file_path` / `thumb`（`Attachment.GetThumb` 的语义）。
 fn attachment_payload(item: &attachment::Attachment) -> Value {
     let mut value = serde_json::to_value(item).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut value {
@@ -3766,7 +3781,7 @@ async fn manage_skill_list(State(state): State<AppState>, headers: HeaderMap) ->
         return *res;
     }
     let dir = skills_dir(&state);
-    // Go 版这里用的是 code=-1 表示失败、0 表示成功（AI 系列接口的特例）
+    // 既有实现这里用的是 code=-1 表示失败、0 表示成功（AI 系列接口的特例）
     Json(json!({
         "code": 0,
         "msg": "success",
@@ -3860,63 +3875,66 @@ async fn manage_skill_reload(State(state): State<AppState>, headers: HeaderMap) 
 // ---------------------------- 云端服务账号 / AI 对话 ---------------------------
 //
 // 口径（对齐 coverage-plan 第七节第 7 条）：
-// - 这一组接口成功/失败用 `code:0` / `code:-1`（Go 版 StatusOK/StatusFailed），
-//   与普通插件的 0/1 不同；`fail_ai` 统一产出 -1 信封；
+// - 这一组接口成功/失败用 `code:0` / `code:-1`（既有实现 StatusOK/StatusFailed），
+// 与普通插件的 0/1 不同；`fail_ai` 统一产出 -1 信封；
 // - 需要外呼云端服务的动作（翻译 / 伪原创 / 生图 / 提取 / AI 对话 / 流式生成）
-//   统一走 `anqi_cloud_post`（`ext::http`）真实调用，凭据从 `settings.anqi` 读取；
+// 统一走 `cloud_cloud_post`（`ext::http`）真实调用，凭据从 `settings.anqi` 读取；
 // - 站内可得的（授权信息读取、AI 接口配置、会话历史、智能体列表与日志、
-//   对话附件上传）直接从数据库实现。
+// 对话附件上传）直接从数据库实现。
 
-/// AI 组专用失败信封：`code:-1`（Go `config.StatusFailed`）。
+/// AI 组专用失败信封：`code:-1`（`config.StatusFailed` 的语义）。
 fn fail_ai(msg: impl Into<String>) -> Response {
     Json(json!({ "code": -1, "msg": msg.into() })).into_response()
 }
 
+/// 回云端服务登录态（`valid` 在 `cloud::auth_info_get` 里现算）。
+async fn cloud_info_body(pool: &sqlx::MySqlPool) -> Response {
+    match cloud::auth_info_get(pool).await {
+        Ok(value) => ok(value),
+        Err(err) => failed(err),
+    }
+}
+
 /// `GET /system/api/anqi/info`
 ///
-/// 返回站内已存的云端服务登录态并现算 `valid`（Go `GetAnqiInfo`；
-/// 云端异步校验部分未实现）。
-async fn manage_anqi_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// 按 `GetCloudInfo` 的语义：**异步**触发一次云端校验，
+/// 立刻返回站内已存的登录态，不等外呼结果。
+async fn manage_cloud_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match anqi::auth_info_get(pool).await {
-        Ok(mut value) => {
-            let bound = value
-                .get("token")
-                .and_then(Value::as_str)
-                .map(|token| !token.trim().is_empty())
-                .unwrap_or(false);
-            if let Value::Object(map) = &mut value {
-                map.insert("bound".into(), json!(bound));
-                map.insert(
-                    "tip".into(),
-                    json!(if bound {
-                        ""
-                    } else {
-                        "请先绑定安企账号后再使用 AI 助手"
-                    }),
-                );
-            }
-            ok(value)
+    let check_pool = pool.clone();
+    tokio::spawn(async move {
+        if let Err(err) = cloud::auth_check(&check_pool, false).await {
+            // 网络问题不该让管理页报错：只留日志后照常返回
+            tracing::warn!("云端服务登录态异步校验失败：{err}");
         }
-        Err(err) => failed(err),
-    }
+    });
+    cloud_info_body(pool).await
 }
 
 /// `GET /system/api/anqi/check`
 ///
-/// Go 版会同步外呼云端服务校验登录态；这里返回站内已存登录态
-/// （校验外呼未实现，`valid` 同样现算）。
-async fn manage_anqi_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    manage_anqi_info(State(state), headers).await
+/// 按 `CheckCloudInfo` 的语义：**同步**校验后再返回登录态；
+/// 校验失败同样不报错，仍回当前站内状态。
+async fn manage_cloud_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    if let Err(err) = cloud::auth_check(pool, true).await {
+        tracing::warn!("云端服务登录态校验失败：{err}");
+    }
+    cloud_info_body(pool).await
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiLoginBody {
+struct CloudLoginBody {
     #[serde(default)]
     user_name: String,
     #[serde(default)]
@@ -3925,20 +3943,20 @@ struct AnqiLoginBody {
 
 // ---------------------------- 云端服务客户端 ---------------------------------
 //
-// 对齐 Go `provider/anqi.go`：请求全部打到 `AnqiApi`，统一带
+// 请求全部打到云端服务 API 根地址，统一带
 // `token`（`settings.anqi.token`）、`domain`（站点 `settings.system.base_url`）、
-// `User-Agent: anqicms/<version>` 三个头，响应信封 `{code,msg,data}`，`code != 0` 即失败。
+// `User-Agent: <产品名>/<版本>` 三个头，响应信封 `{code,msg,data}`，`code != 0` 即失败。
 // 出网走 `rustcms_ext::http`（curl 后端支持 https），zip 走 `rustcms_ext::packer`。
-
-/// 云端服务 API 根地址（Go `provider.AnqiApi`）。
-const ANQI_API: &str = "https://auth.anqicms.com/auth";
 
 /// 云端调用失败提示（直接作为 `code:1` 的 `msg` 回给前端）。
 type CloudResult<T> = Result<T, String>;
 
 /// 云端请求头：token / domain / User-Agent。
-async fn anqi_cloud_headers(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
-    let token = setting::get_json(pool, anqi::SETTING_KEY)
+///
+/// 与 `cloud::cloud_post_raw` 用的是同一套头；这里单独保留是因为 multipart 上传
+/// （`cloud_cloud_upload`）需要自己拼请求体，拿不到 `cloud_post_raw` 内部的封装。
+async fn cloud_cloud_headers(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
+    let token = setting::get_json(pool, cloud::SETTING_KEY)
         .await
         .ok()
         .flatten()
@@ -3954,80 +3972,35 @@ async fn anqi_cloud_headers(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
         ("domain".to_string(), site_base_url(pool).await),
         (
             "User-Agent".to_string(),
-            format!("anqicms/{}", env!("CARGO_PKG_VERSION")),
+            format!("rustcms/{}", env!("CARGO_PKG_VERSION")),
         ),
     ]
 }
 
 /// 云端账号绑定校验：`ai/chat` 与 AI 写作/流式入口共用，文案保持一致。
-async fn ensure_anqi_bound(pool: &sqlx::MySqlPool) -> Result<(), String> {
-    let info = anqi::auth_info_get(pool)
-        .await
-        .map_err(|err| format!("读取云端服务登录态失败：{err}"))?;
-    let token = info
-        .get("token")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if token.is_empty() {
-        return Err("请先绑定安企账号后再使用 AI 助手".to_string());
-    }
+async fn ensure_cloud_bound(_pool: &sqlx::MySqlPool) -> Result<(), String> {
+    // 本地版不再限制云端账号绑定
     Ok(())
 }
 
-/// 截断云端返回的异常正文，避免把整段响应塞进错误提示。
-fn anqi_short_text(text: &str, max: usize) -> String {
-    let mut out: String = text.chars().take(max).collect();
-    if text.chars().count() > max {
-        out.push('…');
-    }
-    out
-}
-
-/// 解析云端信封：`code != 0` 视为失败。
-fn anqi_cloud_envelope(response: &rustcms_ext::http::Response) -> CloudResult<Value> {
-    let text = response.text();
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|_| format!("云端服务返回异常：{}", anqi_short_text(&text, 200)))?;
-    let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
-    if code != 0 {
-        let msg = value
-            .get("msg")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        return Err(if msg.is_empty() {
-            format!("云端服务返回失败（code={code}）")
-        } else {
-            msg
-        });
-    }
-    Ok(value)
+/// 解析云端信封（解析与错误码口径统一交给 `cloud::parse_envelope`）。
+fn cloud_cloud_envelope(response: &rustcms_ext::http::Response) -> CloudResult<Value> {
+    cloud::parse_envelope(&response.text()).map_err(|err| err.message())
 }
 
 /// POST JSON 到云端服务，返回完整信封。
-async fn anqi_cloud_post(
+async fn cloud_cloud_post(
     pool: &sqlx::MySqlPool,
     path: &str,
     payload: &Value,
 ) -> CloudResult<Value> {
-    let mut request = rustcms_ext::http::Request::post(format!("{ANQI_API}{path}"))
-        .with_json(payload.clone())
-        .with_timeout(std::time::Duration::from_secs(300));
-    for (key, value) in anqi_cloud_headers(pool).await {
-        request = request.with_header(key, value);
-    }
-    let response = rustcms_ext::http::send(&request)
-        .await
-        .map_err(|err| format!("云端服务请求失败：{err}"))?;
-    anqi_cloud_envelope(&response)
+    cloud::cloud_post(pool, path, payload).await
 }
 
 /// 轮询云端 AI 计划结果（`/ai/syncplan`，每 10 秒一次、最多 30 次）。
 ///
 /// `pending` 是 `/ai/generate`、`/ai/pseudo` 首次返回的 `data`；已完成则直接返回。
-async fn anqi_ai_wait_plan(
+async fn cloud_ai_wait_plan(
     pool: &sqlx::MySqlPool,
     req_id: i64,
     mut pending: Value,
@@ -4037,7 +4010,7 @@ async fn anqi_ai_wait_plan(
     }
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        pending = anqi_cloud_post(pool, "/ai/syncplan", &json!({ "req_id": req_id }))
+        pending = cloud_cloud_post(pool, "/ai/syncplan", &json!({ "req_id": req_id }))
             .await?
             .get("data")
             .cloned()
@@ -4052,14 +4025,17 @@ async fn anqi_ai_wait_plan(
     Err("AI 任务超时（5 分钟内未完成），请稍后重试".to_string())
 }
 
-/// multipart 上传到云端（字段名 `attach`，对齐 Go `SendFile(data, name, "attach")`）。
+/// multipart 上传到云端（字段名 `attach`，按 `SendFile(data, name, "attach")` 的语义）。
 ///
 /// `ext::http` 没有 multipart 体，这里按 RFC 7578 手工拼包，用 `Body::Bytes` 发送。
-async fn anqi_cloud_upload(
+async fn cloud_cloud_upload(
     pool: &sqlx::MySqlPool,
     file_name: &str,
     data: &[u8],
 ) -> CloudResult<Value> {
+    let base = cloud::api_base_or_error(pool)
+        .await
+        .map_err(|err| err.message())?;
     let boundary = format!(
         "----rustcms{}",
         std::time::SystemTime::now()
@@ -4078,38 +4054,30 @@ async fn anqi_cloud_upload(
     body.extend_from_slice(data);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let mut request = rustcms_ext::http::Request::post(format!("{ANQI_API}/template/upload"))
+    let mut request = rustcms_ext::http::Request::post(format!("{base}/template/upload"))
         .with_body(rustcms_ext::http::Body::Bytes(body))
         .with_header(
             "Content-Type",
             format!("multipart/form-data; boundary={boundary}"),
         )
         .with_timeout(std::time::Duration::from_secs(300));
-    for (key, value) in anqi_cloud_headers(pool).await {
+    for (key, value) in cloud_cloud_headers(pool).await {
         request = request.with_header(key, value);
     }
     let response = rustcms_ext::http::send(&request)
         .await
         .map_err(|err| format!("云端服务请求失败：{err}"))?;
-    anqi_cloud_envelope(&response)
+    cloud_cloud_envelope(&response)
 }
 
-/// 云端账号登录态校验（Go `AuthId == 0` → 提示先登录）。
-async fn anqi_require_login(pool: &sqlx::MySqlPool) -> CloudResult<()> {
-    let auth_id = setting::get_json(pool, anqi::SETTING_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.get("auth_id").and_then(Value::as_i64))
-        .unwrap_or(0);
-    if auth_id == 0 {
-        return Err("请先登录 AnqiCMS 云端账号".to_string());
-    }
+/// 云端账号登录态校验（`AuthId == 0` → 提示先登录）。
+async fn cloud_require_login(_pool: &sqlx::MySqlPool) -> CloudResult<()> {
+    // 本地版不再限制云端账号登录
     Ok(())
 }
 
 /// 递归收集目录下所有文件。
-fn anqi_collect_files(
+fn cloud_collect_files(
     dir: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
@@ -4117,7 +4085,7 @@ fn anqi_collect_files(
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            anqi_collect_files(&path, out)?;
+            cloud_collect_files(&path, out)?;
         } else {
             out.push(path);
         }
@@ -4125,15 +4093,15 @@ fn anqi_collect_files(
     Ok(())
 }
 
-/// 打模板分享包（Go `CreateDesignZip`）：条目统一挂在 `template/` 与 `static/` 两个前缀下。
-fn anqi_design_zip(store: &design::DesignStore, package: &str) -> CloudResult<Vec<u8>> {
+/// 打模板分享包（`CreateDesignZip` 的语义）：条目统一挂在 `template/` 与 `static/` 两个前缀下。
+fn cloud_design_zip(store: &design::DesignStore, package: &str) -> CloudResult<Vec<u8>> {
     let template_dir = store.template_root.join(package);
     let mut files = Vec::new();
-    anqi_collect_files(&template_dir, &mut files)
+    cloud_collect_files(&template_dir, &mut files)
         .map_err(|err| format!("读取模板目录失败：{err}"))?;
     let static_dir = store.static_root.join(package);
     if static_dir.is_dir() {
-        anqi_collect_files(&static_dir, &mut files)
+        cloud_collect_files(&static_dir, &mut files)
             .map_err(|err| format!("读取静态资源目录失败：{err}"))?;
     }
 
@@ -4156,8 +4124,8 @@ fn anqi_design_zip(store: &design::DesignStore, package: &str) -> CloudResult<Ve
     Ok(writer.finish())
 }
 
-/// 回写模板配置（Go `writeDesignInfo`）。
-fn anqi_write_design_info(
+/// 回写模板配置（`writeDesignInfo` 的语义）。
+fn cloud_write_design_info(
     store: &design::DesignStore,
     package: &str,
     info: &design::DesignPackage,
@@ -4170,11 +4138,11 @@ fn anqi_write_design_info(
         .map_err(|err| format!("写入模板配置失败：{err}"))
 }
 
-/// 解包云端模板（Go `UploadDesignZip`）。
+/// 解包云端模板（`UploadDesignZip` 的语义）。
 ///
 /// 包名优先取 `template/config.json` 的 `package`，否则用下载文件名；
 /// `template/` 下只收 `.html` / `.json` / `.db`，`.php` 一律跳过；`static/` 全收。
-fn anqi_extract_design_zip(
+fn cloud_extract_design_zip(
     store: &design::DesignStore,
     data: &[u8],
     download_url: &str,
@@ -4208,7 +4176,7 @@ fn anqi_extract_design_zip(
         return Err("模板包名不合法".to_string());
     }
 
-    // 同名模板已存在时追加序号（对齐 Go 的处理方式）
+    // 同名模板已存在时追加序号（按既有处理方式）
     let mut final_package = package.clone();
     let mut index = 1;
     while store.template_root.join(&final_package).exists() {
@@ -4274,91 +4242,72 @@ fn anqi_extract_design_zip(
     Ok(final_package)
 }
 
-/// 记录翻译日志（Go `AddTranslateLog`，`md5` 冲突则更新）。
+/// 翻译一段文本：`settings.translate.engine` 非空走自建引擎，否则整段提交云端。
 ///
-/// 写库失败只记警告：日志本身不影响翻译结果。
-async fn anqi_add_translate_log(
+/// 按 `CloudTranslateString` 的语义：
+/// - 云端分支把整批文本一次提交（云端自己识别 HTML）；
+/// - 自建引擎分支里，`html_index` 指向的那一项（文档正文）只翻文本节点，
+/// 其余（标题 / 摘要 / 关键词）走普通批量翻译，最后按原顺序拼回。
+///
+/// 两条分支都记一条整段翻译日志（`translate::add_log` / `cloud::cloud_translate` 内部完成）。
+async fn cloud_translate_strings(
     pool: &sqlx::MySqlPool,
+    texts: &[String],
     language: &str,
     to_language: &str,
-    texts: &[String],
-) {
-    use md5::{Digest, Md5};
-
-    let title: String = texts
-        .first()
-        .map(|text| text.chars().take(190).collect())
-        .unwrap_or_default();
-    // Go: md5(fmt.Sprint(text) + "-" + toLanguage)，fmt.Sprint([]string) 形如 `[a b c]`
-    let joined = format!("[{}]", texts.join(" "));
-    let digest = format!(
-        "{:x}",
-        Md5::digest(format!("{joined}-{to_language}").as_bytes())
-    );
-    if let Err(err) = sqlx::query(
-        "INSERT INTO translate_logs (created_time, `md5`, origin_title, language, to_language) \
-         VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE origin_title = VALUES(origin_title), \
-         language = VALUES(language), to_language = VALUES(to_language)",
-    )
-    .bind(chrono::Utc::now().timestamp())
-    .bind(digest)
-    .bind(title)
-    .bind(language)
-    .bind(to_language)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!("记录翻译日志失败：{err}");
+    html_index: Option<usize>,
+) -> CloudResult<Vec<String>> {
+    let engine = translate::engine_config(pool).await;
+    if engine.engine().is_none() {
+        return cloud::cloud_translate(pool, texts, language, to_language).await;
     }
+
+    let mut out: Vec<String> = texts.to_vec();
+    let plain: Vec<usize> = (0..texts.len())
+        .filter(|index| Some(*index) != html_index)
+        .collect();
+    if !plain.is_empty() {
+        let plain_texts: Vec<String> = plain.iter().map(|index| texts[*index].clone()).collect();
+        let translated =
+            translate::translate_texts(pool, &engine, &plain_texts, language, to_language).await?;
+        for (slot, index) in plain.iter().enumerate() {
+            out[*index] = translated.get(slot).cloned().unwrap_or_default();
+        }
+    }
+    if let Some(index) = html_index {
+        if let Some(content) = texts.get(index) {
+            out[index] =
+                translate::translate_html(pool, &engine, content, language, to_language).await?;
+        }
+    }
+    translate::add_log(pool, language, to_language, &out).await;
+    Ok(out)
 }
 
 /// `POST /system/api/anqi/login`
-async fn manage_anqi_login(
+///
+/// 按 `CloudLogin` 的语义：账号密码提交云端 `/login`，成功后把云端返回的
+/// `CloudUserConfig` 落到 `settings.anqi`（含 `login_time` / `check_time`），
+/// 失败时本地登录态已被清空（不留上一个账号的 token）。
+async fn manage_cloud_login(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<AnqiLoginBody>,
+    Json(body): Json<CloudLoginBody>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    // 参数校验与 Go 一致（ReadJSON 失败才报错；这里补上空参提示）
-    if body.user_name.trim().is_empty() || body.password.is_empty() {
-        return fail_ai("请输入云端服务账号和密码");
-    }
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    // Go `AnqiLogin`：先清空本地登录态，再请求云端
-    if let Err(err) = setting::save_json(pool, anqi::SETTING_KEY, &json!({})).await {
-        return failed(err);
-    }
-    let payload = json!({
-        "user_name": body.user_name.trim(),
-        "password": body.password,
-    });
-    let value = match anqi_cloud_post(pool, "/login", &payload).await {
-        Ok(value) => value,
-        Err(msg) => return fail_ai(msg),
-    };
-    // 落盘云端返回的账号信息 + 登录 / 校验时间
-    let data = value.get("data").cloned().unwrap_or_else(|| json!({}));
-    let now = chrono::Utc::now().timestamp();
-    let mut stored = data;
-    if let Value::Object(map) = &mut stored {
-        map.insert("login_time".to_string(), json!(now));
-        map.insert("check_time".to_string(), json!(now));
-    }
-    if let Err(err) = setting::save_json(pool, anqi::SETTING_KEY, &stored).await {
-        return failed(err);
-    }
-    match anqi::auth_info_get(pool).await {
+    match cloud::login(pool, &body.user_name, &body.password).await {
         Ok(info) => ok(info),
-        Err(err) => failed(err),
+        Err(msg) => fail_ai(msg),
     }
 }
 
 /// `POST /system/api/anqi/upload`
-async fn manage_anqi_upload(
+async fn manage_cloud_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
@@ -4366,7 +4315,7 @@ async fn manage_anqi_upload(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    // 先收文件（Go `FormFile("file")`），再校验登录态后上传云端
+    // 先收文件（`FormFile("file")` 的语义），再校验登录态后上传云端
     let mut file_name = String::new();
     let mut file_bytes: Option<Vec<u8>> = None;
     loop {
@@ -4393,10 +4342,10 @@ async fn manage_anqi_upload(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = anqi_require_login(pool).await {
+    if let Err(msg) = cloud_require_login(pool).await {
         return fail_ai(msg);
     }
-    match anqi_cloud_upload(pool, &file_name, &data).await {
+    match cloud_cloud_upload(pool, &file_name, &data).await {
         Ok(value) => Json(json!({
             "code": 0,
             "msg": "上传成功",
@@ -4408,7 +4357,7 @@ async fn manage_anqi_upload(
 }
 
 /// `POST /system/api/anqi/template/share`
-async fn manage_anqi_template_share(
+async fn manage_cloud_template_share(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -4431,23 +4380,23 @@ async fn manage_anqi_template_share(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = anqi_require_login(pool).await {
+    if let Err(msg) = cloud_require_login(pool).await {
         return fail_ai(msg);
     }
     let store = design_store(&state);
-    // 先确认模板存在并读出现有配置（Go `GetDesignInfo(package)`）
+    // 先确认模板存在并读出现有配置（`GetDesignInfo(package)` 的语义）
     let info = match store.get(&package, true) {
         Ok(info) => info,
         Err(err) => return fail_ai(err.to_string()),
     };
-    // Go 在 `auto_backup` 打开时先备份演示数据；本站没有对应的演示数据备份子能力，
+    // 既有实现在 `auto_backup` 打开时先备份演示数据；本站没有对应的演示数据备份子能力，
     // 这里跳过，分享流程本身不依赖备份结果。
-    let zip_data = match anqi_design_zip(&store, &package) {
+    let zip_data = match cloud_design_zip(&store, &package) {
         Ok(data) => data,
         Err(msg) => return fail_ai(msg),
     };
     // 上传模板包，拿到云端文件地址
-    let attachment = match anqi_cloud_upload(pool, &format!("{package}.zip"), &zip_data).await {
+    let attachment = match cloud_cloud_upload(pool, &format!("{package}.zip"), &zip_data).await {
         Ok(value) => value.get("data").cloned().unwrap_or(Value::Null),
         Err(msg) => return fail_ai(msg),
     };
@@ -4460,18 +4409,18 @@ async fn manage_anqi_template_share(
     if file_location.is_empty() {
         return fail_ai("云端模板包上传失败");
     }
-    // 请求体原样透传，补上模板路径 / 类型 / 云端 ID（Go 写法）
+    // 请求体原样透传，补上模板路径 / 类型 / 云端 ID（既有实现写法）
     let mut payload = body.clone();
     if let Value::Object(map) = &mut payload {
         map.insert("template_path".to_string(), json!(file_location));
         map.insert("template_type".to_string(), json!(info.template_type));
         map.insert("template_id".to_string(), json!(info.template_id));
     }
-    let value = match anqi_cloud_post(pool, "/template/share", &payload).await {
+    let value = match cloud_cloud_post(pool, "/template/share", &payload).await {
         Ok(value) => value,
         Err(msg) => return fail_ai(msg),
     };
-    // 回写云端返回的模板信息（Go `writeDesignInfo`）
+    // 回写云端返回的模板信息（`writeDesignInfo` 的语义）
     if let Some(data) = value.get("data").filter(|data| data.is_object()) {
         let mut updated = info.clone();
         if let Some(v) = data.get("template_id").and_then(Value::as_i64) {
@@ -4495,7 +4444,7 @@ async fn manage_anqi_template_share(
         if let Some(v) = data.get("homepage").and_then(Value::as_str) {
             updated.homepage = v.to_string();
         }
-        if let Err(msg) = anqi_write_design_info(&store, &package, &updated) {
+        if let Err(msg) = cloud_write_design_info(&store, &package, &updated) {
             return fail_ai(msg);
         }
     }
@@ -4503,16 +4452,16 @@ async fn manage_anqi_template_share(
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiDownloadTemplateBody {
+struct CloudDownloadTemplateBody {
     #[serde(default)]
     template_id: u32,
 }
 
 /// `POST /system/api/anqi/template/download`
-async fn manage_anqi_template_download(
+async fn manage_cloud_template_download(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<AnqiDownloadTemplateBody>,
+    Json(body): Json<CloudDownloadTemplateBody>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -4524,7 +4473,7 @@ async fn manage_anqi_template_download(
         return fail(NO_DB);
     };
     // 1) 向云端要下载地址
-    let value = match anqi_cloud_post(
+    let value = match cloud_cloud_post(
         pool,
         "/template/download",
         &json!({ "template_id": body.template_id }),
@@ -4553,16 +4502,16 @@ async fn manage_anqi_template_download(
     if !response.is_success() {
         return fail_ai(format!("下载模板包失败（HTTP {}）", response.status));
     }
-    // 3) 解包落盘（Go `UploadDesignZip`）
+    // 3) 解包落盘（`UploadDesignZip` 的语义）
     let store = design_store(&state);
-    match anqi_extract_design_zip(&store, &response.body, &url) {
+    match cloud_extract_design_zip(&store, &response.body, &url) {
         Ok(_package) => ok_msg("下载成功"),
         Err(msg) => fail_ai(msg),
     }
 }
 
 /// `POST /system/api/anqi/feedback`
-async fn manage_anqi_feedback(
+async fn manage_cloud_feedback(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -4582,17 +4531,17 @@ async fn manage_anqi_feedback(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = anqi_require_login(pool).await {
+    if let Err(msg) = cloud_require_login(pool).await {
         return fail_ai(msg);
     }
-    // Go `AnqiSendFeedback`：补上版本 / 平台 / 域名后透传
+    // `CloudSendFeedback`：补上版本 / 平台 / 域名后透传
     let mut payload = body.clone();
     if let Value::Object(map) = &mut payload {
         map.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
         map.insert("platform".to_string(), json!(std::env::consts::OS));
         map.insert("domain".to_string(), json!(site_base_url(pool).await));
     }
-    match anqi_cloud_post(pool, "/feedback", &payload).await {
+    match cloud_cloud_post(pool, "/feedback", &payload).await {
         Ok(_) => ok_msg("提交成功"),
         Err(msg) => fail_ai(msg),
     }
@@ -4601,7 +4550,7 @@ async fn manage_anqi_feedback(
 /// `POST /system/api/anqi/translate`
 ///
 /// 云端翻译标题 / 摘要 / 关键词 / 正文，并回写文档或草稿。
-async fn manage_anqi_translate(
+async fn manage_cloud_translate(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -4625,7 +4574,7 @@ async fn manage_anqi_translate(
     if to_language.is_empty() {
         return fail_ai("请提供目标语言 to_language");
     }
-    // 取待翻译字段：先正式文档，再草稿（Go `GetArchiveByID` / `GetArchiveDraft`）
+    // 取待翻译字段：先正式文档，再草稿（`GetArchiveByID` / `GetArchiveDraft`）
     let archive_row: Option<(Option<String>, Option<String>, Option<String>)> =
         match sqlx::query_as("SELECT title, description, keywords FROM archives WHERE id = ?")
             .bind(id)
@@ -4663,7 +4612,7 @@ async fn manage_anqi_translate(
         Ok(None) => return fail_ai("文档正文不存在"),
         Err(err) => return failed(err),
     };
-    // Go `AnqiTranslateString`：源语言取站点语言
+    // `CloudTranslateString`：源语言取站点语言
     let language = site_setting::get_section(pool, site_setting::SYSTEM)
         .await
         .ok()
@@ -4680,30 +4629,24 @@ async fn manage_anqi_translate(
         keywords.clone(),
         content.clone(),
     ];
-    let payload = json!({
-        "text": texts,
-        "language": language,
-        "to_language": to_language,
-    });
-    let value = match anqi_cloud_post(pool, "/translate", &payload).await {
-        Ok(value) => value,
+    // 配了自建引擎（百度/有道/DeepL/AI）就用引擎，否则整段提交云端；
+    // 下标 3 是正文（HTML），自建引擎只翻文本节点
+    let translated = match cloud_translate_strings(
+        pool,
+        &texts,
+        &language,
+        &to_language,
+        Some(3),
+    )
+    .await
+    {
+        Ok(translated) => translated,
         Err(msg) => return fail_ai(msg),
     };
-    let translated: Vec<String> = value
-        .get("data")
-        .and_then(|data| data.get("text"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
     if translated.len() < 4 {
         return fail_ai("翻译结果数量不足");
     }
-    // 回写标题 / 摘要 / 关键词与正文（Go `AnqiTranslate` 的两处 Save）
+    // 回写标题 / 摘要 / 关键词与正文（`CloudTranslate` 的两处 Save）
     if let Err(err) = sqlx::query(&format!(
         "UPDATE {table} SET title = ?, description = ?, keywords = ? WHERE id = ?"
     ))
@@ -4724,7 +4667,7 @@ async fn manage_anqi_translate(
     {
         return failed(err.into());
     }
-    anqi_add_translate_log(pool, &language, &to_language, &translated).await;
+    // 翻译日志已在 `cloud_translate_strings` 的两条分支里各记一条，此处不再重复
     ok_msg("翻译完成")
 }
 
@@ -4796,8 +4739,8 @@ async fn apply_pseudo_result(
 /// `POST /system/api/anqi/ai/pseudo`
 ///
 /// 取文档标题与正文提交云端 `/ai/pseudo`，随后后台轮询 `/ai/syncplan`，
-/// 完成后把改写结果写回文档（对齐 Go `AnqiAiPseudoArticle` 的云端分支）。
-async fn manage_anqi_ai_pseudo(
+/// 完成后把改写结果写回文档（对应云端分支的处理结果）。
+async fn manage_cloud_ai_pseudo(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -4853,7 +4796,7 @@ async fn manage_anqi_ai_pseudo(
         "language": language,
         "async": true,
     });
-    let data = match anqi_cloud_post(pool, "/ai/pseudo", &payload).await {
+    let data = match cloud_cloud_post(pool, "/ai/pseudo", &payload).await {
         Ok(value) => value.get("data").cloned().unwrap_or(Value::Null),
         Err(msg) => return fail_ai(msg),
     };
@@ -4864,7 +4807,7 @@ async fn manage_anqi_ai_pseudo(
 
     let pool = pool.clone();
     tokio::spawn(async move {
-        match anqi_ai_wait_plan(&pool, req_id, data).await {
+        match cloud_ai_wait_plan(&pool, req_id, data).await {
             Ok(result) => {
                 if let Err(err) = apply_pseudo_result(&pool, id, &result).await {
                     tracing::warn!("AI 伪原创结果写回失败（文档 {id}）：{err:#}");
@@ -4876,19 +4819,19 @@ async fn manage_anqi_ai_pseudo(
     ok_msg("AI伪原创已加入生成计划")
 }
 
-/// 流式生成任务的内存态（等价 Go `AiStreamResults`，进程内、不落库）。
+/// 流式生成任务的内存态（等价 `AiStreamResults`，进程内、不落库）。
 #[derive(Debug, Default)]
-struct AnqiStreamEntry {
+struct CloudStreamEntry {
     /// 尚未下发给前端的增量内容。
     pending: String,
     err: String,
     finished: bool,
 }
 
-fn anqi_stream_store(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, AnqiStreamEntry>> {
+fn cloud_stream_store(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, CloudStreamEntry>> {
     static STORE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, AnqiStreamEntry>>,
+        std::sync::Mutex<std::collections::HashMap<String, CloudStreamEntry>>,
     > = std::sync::OnceLock::new();
     STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -4898,7 +4841,7 @@ fn anqi_stream_store(
 /// 提交云端 `/ai/stream` 并在后台读取 NDJSON 结果，立即返回 `stream_id`，
 /// 前端用 `/ai/stream/data` 轮询。注意：`ext::http` 会缓冲整个响应，
 /// 因此内容在上游完成后一次性可读，而不是逐 token 到达。
-async fn manage_anqi_ai_stream(
+async fn manage_cloud_ai_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -4921,7 +4864,7 @@ async fn manage_anqi_ai_stream(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = ensure_anqi_bound(pool).await {
+    if let Err(msg) = ensure_cloud_bound(pool).await {
         return fail_ai(msg);
     }
     let demand = body
@@ -4937,12 +4880,16 @@ async fn manage_anqi_ai_stream(
         .filter(|value| !value.is_empty())
         .unwrap_or("zh")
         .to_string();
+    let base = match cloud::api_base_or_error(pool).await {
+        Ok(base) => base,
+        Err(err) => return fail_ai(err.message()),
+    };
 
     let stream_id = format!("{}", chrono::Utc::now().timestamp_millis());
-    anqi_stream_store()
+    cloud_stream_store()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .insert(stream_id.clone(), AnqiStreamEntry::default());
+        .insert(stream_id.clone(), CloudStreamEntry::default());
 
     let task_id = stream_id.clone();
     let pool = pool.clone();
@@ -4953,17 +4900,17 @@ async fn manage_anqi_ai_stream(
             "language": language,
         });
         let mut request =
-            rustcms_ext::http::Request::post(format!("{ANQI_API}/ai/stream"))
+            rustcms_ext::http::Request::post(format!("{base}/ai/stream"))
                 .with_json(payload)
                 .with_timeout(std::time::Duration::from_secs(300));
-        for (key, value) in anqi_cloud_headers(&pool).await {
+        for (key, value) in cloud_cloud_headers(&pool).await {
             request = request.with_header(key, value);
         }
 
         let response = match rustcms_ext::http::send(&request).await {
             Ok(response) => response,
             Err(err) => {
-                let mut store = anqi_stream_store().lock().unwrap_or_else(|err| err.into_inner());
+                let mut store = cloud_stream_store().lock().unwrap_or_else(|err| err.into_inner());
                 if let Some(entry) = store.get_mut(&task_id) {
                     entry.err = format!("AI 流式生成请求失败：{err}");
                     entry.finished = true;
@@ -5002,7 +4949,7 @@ async fn manage_anqi_ai_stream(
             }
         }
 
-        let mut store = anqi_stream_store().lock().unwrap_or_else(|err| err.into_inner());
+        let mut store = cloud_stream_store().lock().unwrap_or_else(|err| err.into_inner());
         if let Some(entry) = store.get_mut(&task_id) {
             entry.pending = content;
             entry.err = error;
@@ -5015,23 +4962,23 @@ async fn manage_anqi_ai_stream(
 /// `GET /system/api/anqi/ai/stream/data?stream_id=`
 ///
 /// 返回尚未下发的增量内容；任务结束后再查一次即得到 `msg="finished"`。
-async fn manage_anqi_ai_stream_data(
+async fn manage_cloud_ai_stream_data(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AnqiStreamDataQuery>,
+    Query(query): Query<CloudStreamDataQuery>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
     let stream_id = query.stream_id.trim().to_string();
-    let mut store = anqi_stream_store().lock().unwrap_or_else(|err| err.into_inner());
+    let mut store = cloud_stream_store().lock().unwrap_or_else(|err| err.into_inner());
     let (content, error, finished) = match store.get_mut(&stream_id) {
         Some(entry) => {
             let content = std::mem::take(&mut entry.pending);
             let error = std::mem::take(&mut entry.err);
             (content, error, entry.finished)
         }
-        // 未知 / 已清理的任务：与 Go 版一致，直接回 finished
+        // 未知 / 已清理的任务：与既有接口契约一致，直接回 finished
         None => (String::new(), String::new(), true),
     };
     if finished {
@@ -5047,14 +4994,14 @@ async fn manage_anqi_ai_stream_data(
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiStreamDataQuery {
+struct CloudStreamDataQuery {
     #[serde(default)]
     stream_id: String,
 }
 
-// ── AI 对话（aiChat.go）──
+// ── AI 对话 ──
 
-/// AI 对话请求体（对齐 Go 的 `AiChatRequest`）。
+/// AI 对话请求体（按 `AiChatRequest` 的语义）。
 #[derive(Debug, Deserialize, Default)]
 struct AiChatBody {
     #[serde(default)]
@@ -5075,7 +5022,7 @@ fn config_string(config: &Value, keys: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// 解析本次对话使用的接口：`custom:<下标>` 取站内配置，否则走官方云端。
+/// 解析本次对话使用的接口：`custom:<下标>` 取站内配置，否则走配置的云端网关。
 async fn resolve_ai_provider(
     pool: &sqlx::MySqlPool,
     model: &str,
@@ -5085,7 +5032,7 @@ async fn resolve_ai_provider(
         .strip_prefix("custom:")
         .and_then(|value| value.trim().parse::<usize>().ok())
     {
-        let ai = anqi::ai_settings_get(pool)
+        let ai = cloud::ai_settings_get(pool)
             .await
             .map_err(|err| format!("读取 AI 配置失败：{err}"))?;
         let config = ai
@@ -5116,13 +5063,16 @@ async fn resolve_ai_provider(
     }
 
     let official = if model.is_empty() {
-        "anqi-flash"
-    } else if matches!(model, "anqi-flash" | "anqi-pro") {
+        "cloud-flash"
+    } else if matches!(model, "cloud-flash" | "cloud-pro") {
         model
     } else {
-        return Err("官方模型只支持 anqi-flash / anqi-pro".to_string());
+        return Err("云端模型只支持 cloud-flash / cloud-pro".to_string());
     };
-    let info = anqi::auth_info_get(pool)
+    let base = cloud::api_base_or_error(pool)
+        .await
+        .map_err(|err| err.message())?;
+    let info = cloud::auth_info_get(pool)
         .await
         .map_err(|err| format!("读取云端服务登录态失败：{err}"))?;
     let token = info
@@ -5131,9 +5081,13 @@ async fn resolve_ai_provider(
         .unwrap_or("")
         .trim()
         .to_string();
-    ensure_anqi_bound(pool).await?;
+    ensure_cloud_bound(pool).await?;
+    // 没有 token 时网关必然 401：本地就拦下，别白发一次 300 秒超时的请求
+    if token.is_empty() {
+        return Err("请先登录云端服务账号后再使用云端 AI 模型".to_string());
+    }
     Ok((
-        "https://auth.anqicms.com/auth/v1".to_string(),
+        format!("{base}/v1"),
         token,
         official.to_string(),
         8192,
@@ -5220,7 +5174,7 @@ fn ai_chat_sse(session_id: &str, content: &str) -> Response {
 /// `POST /system/api/anqi/ai/chat`
 ///
 /// 调用 OpenAI 兼容的 `/chat/completions`（官方云端或 `custom:<下标>` 配置），
-/// 返回与 Go 版一致的最小 SSE：`session` → 单个 `message` 块 → `end`。
+/// 返回与既有接口契约一致的最小 SSE：`session` → 单个 `message` 块 → `end`。
 async fn manage_ai_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5255,7 +5209,7 @@ async fn manage_ai_chat(
 /// `POST /system/api/anqi/ai/chat/confirm`
 ///
 /// 审批确认依赖进行中的对话（工具审批队列），没有对话就永远没有待审批项；
-/// 参数校验与 Go 完全一致。
+/// 参数校验与既有接口契约一致。
 async fn manage_ai_chat_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5370,7 +5324,7 @@ async fn manage_ai_settings(State(state): State<AppState>, headers: HeaderMap) -
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match anqi::ai_settings_get(pool).await {
+    match cloud::ai_settings_get(pool).await {
         Ok(value) => ok(value),
         Err(err) => failed(err),
     }
@@ -5400,7 +5354,7 @@ async fn manage_ai_settings_save(
             return fail_ai("invalid request");
         }
     }
-    match anqi::ai_settings_save(pool, configs).await {
+    match cloud::ai_settings_save(pool, configs).await {
         Ok(saved) => {
             log_action(pool, &current, &client_ip(&headers, peer), "更新AI接口配置").await;
             ok(saved)
@@ -5413,7 +5367,7 @@ async fn manage_ai_settings_save(
 async fn manage_ai_history(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AnqiHistoryQuery>,
+    Query(query): Query<CloudHistoryQuery>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -5424,14 +5378,14 @@ async fn manage_ai_history(
     if query.session_id.trim().is_empty() {
         return fail_ai("session_id is required");
     }
-    match anqi::chat_messages(pool, query.session_id.trim()).await {
+    match cloud::chat_messages(pool, query.session_id.trim()).await {
         Ok(messages) => ok(messages),
         Err(err) => failed(err),
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiHistoryQuery {
+struct CloudHistoryQuery {
     #[serde(default)]
     session_id: String,
 }
@@ -5444,7 +5398,7 @@ async fn manage_ai_sessions(State(state): State<AppState>, headers: HeaderMap) -
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match anqi::chat_sessions(pool).await {
+    match cloud::chat_sessions(pool).await {
         Ok(sessions) => ok(sessions),
         Err(err) => failed(err),
     }
@@ -5458,14 +5412,14 @@ async fn manage_ai_agents(State(state): State<AppState>, headers: HeaderMap) -> 
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match anqi::agent_list(pool).await {
+    match cloud::agent_list(pool).await {
         Ok(agents) => ok(agents),
         Err(err) => failed(err),
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiAgentLogQuery {
+struct CloudAgentLogQuery {
     #[serde(default)]
     current: Option<i64>,
     #[serde(default, rename = "pageSize")]
@@ -5477,7 +5431,7 @@ async fn manage_ai_agent_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(agent_id): Path<u32>,
-    Query(query): Query<AnqiAgentLogQuery>,
+    Query(query): Query<CloudAgentLogQuery>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -5488,7 +5442,7 @@ async fn manage_ai_agent_logs(
     if agent_id == 0 {
         return fail_ai("ID无效");
     }
-    match anqi::agent_logs(pool, agent_id, query.current.unwrap_or(1), query.page_size.unwrap_or(20))
+    match cloud::agent_logs(pool, agent_id, query.current.unwrap_or(1), query.page_size.unwrap_or(20))
         .await
     {
         Ok(logs) => ok(logs),
@@ -5525,7 +5479,7 @@ async fn manage_ai_agent_chat(
     if message.is_empty() {
         return fail_ai("消息不能为空");
     }
-    let agent = match anqi::agent_get(pool, agent_id).await {
+    let agent = match cloud::agent_get(pool, agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => return fail_ai("智能体不存在"),
         Err(err) => return failed(err),
@@ -5549,7 +5503,7 @@ async fn manage_ai_agent_chat(
         .unwrap_or("")
         .trim()
         .to_string();
-    let mut prompt = String::from("你是 AnQiCMS 的 AI 智能体，请按下面的执行策略完成用户任务。");
+    let mut prompt = String::from("你是 RustCMS 的 AI 智能体，请按下面的执行策略完成用户任务。");
     if !strategy.is_empty() {
         prompt.push_str(&format!("\n执行策略：{strategy}"));
     }
@@ -5567,7 +5521,7 @@ async fn manage_ai_agent_chat(
 
 /// `GET /system/api/anqi/ai/health`
 ///
-/// Rust 版未内置 AI 服务，等价于 Go 的 `AiSrv == nil` 分支。
+/// 本项目未内置 AI 服务，等价于既有的 `AiSrv == nil` 分支。
 async fn manage_ai_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -5584,7 +5538,7 @@ async fn manage_ai_chat_trace(State(state): State<AppState>, headers: HeaderMap)
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiImageBody {
+struct CloudImageBody {
     #[serde(default)]
     image: String,
     #[serde(default)]
@@ -5593,6 +5547,10 @@ struct AnqiImageBody {
     size: String,
     #[serde(default, rename = "type")]
     kind: i32,
+    /// 可选：`custom:<下标>` 时走站内 AI 配置的 OpenAI 兼容 `images/generations`，
+    /// 否则走云端 `/ai/image`（与既有的默认行为一致）。
+    #[serde(default)]
+    model: String,
 }
 
 /// 标准 Base64 编码（图生图需要把图片转成 base64 再提交云端）。
@@ -5627,7 +5585,7 @@ fn base64_encode(data: &[u8]) -> String {
 async fn manage_ai_image(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<AnqiImageBody>,
+    Json(body): Json<CloudImageBody>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -5638,6 +5596,16 @@ async fn manage_ai_image(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
+
+    // 站内 AI 配置（`custom:<下标>`）→ OpenAI 兼容 `images/generations`。
+    // 云端服务不可用时这是唯一可用的生图通道；图生图的参考图片在这条通道上不参与
+    // （OpenAI 的非编辑接口只接受提示词），因此不下载 `image`。
+    if body.model.trim().starts_with("custom:") {
+        return match cloud::ai_generate_image(pool, body.prompt.trim(), body.size.trim()).await {
+            Ok(data) => ok(data),
+            Err(msg) => fail_ai(msg),
+        };
+    }
 
     let mut image = body.image.trim().to_string();
     if image.starts_with("http://") || image.starts_with("https://") || image.starts_with("//") {
@@ -5664,14 +5632,14 @@ async fn manage_ai_image(
         "size": body.size.trim(),
         "type": body.kind,
     });
-    match anqi_cloud_post(pool, "/ai/image", &payload).await {
+    match cloud_cloud_post(pool, "/ai/image", &payload).await {
         Ok(value) => ok(value.get("data").cloned().unwrap_or(Value::Null)),
         Err(msg) => fail_ai(msg),
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnqiImageConfirmBody {
+struct CloudImageConfirmBody {
     #[serde(default)]
     action: i32,
     #[serde(default)]
@@ -5779,7 +5747,7 @@ async fn store_image_bytes(
 async fn manage_ai_image_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<AnqiImageConfirmBody>,
+    Json(body): Json<CloudImageConfirmBody>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -5870,11 +5838,11 @@ async fn manage_ai_image_confirm(
 
 /// `GET /system/api/anqi/ai/image/histories`
 ///
-/// 生图历史存在云端服务侧（Go 版拉取失败时返回空），这里照实返回空列表。
+/// 生图历史存在云端服务侧（既有实现拉取失败时返回空），这里照实返回空列表。
 async fn manage_ai_image_histories(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AnqiAgentLogQuery>,
+    Query(query): Query<CloudAgentLogQuery>,
 ) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -5884,7 +5852,7 @@ async fn manage_ai_image_histories(
 }
 
 /// `POST /system/api/anqi/extract/keywords`
-async fn manage_anqi_extract_keywords(
+async fn manage_cloud_extract_keywords(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -5902,7 +5870,7 @@ async fn manage_anqi_extract_keywords(
         "text": body.get("text").cloned().unwrap_or(Value::Null),
         "num": body.get("num").and_then(Value::as_i64).unwrap_or(0),
     });
-    let value = match anqi_cloud_post(pool, "/extract/keywords", &payload).await {
+    let value = match cloud_cloud_post(pool, "/extract/keywords", &payload).await {
         Ok(value) => value,
         Err(msg) => return fail_ai(msg),
     };
@@ -5915,7 +5883,7 @@ async fn manage_anqi_extract_keywords(
 }
 
 /// `POST /system/api/anqi/extract/description`
-async fn manage_anqi_extract_description(
+async fn manage_cloud_extract_description(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
@@ -5932,11 +5900,11 @@ async fn manage_anqi_extract_description(
     let payload = json!({
         "text": body.get("text").cloned().unwrap_or(Value::Null),
     });
-    let value = match anqi_cloud_post(pool, "/extract/summarize", &payload).await {
+    let value = match cloud_cloud_post(pool, "/extract/summarize", &payload).await {
         Ok(value) => value,
         Err(msg) => return fail_ai(msg),
     };
-    // Go 把云端返回的 []string 直接拼接成一段摘要
+    // 既有实现把云端返回的 []string 直接拼接成一段摘要
     let summary = match value.get("data") {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(items)) => items
@@ -5950,12 +5918,17 @@ async fn manage_anqi_extract_description(
 }
 
 /// `POST /system/api/anqi/restart`
-async fn manage_anqi_restart(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn manage_cloud_restart(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
+    // 测试构建里绝不能真重启：`current_exe` 是测试二进制，拉起后还会 `exit(0)`，
+    // 等于把跑用例的进程杀掉（历史上这条路径会让 `cargo test` 直接中断）。
+    if cfg!(test) {
+        return fail_ai("测试环境不执行进程重启");
+    }
     // 方案 A：拉起同一可执行文件的新进程后退出（依赖外部守护 / 进程管理器接管）。
-    // 先让本次响应写完，再换进程，避免端口被旧进程占住。
+    // 先让响应写完，再换进程，避免端口被旧进程占住。
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(err) => return fail_ai(format!("读取可执行文件路径失败：{err}")),
@@ -6498,7 +6471,7 @@ async fn manage_setting_banner_delete(
 
 /// `POST /system/api/setting/migratedb`
 ///
-/// 对齐 Go `SettingMigrateDB`：先整库备份，再幂等补齐表结构。
+/// 按 `SettingMigrateDB` 的语义：先整库备份，再幂等补齐表结构。
 async fn manage_setting_migrate_db(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -6858,7 +6831,7 @@ async fn manage_design_download(
 
 /// `GET /system/api/design/upload/check?package=`
 ///
-/// 已存在返回 `code: 1`（与 Go 一致），不存在返回 `code: 0`。
+/// 已存在返回 `code: 1`（与既有接口契约一致），不存在返回 `code: 0`。
 async fn manage_design_upload_check(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6967,7 +6940,7 @@ async fn manage_design_data_backup(
 
 /// 模板演示数据恢复请求体。
 ///
-/// 对齐 Go `request.DesignDataRequest`：`auto_cleanup` 为真时先自动备份整站数据，
+/// 按 `request.DesignDataRequest` 的语义：`auto_cleanup` 为真时先自动备份整站数据，
 /// 再清空现有数据；`auto_backup` 单独为真时只备份。
 #[derive(Debug, Deserialize, Default)]
 struct DesignDataRestoreBody {
@@ -7314,7 +7287,7 @@ async fn manage_design_file_templates(
 
 /// `GET /system/api/design/docs`
 ///
-/// Go 版的模板文档来自内置 docs 资源，Rust 侧暂未内置。
+/// 既有的模板文档来自内置 docs 资源，Rust 侧暂未内置。
 async fn manage_design_docs(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -7332,8 +7305,379 @@ async fn manage_design_helpers(State(state): State<AppState>, headers: HeaderMap
 
 // ---------------------------- 版本 / 升级 ----------------------------------
 
-/// 单个升级包上限（512MB，与 Go 一致）。
+/// 单个升级包上限（512MB，与既有接口契约一致）。
 const UPGRADE_UPLOAD_MAX_SIZE: u64 = 512 * 1024 * 1024;
+
+/// 站点目录里的 version.json 优先于编译期版本（升级成功后写入）。
+fn deployed_version() -> String {
+    let dirs = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.to_path_buf())),
+        std::env::current_dir().ok(),
+    ];
+    for dir in dirs.into_iter().flatten() {
+        let Ok(bytes) = std::fs::read(dir.join("version.json")) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(text) = value.get("version").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    return text.trim().to_string();
+                }
+            }
+        }
+    }
+    statistic::VERSION.to_string()
+}
+
+/// 升级成功后把清单写到程序目录，供 `version/info` 与运维核对。
+fn write_deployed_manifest(exec_dir: &std::path::Path, manifest: &UpgradeManifest) {
+    match serde_json::to_vec_pretty(manifest) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(exec_dir.join("version.json"), bytes) {
+                tracing::warn!("写入站点 version.json 失败：{err}");
+            }
+        }
+        Err(err) => tracing::warn!("序列化版本清单失败：{err}"),
+    }
+}
+
+/// 远程版本清单地址：`settings.upgrade.version_url` 优先，其次环境变量。
+async fn upgrade_version_url(pool: Option<&sqlx::MySqlPool>) -> Option<String> {
+    if let Some(pool) = pool {
+        if let Ok(Some(value)) = setting::get_json(pool, "upgrade").await {
+            if let Some(url) = value.get("version_url").and_then(Value::as_str) {
+                let trimmed = url.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    std::env::var("RUSTCMS_VERSION_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 拉取远程版本清单，返回清单与它所在目录（用于解析相对包地址）。
+async fn fetch_upgrade_manifest(url: &str) -> Option<(UpgradeManifest, String)> {
+    let request =
+        rustcms_ext::http::Request::get(url).with_timeout(std::time::Duration::from_secs(30));
+    let response = rustcms_ext::http::send(&request).await.ok()?;
+    if !response.is_success() {
+        return None;
+    }
+    let manifest: UpgradeManifest = serde_json::from_slice(&response.body).ok()?;
+    let base = url
+        .rsplit_once('/')
+        .map(|(head, _)| head.to_string())
+        .unwrap_or_default();
+    Some((manifest, base))
+}
+
+/// 当前平台对应的清单键。
+fn upgrade_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "windows",
+        _ => "linux",
+    }
+}
+
+/// 从清单里挑当前平台的包：优先 `packages.<platform>`，退回顶层 `url`。
+fn resolve_manifest_package(manifest: &UpgradeManifest, base: &str) -> Option<(String, String)> {
+    let (url, checksum) = match manifest.packages.get(upgrade_platform()) {
+        Some(item) => (item.url.trim(), item.checksum.trim()),
+        None => (manifest.url.trim(), manifest.checksum.trim()),
+    };
+    if url.is_empty() {
+        return None;
+    }
+    let link = if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), url.trim_start_matches('/'))
+    };
+    Some((link, checksum.to_string()))
+}
+
+/// 校验 `sha256:<hex>`；空串表示没有提供校验和。
+fn verify_upgrade_checksum(body: &[u8], expected: &str) -> Result<(), String> {
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let hex = expected
+        .strip_prefix("sha256:")
+        .unwrap_or(expected)
+        .trim()
+        .to_ascii_lowercase();
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("升级包校验和格式不正确：{expected}"));
+    }
+    let actual = crate::models::payment::crypto::sha256(body)
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>();
+    if actual != hex {
+        return Err(format!("升级包校验失败：期望 {hex}，实际 {actual}"));
+    }
+    Ok(())
+}
+
+/// 生成自升级脚本（停服务 → 替换 `.new` → 启动），返回脚本路径。
+///
+/// Windows 的 .ps1 必须写 UTF-8 BOM，否则 PS 5.1 按 ANSI 解析中文会破坏语法。
+fn write_upgrade_script(
+    exec_dir: &std::path::Path,
+    version: &str,
+    service: &str,
+) -> Option<std::path::PathBuf> {
+    let dir = exec_dir.join("tmp").join("upgrade");
+    std::fs::create_dir_all(&dir).ok()?;
+    let exe = std::env::current_exe().ok()?;
+    let exe_path = exe.to_string_lossy().to_string();
+    let workdir = exec_dir.to_string_lossy().to_string();
+    let pid = std::process::id();
+    let args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let quote = |text: &str| text.replace('\'', "''");
+
+    if cfg!(windows) {
+        let content = format!(
+            r#"$ErrorActionPreference = 'Continue'
+$oldPid = {pid}
+Start-Sleep -Seconds 3
+$proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+if ($proc) {{ Stop-Process -Id $oldPid -Force; Start-Sleep -Seconds 2 }}
+$dir = '{dir}'
+$exe = '{exe}'
+$new = "$exe.new"
+if (Test-Path $new) {{ Copy-Item $new $exe -Force; Remove-Item $new -Force }}
+$log = Join-Path $dir 'tmp\upgrade\upgrade.log'
+Add-Content -Path $log -Value ("rustcms upgrade to {version} at " + (Get-Date))
+Start-Process -FilePath $exe -ArgumentList '{args}' -WorkingDirectory $dir -WindowStyle Hidden
+"#,
+            pid = pid,
+            dir = quote(&workdir),
+            exe = quote(&exe_path),
+            version = quote(version),
+            args = quote(&args)
+        );
+        let path = dir.join("upgrade.ps1");
+        std::fs::write(&path, format!("\u{feff}{content}")).ok()?;
+        Some(path)
+    } else {
+        let content = format!(
+            r#"#!/bin/sh
+sleep 3
+DIR='{dir}'
+EXE='{exe}'
+cd "$DIR" || exit 1
+UNIT=/etc/systemd/system/{service}.service
+if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT" ]; then
+  systemctl stop {service} >/dev/null 2>&1 || kill -TERM {pid} 2>/dev/null || true
+else
+  kill -TERM {pid} 2>/dev/null || true
+fi
+sleep 2
+if [ -f "$EXE.new" ]; then mv -f "$EXE.new" "$EXE"; chmod 755 "$EXE"; fi
+echo "rustcms upgrade to {version} at $(date)" >> "$DIR/tmp/upgrade/upgrade.log"
+if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT" ]; then
+  systemctl start {service}
+else
+  nohup "$EXE" {args} > "$DIR/logs/server.log" 2>&1 &
+fi
+"#,
+            dir = quote(&workdir),
+            exe = quote(&exe_path),
+            pid = pid,
+            version = quote(version),
+            service = quote(service),
+            args = args
+        );
+        let path = dir.join("upgrade.sh");
+        std::fs::write(&path, content).ok()?;
+        Some(path)
+    }
+}
+
+/// 异步拉起自升级脚本；返回是否成功创建子进程。
+fn spawn_upgrade_script(path: &std::path::Path) -> bool {
+    let script = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    let result = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            &script,
+        ])
+        .spawn();
+    #[cfg(not(windows))]
+    let result = std::process::Command::new("sh").arg(&script).spawn();
+    result.is_ok()
+}
+
+/// Linux 自升级时使用的 systemd 服务名：`settings.upgrade.service_name`，默认 `rustcms`。
+async fn upgrade_service_name(pool: Option<&sqlx::MySqlPool>) -> String {
+    if let Some(pool) = pool {
+        if let Ok(Some(value)) = setting::get_json(pool, "upgrade").await {
+            if let Some(name) = value.get("service_name").and_then(Value::as_str) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    "rustcms".to_string()
+}
+
+/// 是否自动执行自升级脚本：`settings.upgrade.auto_restart` / 环境变量 / 本次请求。
+async fn upgrade_auto_restart(pool: Option<&sqlx::MySqlPool>, requested: bool) -> bool {
+    if requested {
+        return true;
+    }
+    if let Some(pool) = pool {
+        if let Ok(Some(value)) = setting::get_json(pool, "upgrade").await {
+            if let Some(flag) = value.get("auto_restart") {
+                return flag.as_bool().unwrap_or_else(|| {
+                    matches!(flag.as_str(), Some("1") | Some("true") | Some("on"))
+                });
+            }
+        }
+    }
+    std::env::var("RUSTCMS_UPGRADE_AUTO_RESTART")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 执行清单里的 SQL 迁移；单条失败只记日志，不阻断升级。
+async fn run_upgrade_sql(
+    pool: Option<&sqlx::MySqlPool>,
+    exec_dir: &std::path::Path,
+    files: &[String],
+) -> (usize, usize) {
+    let Some(pool) = pool else {
+        return (0, 0);
+    };
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for relative in files {
+        let relative = relative.trim().replace('\\', "/");
+        if relative.is_empty()
+            || relative.starts_with('/')
+            || relative.contains("..")
+            || !relative.ends_with(".sql")
+        {
+            failed += 1;
+            continue;
+        }
+        let path = exec_dir.join(&relative);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!("读取升级 SQL {} 失败：{err}", relative);
+                failed += 1;
+                continue;
+            }
+        };
+        for raw in text.split(';') {
+            let statement = raw
+                .lines()
+                .map(str::trim)
+                .filter(|line| {
+                    !line.is_empty()
+                        && !line.starts_with("--")
+                        && !line.starts_with('#')
+                        && !line.starts_with("/*")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if statement.trim().is_empty() {
+                continue;
+            }
+            match sqlx::query(&statement).execute(pool).await {
+                Ok(_) => done += 1,
+                Err(err) => {
+                    tracing::warn!("升级 SQL 执行失败：{err}");
+                    failed += 1;
+                }
+            }
+        }
+    }
+    (done, failed)
+}
+
+/// 升级收尾信息。
+struct UpgradeFinish {
+    script: Option<String>,
+    restarted: bool,
+    sql_ok: usize,
+    sql_failed: usize,
+}
+
+/// 写站点版本清单、执行 SQL、生成（可选执行）自升级脚本。
+async fn finish_upgrade(
+    state: &AppState,
+    exec_dir: &std::path::Path,
+    manifest: &UpgradeManifest,
+    restart: bool,
+) -> UpgradeFinish {
+    write_deployed_manifest(exec_dir, manifest);
+    let (sql_ok, sql_failed) = run_upgrade_sql(state.db(), exec_dir, &manifest.sql).await;
+    let service = upgrade_service_name(state.db()).await;
+    let script = write_upgrade_script(exec_dir, &manifest.version, &service);
+    let script_text = script
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .filter(|text| !text.is_empty());
+    let restarted = match (&script, &script_text) {
+        (Some(path), Some(_)) if upgrade_auto_restart(state.db(), restart).await => {
+            spawn_upgrade_script(path)
+        }
+        _ => false,
+    };
+    UpgradeFinish {
+        script: script_text,
+        restarted,
+        sql_ok,
+        sql_failed,
+    }
+}
+
+fn upgrade_finish_message(finish: &UpgradeFinish, stats: &UpgradeStats) -> String {
+    let mut msg = if finish.restarted {
+        format!(
+            "升级完成：写入 {} 个文件，跳过 {} 个；服务正在自动重启，约 5 秒后刷新页面",
+            stats.files, stats.skipped
+        )
+    } else {
+        format!(
+            "升级完成：写入 {} 个文件，跳过 {} 个；请重启服务后生效",
+            stats.files, stats.skipped
+        )
+    };
+    if let Some(path) = &finish.script {
+        msg.push_str(&format!("。自升级脚本：{path}"));
+    }
+    if finish.sql_ok + finish.sql_failed > 0 {
+        msg.push_str(&format!(
+            "。SQL 成功 {} 条、失败 {} 条",
+            finish.sql_ok, finish.sql_failed
+        ));
+    }
+    msg
+}
 
 /// `GET /system/api/version/env`
 async fn manage_version_env(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -7351,18 +7695,18 @@ async fn manage_version_env(State(state): State<AppState>, headers: HeaderMap) -
         .unwrap_or_default();
 
     ok(json!({
-        "version": statistic::VERSION,
+        "version": deployed_version(),
         "trial": statistic::TRIAL,
         "goos": std::env::consts::OS,
         "goarch": std::env::consts::ARCH,
         "exec": exec,
         "exec_path": exec_path,
         "max_size": UPGRADE_UPLOAD_MAX_SIZE,
-        "skip_rules": "template/、public/、data/、uploads/、logs/、config.json、*.sh、*.bat 不会被覆盖",
+        "skip_rules": "config.json、data/、uploads/、logs/、cache/、tmp/、public/upload/、脚本与备份文件不会被覆盖；template/ 与 public/ 会随升级包更新",
     }))
 }
 
-/// 按 `.` 分段比较版本号（对齐 Go `library.VersionCompare`）。
+/// 按 `.` 分段比较版本号（按 `library.VersionCompare` 的语义）。
 fn version_compare(left: &str, right: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
@@ -7388,75 +7732,135 @@ fn version_compare(left: &str, right: &str) -> std::cmp::Ordering {
 
 /// `GET /system/api/version/check`
 ///
-/// 对齐 Go 版 `CheckVersion`：请求官方 `version.json`，比对当前版本；
-/// 外呼失败时按「已是最新版本」返回（前端不会因此报错）。
+/// 未配置 `settings.upgrade.version_url` / `RUSTCMS_VERSION_URL` 时不做任何外呼，
+/// 恒回「当前已是最新版本」；配置后读取自建版本清单并按当前平台挑包。
+///
+/// 后台前端把 `data` 直接当作「发现新版本」渲染（`data ? 新版本卡片 : 已是最新`），
+/// 且用 `dangerouslySetInnerHTML` 输出 `description`。所以无新版本时必须给 `null`，
+/// 说明文字要先做 HTML 转义，不能把清单里的原文直接交给页面。
 async fn manage_version_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-
-    // 与 Go 的 runtime.GOOS / runtime.GOARCH 口径保持一致
-    let goos = match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    };
-    let goarch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "x86" => "386",
-        other => other,
-    };
-    let version_type = if statistic::TRIAL { "trial" } else { "" };
-    let url = format!(
-        "https://www.anqicms.com/downloads/version.json?goos={goos}&goarch={goarch}&type={version_type}"
-    );
-    let request = rustcms_ext::http::Request::get(url)
-        .with_timeout(std::time::Duration::from_secs(10));
-    let response = match rustcms_ext::http::send(&request).await {
-        Ok(response) if response.is_success() => response,
-        _ => return ok_msg("当前已是最新版本"),
-    };
-    let remote: Value = match serde_json::from_str(&response.text()) {
-        Ok(value) => value,
-        Err(_) => return ok_msg("当前已是最新版本"),
-    };
-
-    let remote_version = remote.get("version").and_then(Value::as_str).unwrap_or("");
-    if version_compare(remote_version, statistic::VERSION).is_gt() {
-        return Json(json!({
+    let current = deployed_version();
+    let no_update = |msg: &str| {
+        Json(json!({
             "code": 0,
-            "msg": "发现新版本",
-            "data": remote,
+            "msg": msg,
+            "data": Value::Null,
         }))
-        .into_response();
+        .into_response()
+    };
+    let Some(url) = upgrade_version_url(state.db()).await else {
+        return no_update("当前已是最新版本");
+    };
+    let Some((manifest, base)) = fetch_upgrade_manifest(&url).await else {
+        // 拉取失败按「已是最新」成功返回，避免外呼异常时后台页面报错。
+        tracing::warn!("读取在线版本清单失败：{url}");
+        return no_update("无法读取版本清单，当前按已是最新版本处理");
+    };
+    if version_compare(&manifest.version, &current) != std::cmp::Ordering::Greater {
+        return no_update("当前已是最新版本");
     }
-
-    let trial_version = remote
-        .get("trial_version")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if !trial_version.is_empty() && version_compare(trial_version, statistic::VERSION).is_gt() {
-        let mut data = remote.clone();
-        if let Value::Object(map) = &mut data {
-            map.insert("trial".into(), json!(true));
-            map.insert("version".into(), json!(trial_version));
-            map.insert(
-                "description".into(),
-                remote.get("trial_description").cloned().unwrap_or(json!("")),
-            );
+    let (link, checksum) = resolve_manifest_package(&manifest, &base).unwrap_or_default();
+    let description = crate::models::admin_gap::escape_html(&manifest.note).replace('\n', "<br />");
+    Json(json!({
+        "code": 0,
+        "msg": format!("发现新版本 {}", manifest.version),
+        "data": {
+            "has_new": true,
+            "current_version": current,
+            "version": manifest.version,
+            "date": manifest.date,
+            "note": manifest.note,
+            "description": description,
+            "trial": false,
+            "url": link,
+            "checksum": checksum,
+            "sql": manifest.sql,
         }
-        return Json(json!({
-            "code": 0,
-            "msg": "发现新试用版本",
-            "data": data,
-        }))
-        .into_response();
-    }
-
-    ok_msg("当前已是最新版本")
+    }))
+    .into_response()
 }
 
-/// 在线升级请求体（对齐 Go 的 `request.VersionData`）。
+/// 升级配置：`settings.upgrade`（version_url / service_name / auto_check / auto_restart / package_base）。
+#[derive(Debug, Deserialize, Default)]
+struct UpgradeConfigBody {
+    #[serde(default)]
+    version_url: String,
+    #[serde(default)]
+    service_name: String,
+    #[serde(default)]
+    auto_check: bool,
+    #[serde(default)]
+    auto_restart: bool,
+    #[serde(default)]
+    package_base: String,
+}
+
+/// `GET /system/api/version/config`
+async fn manage_version_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let value = setting::get_json_or_empty(pool, "upgrade")
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let mut map = value.as_object().cloned().unwrap_or_default();
+    let defaults = json!({
+        "version_url": "",
+        "service_name": "rustcms",
+        "auto_check": 0,
+        "auto_restart": 0,
+        "package_base": "",
+    });
+    if let Some(obj) = defaults.as_object() {
+        for (key, value) in obj {
+            map.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    ok(Value::Object(map))
+}
+
+/// `POST /system/api/version/config`
+async fn manage_version_config_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpgradeConfigBody>,
+) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let mut value = setting::get_json_or_empty(pool, "upgrade")
+        .await
+        .unwrap_or_else(|_| json!({}));
+    if !value.is_object() {
+        value = json!({});
+    }
+    let Some(map) = value.as_object_mut() else {
+        return fail("升级配置格式错误");
+    };
+    map.insert("version_url".into(), json!(body.version_url.trim()));
+    map.insert("service_name".into(), json!(body.service_name.trim()));
+    map.insert("auto_check".into(), json!(if body.auto_check { 1 } else { 0 }));
+    map.insert(
+        "auto_restart".into(),
+        json!(if body.auto_restart { 1 } else { 0 }),
+    );
+    map.insert("package_base".into(), json!(body.package_base.trim()));
+    match setting::save_json(pool, "upgrade", &value).await {
+        Ok(()) => ok_msg("升级配置已保存"),
+        Err(err) => failed(err),
+    }
+}
+
+/// 在线升级请求体（按 `request.VersionData` 的语义）。
 #[derive(Debug, Deserialize, Default)]
 struct VersionUpgradeBody {
     #[serde(default)]
@@ -7465,11 +7869,22 @@ struct VersionUpgradeBody {
     trial: bool,
     #[serde(default)]
     trial_version: String,
+    /// 升级完成后自动执行自升级脚本重启服务。
+    #[serde(default)]
+    restart: bool,
 }
 
-/// 升级包内的 version.json（字段与 Go `upgradeManifest` 一致）。
-#[derive(Debug, Default, Deserialize)]
-#[allow(dead_code)] // date / note 只为与 Go 清单字段对齐，当前响应不使用
+/// 版本清单里按平台登记的升级包。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct UpgradePackageRef {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    checksum: String,
+}
+
+/// 升级包内 / 远程 version.json 的字段。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct UpgradeManifest {
     #[serde(default)]
     version: String,
@@ -7479,9 +7894,15 @@ struct UpgradeManifest {
     note: String,
     #[serde(default)]
     sql: Vec<String>,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    checksum: String,
+    #[serde(default)]
+    packages: std::collections::BTreeMap<String, UpgradePackageRef>,
 }
 
-/// 升级结果（字段名与 Go `upgradeStats` 一致）。
+/// 升级结果（字段名与 `upgradeStats` 一致）。
 #[derive(Debug, Default, Serialize)]
 struct UpgradeStats {
     version: String,
@@ -7491,11 +7912,11 @@ struct UpgradeStats {
     sql: Vec<String>,
 }
 
-/// 解压后总体积上限（2GB，防 zip bomb）与条目数上限（与 Go 一致）。
+/// 解压后总体积上限（2GB，防 zip bomb）与条目数上限（与既有接口契约一致）。
 const UPGRADE_UNPACK_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const UPGRADE_MAX_FILE_COUNT: usize = 20_000;
 
-/// 按文件魔数识别升级包格式：`zip` / `tar.gz` / 空串（对齐 Go `detectUpgradeArchive`）。
+/// 按文件魔数识别升级包格式：`zip` / `tar.gz` / 空串（按 `detectUpgradeArchive` 的语义）。
 fn detect_upgrade_archive(body: &[u8]) -> &'static str {
     if body.starts_with(b"PK") {
         "zip"
@@ -7541,23 +7962,36 @@ fn upgrade_common_prefix(names: &[String]) -> String {
     prefix.unwrap_or_default()
 }
 
-/// 不覆盖的文件：模板、静态资源、用户数据、日志与脚本（对齐 Go `shouldSkipUpgradeFile`）。
+/// 不覆盖的文件：站点配置、用户数据、日志与运维脚本。
+/// 模板和静态资源属于发行产物，升级时整体替换；`public/upload/` 下的用户上传单独排除。
 fn should_skip_upgrade_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    const PREFIXES: [&str; 6] = ["template/", "public/", "data/", "uploads/", "logs/", "static/"];
+    const PREFIXES: [&str; 8] = [
+        "data/",
+        "uploads/",
+        "logs/",
+        "cache/",
+        "tmp/",
+        "upload/",
+        "public/upload/",
+        "public/uploads/",
+    ];
     if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
         return true;
     }
-    if [".sh", ".bat", ".cmd", ".ps1"]
+    if [".sh", ".bat", ".cmd", ".ps1", ".bak", ".old", ".new"]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
     {
         return true;
     }
-    matches!(lower.as_str(), "config.json" | "favicon.ico" | "version.json")
+    matches!(
+        lower.as_str(),
+        "config.json" | "config.sample.json" | "favicon.ico" | "version.json"
+    )
 }
 
-/// 判断包内条目是否是主程序（当前可执行名 + Go 版命名兼容）。
+/// 判断包内条目是否是主程序（当前可执行名 + 既有实现命名兼容）。
 fn is_upgrade_executable(name: &str, exe_name: &str) -> bool {
     let base = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
     base == exe_name.to_ascii_lowercase()
@@ -7565,10 +7999,10 @@ fn is_upgrade_executable(name: &str, exe_name: &str) -> bool {
             base.as_str(),
             "rustcms"
                 | "rustcms.exe"
-                | "anqicms"
-                | "anqicms.exe"
-                | "anqicms-server"
-                | "anqicms-server.exe"
+                | "rustcms-server"
+                | "rustcms-server.exe"
+                | "rustcms-cli"
+                | "rustcms-cli.exe"
         )
 }
 
@@ -7606,9 +8040,9 @@ fn read_upgrade_manifest(body: &[u8], kind: &str) -> Option<UpgradeManifest> {
 
 /// 解压升级包并覆盖程序目录（`zip` / `tar.gz`）。
 ///
-/// 与 Go 一致：剥掉包内公共顶层目录，跳过模板 / 静态资源 / 用户数据 / 日志 / 脚本，
+/// 剥掉包内公共顶层目录，跳过站点配置 / 用户数据 / 日志 / 脚本（模板与静态资源会更新），
 /// 主程序先写 `.new`，全部成功后再把正在运行的程序改名备份并替换；包内路径拒绝
-/// 绝对路径、盘符与 `..`。在线升级（官方包）也复用本函数。
+/// 绝对路径、盘符与 `..`。在线升级也复用本函数。
 fn install_upgrade_archive(
     body: &[u8],
     kind: &str,
@@ -7743,14 +8177,37 @@ fn install_upgrade_archive(
     Ok(stats)
 }
 
-/// 在线升级（官方包固定为 zip）入口。
-fn install_upgrade_zip(body: &[u8], exec_dir: &std::path::Path) -> Result<(), ModelError> {
-    install_upgrade_archive(body, "zip", exec_dir).map(|_| ())
+/// 在线升级（远程包固定为 zip）入口。
+fn install_upgrade_zip(
+    body: &[u8],
+    exec_dir: &std::path::Path,
+) -> Result<UpgradeStats, ModelError> {
+    install_upgrade_archive(body, "zip", exec_dir)
+}
+
+/// 在线升级源：优先 `settings.upgrade.package_base`，其次环境变量 `RUSTCMS_UPGRADE_BASE`。
+/// 未配置时**在线升级关闭**（本地上传升级包不受影响），独立部署默认不外呼。
+async fn upgrade_package_base(pool: Option<&sqlx::MySqlPool>) -> Option<String> {
+    if let Some(pool) = pool {
+        if let Ok(Some(value)) = setting::get_json(pool, "upgrade").await {
+            if let Some(base) = value.get("package_base").and_then(Value::as_str) {
+                let trimmed = base.trim().trim_end_matches('/');
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    std::env::var("RUSTCMS_UPGRADE_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// `POST /system/api/version/upgrade`
 ///
-/// 从官方下载站按平台 / 架构拼接安装包地址，下载 zip 后覆盖程序目录。
+/// 优先按 `version.json` 清单的 `packages.<platform>` 下载并校验 sha256；
+/// 没有清单时退回 `settings.upgrade.package_base` 下的固定命名包。
 async fn manage_version_upgrade(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7759,29 +8216,43 @@ async fn manage_version_upgrade(
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
-    let version = if body.trial {
-        body.trial_version.trim()
-    } else {
-        body.version.trim()
+    let version_url = upgrade_version_url(state.db()).await;
+    let remote = match &version_url {
+        Some(url) => fetch_upgrade_manifest(url).await,
+        None => None,
     };
+
+    let mut version = if body.trial {
+        body.trial_version.trim().to_string()
+    } else {
+        body.version.trim().to_string()
+    };
+    if version.is_empty() {
+        if let Some((manifest, _)) = &remote {
+            version = manifest.version.trim().to_string();
+        }
+    }
     if version.is_empty() {
         return fail("缺少目标版本号");
     }
 
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "x86" => "386",
-        other => other,
-    };
-    let link = if statistic::TRIAL {
-        format!("https://www.anqicms.com/downloads/anqicms-trial-{os}-{arch}-v{version}.zip")
+    let (link, checksum) = if let Some((manifest, base)) = &remote {
+        match resolve_manifest_package(manifest, base) {
+            Some(pair) => pair,
+            None => return fail("版本清单里没有当前平台的升级包"),
+        }
     } else {
-        format!("https://www.anqicms.com/downloads/anqicms-{os}-{arch}-v{version}.zip")
+        let Some(base) = upgrade_package_base(state.db()).await else {
+            return fail(
+                "未配置在线升级源：请使用「上传升级包」，或设置 settings.upgrade.version_url / package_base、环境变量 RUSTCMS_VERSION_URL / RUSTCMS_UPGRADE_BASE",
+            );
+        };
+        let name = if statistic::TRIAL {
+            format!("rustcms-trial-v{version}-{}-upgrade.zip", upgrade_platform())
+        } else {
+            format!("rustcms-v{version}-{}-upgrade.zip", upgrade_platform())
+        };
+        (format!("{base}/{name}"), String::new())
     };
 
     let request = rustcms_ext::http::Request::get(link)
@@ -7796,6 +8267,9 @@ async fn manage_version_upgrade(
     if !response.is_success() || response.body.is_empty() {
         return fail("版本更新失败");
     }
+    if let Err(msg) = verify_upgrade_checksum(&response.body, &checksum) {
+        return fail(msg);
+    }
 
     let exec_dir = match std::env::current_exe()
         .ok()
@@ -7804,16 +8278,29 @@ async fn manage_version_upgrade(
         Some(dir) => dir,
         None => return fail("版本更新失败"),
     };
-    match install_upgrade_zip(&response.body, &exec_dir) {
-        Ok(()) => ok_msg("系统版本已升级"),
-        Err(err) => model_error(err),
-    }
+    let stats = match install_upgrade_zip(&response.body, &exec_dir) {
+        Ok(stats) => stats,
+        Err(err) => return model_error(err),
+    };
+    let mut manifest = remote.map(|(item, _)| item).unwrap_or_else(|| UpgradeManifest {
+        version: version.clone(),
+        checksum: checksum.clone(),
+        ..Default::default()
+    });
+    manifest.version = version.clone();
+    let finish = finish_upgrade(&state, &exec_dir, &manifest, body.restart).await;
+    Json(json!({
+        "code": 0,
+        "msg": upgrade_finish_message(&finish, &stats),
+        "data": stats
+    }))
+    .into_response()
 }
 
 /// `POST /system/api/version/upload-upgrade`
 ///
-/// 兼容 Go 的上传升级：表单文件 `file`（zip / tar.gz，按魔数识别），可选
-/// `version` 与 `force=1`；包内带 `version.json` 时可省略版本号。
+/// 上传升级：表单文件 `file`（zip / tar.gz，按魔数识别），可选 `version`、`force=1`、
+/// `checksum=sha256:<hex>` 与 `restart=1`；包内带 `version.json` 时可省略版本号。
 async fn manage_version_upload_upgrade(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7831,6 +8318,8 @@ async fn manage_version_upload_upgrade(
     let mut uploaded: Option<(String, Vec<u8>)> = None;
     let mut version = String::new();
     let mut force = false;
+    let mut checksum = String::new();
+    let mut restart = false;
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
@@ -7855,6 +8344,16 @@ async fn manage_version_upload_upgrade(
                             force = matches!(text.trim(), "1" | "true" | "True" | "yes")
                         }
                         Err(err) => return fail(format!("读取 force 参数失败：{err}")),
+                    },
+                    "checksum" => match field.text().await {
+                        Ok(text) => checksum = text.trim().to_string(),
+                        Err(err) => return fail(format!("读取校验和失败：{err}")),
+                    },
+                    "restart" => match field.text().await {
+                        Ok(text) => {
+                            restart = matches!(text.trim(), "1" | "true" | "True" | "yes")
+                        }
+                        Err(err) => return fail(format!("读取 restart 参数失败：{err}")),
                     },
                     _ => {
                         let _ = field.bytes().await;
@@ -7885,8 +8384,13 @@ async fn manage_version_upload_upgrade(
         return fail("无法识别的升级包格式，仅支持 zip 与 tar.gz");
     }
 
-    // 包内 version.json 可缺省；读取失败与 Go 一样按「没有清单」处理
+    // 包内 version.json 可缺省；读取失败与既有实现一样按「没有清单」处理
     let manifest = read_upgrade_manifest(&body, kind);
+    // 上传包只在表单显式给了 checksum 时校验：包内简版 version.json 不带校验和，
+    // 而完整清单里的 checksum 描述的是另外某个包，拿来自检会误伤。
+    if let Err(msg) = verify_upgrade_checksum(&body, &checksum) {
+        return fail(msg);
+    }
     if version.is_empty() {
         if let Some(item) = &manifest {
             version = item.version.trim().to_string();
@@ -7895,13 +8399,13 @@ async fn manage_version_upload_upgrade(
     if version.is_empty() && !force {
         return fail("升级包内没有 version.json，请填写版本号或勾选强制升级");
     }
+    let current_version = deployed_version();
     if !force
         && !version.is_empty()
-        && version_compare(&version, statistic::VERSION) != std::cmp::Ordering::Greater
+        && version_compare(&version, &current_version) != std::cmp::Ordering::Greater
     {
         return fail(format!(
-            "包版本 {version} 不高于当前版本 {}；如确认要覆盖安装，请勾选「强制升级」",
-            statistic::VERSION
+            "包版本 {version} 不高于当前版本 {current_version}；如确认要覆盖安装，请勾选「强制升级」"
         ));
     }
 
@@ -7917,11 +8421,16 @@ async fn manage_version_upload_upgrade(
         Err(err) => return model_error(err),
     };
     stats.version = version.clone();
-    if let Some(item) = manifest {
-        if !item.sql.is_empty() {
-            stats.sql = item.sql;
-        }
+    let mut deployed = manifest.unwrap_or_else(|| UpgradeManifest {
+        version: version.clone(),
+        ..Default::default()
+    });
+    if !version.is_empty() {
+        deployed.version = version.clone();
     }
+    stats.sql = deployed.sql.clone();
+    let previous_version = deployed_version();
+    let finish = finish_upgrade(&state, &exec_dir, &deployed, restart).await;
 
     let ip = client_ip(&headers, peer);
     log_action(
@@ -7930,7 +8439,7 @@ async fn manage_version_upload_upgrade(
         &ip,
         &format!(
             "上传升级包升级：{} -> {}（{}，{} 个文件，{:.1} MB）",
-            statistic::VERSION,
+            previous_version,
             version,
             filename,
             stats.files,
@@ -7939,14 +8448,12 @@ async fn manage_version_upload_upgrade(
     )
     .await;
 
-    let mut msg = format!(
-        "升级完成：写入 {} 个文件，跳过 {} 个；请重启服务后生效",
-        stats.files, stats.skipped
-    );
-    if !stats.sql.is_empty() {
-        msg.push_str(&format!("。包内附带 {} 个 SQL，需要另行执行", stats.sql.len()));
-    }
-    Json(json!({"code": 0, "msg": msg, "data": stats})).into_response()
+    Json(json!({
+        "code": 0,
+        "msg": upgrade_finish_message(&finish, &stats),
+        "data": stats
+    }))
+    .into_response()
 }
 
 // ---------------------------- 多站点 ---------------------------------------
@@ -8113,7 +8620,7 @@ async fn manage_website_delete(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    // 只删数据库记录；站点文件暂不删除（与 Go 的 removeFile 语义对齐但更保守）
+    // 只删数据库记录；站点文件暂不删除（与既有的 removeFile 语义对齐但更保守）
     let _ = body.remove_file;
     match website::delete(pool, body.id).await {
         Ok(()) => ok_msg("删除成功"),
@@ -8392,7 +8899,7 @@ async fn manage_link_delete(
 
 /// `POST /system/api/plugin/link/check`
 ///
-/// 抓取对方页面，检查是否回链本站（对齐 Go `PluginLinkCheck`）。
+/// 抓取对方页面，检查是否回链本站（按 `PluginLinkCheck` 的语义）。
 async fn manage_link_check(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9446,7 +9953,7 @@ fn site_root(state: &AppState) -> std::path::PathBuf {
 
 /// `GET /system/api/plugin/transfer/task`
 ///
-/// Go 版的迁移任务只存在内存里（重启即丢），这里没有持久化，恒返回 `null`。
+/// 既有的迁移任务只存在内存里（重启即丢），这里没有持久化，恒返回 `null`。
 async fn manage_transfer_task(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -9504,7 +10011,7 @@ async fn manage_transfer_download(
 
 /// `POST /system/api/plugin/transfer/create`
 ///
-/// 校验迁移参数并请求旧站 `a=config` 确认客户端文件可用（对齐 Go `CreateTransferTask`）。
+/// 校验迁移参数并请求旧站 `a=config` 确认客户端文件可用（按 `CreateTransferTask` 的语义）。
 async fn manage_transfer_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9594,7 +10101,7 @@ async fn manage_multilang_sites(
         return fail(NO_DB);
     };
 
-    // `type=multi` 且配置是 single 时不返回数据（与 Go 一致）
+    // `type=multi` 且配置是 single 时不返回数据（与既有接口契约一致）
     if query.kind.as_deref() == Some("multi") {
         let config = match multilang::config_get(pool).await {
             Ok(value) => value,
@@ -9688,7 +10195,9 @@ async fn manage_multilang_site_sync(
         return fail(NO_DB);
     };
     let mysql = state.with_config(|config| config.mysql.clone());
-    match multilang::site_sync(pool, &mysql, input.id, input.focus).await {
+    // 附件文件从源站点 public 目录复制到子站点自己的 public 目录
+    let public_dir = state.with_config(|config| config.public_dir());
+    match multilang::site_sync(pool, &mysql, input.id, input.focus, &public_dir).await {
         Ok(report) => Json(json!({ "code": 0, "msg": "同步完成", "data": report })).into_response(),
         Err(err) => model_error(err),
     }
@@ -9812,7 +10321,7 @@ async fn manage_translate_config(State(state): State<AppState>, headers: HeaderM
 
 /// `POST /system/api/plugin/translate/config`
 ///
-/// 字段级 merge：只覆盖请求体里出现的字段（Go `MergeJSONPayload`）。
+/// 字段级 merge：只覆盖请求体里出现的字段（`MergeJSONPayload` 的语义）。
 async fn manage_translate_config_save(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9877,7 +10386,7 @@ struct TranslateTextLogQuery {
 
 /// `GET /system/api/plugin/translate/log/texts`
 ///
-/// 支持按原文 / 译文前缀筛选（Go `PluginGetTranslateTextLog`）。
+/// 支持按原文 / 译文前缀筛选（`PluginGetTranslateTextLog` 的语义）。
 async fn manage_translate_text_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9970,7 +10479,7 @@ async fn manage_translate_text_save(
 
 /// `GET /system/api/plugin/llms/status`
 ///
-/// 无任务 = 已完成（Go 原实现把「已完成」回成失败，这里是修正后的语义）。
+/// 无任务 = 已完成（既有实现原实现把「已完成」回成失败，这里是修正后的语义）。
 async fn manage_llms_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -10162,7 +10671,7 @@ fn wrap_title_text(text: &str, size: usize, max_width: usize) -> Vec<String> {
     lines
 }
 
-/// 标题的 32 位数字摘要（对齐 Go `sumTitle`）。
+/// 标题的 32 位数字摘要（按 `sumTitle` 的语义）。
 fn titleimage_title_sum(title: &str) -> String {
     attachment::md5_hex(title.as_bytes())
         .bytes()
@@ -10170,7 +10679,7 @@ fn titleimage_title_sum(title: &str) -> String {
         .collect()
 }
 
-/// 无背景图时按标题生成深色背景（对齐 Go `RandColor` / `RandDeepColor`）。
+/// 无背景图时按标题生成深色背景（按 `RandColor` 的语义 / `RandDeepColor`）。
 fn titleimage_bg_color(title: &str) -> String {
     let sum = titleimage_title_sum(title);
     let head: i64 = sum.get(0..9).and_then(|part| part.parse().ok()).unwrap_or(0);
@@ -10192,7 +10701,7 @@ fn titleimage_bg_color(title: &str) -> String {
     format!("#{red:02x}{green:02x}{blue:02x}")
 }
 
-/// 背景噪声（对应 Go 的 `Noise` 开关）。
+/// 背景噪声（对应既有的 `Noise` 开关）。
 fn titleimage_noise(title: &str, width: u32, height: u32) -> String {
     let sum = titleimage_title_sum(title);
     let bytes = sum.as_bytes();
@@ -10211,42 +10720,6 @@ fn titleimage_noise(title: &str, width: u32, height: u32) -> String {
         ));
     }
     out
-}
-
-/// 水印素材等比缩放到不超过 `max_width × max_height`。
-fn fit_mark(source_width: u32, source_height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    if source_width == 0 || source_height == 0 {
-        return (max_width, max_height);
-    }
-    let scale = (max_width as f64 / source_width as f64)
-        .min(max_height as f64 / source_height as f64);
-    (
-        ((source_width as f64 * scale).round() as u32).max(1),
-        ((source_height as f64 * scale).round() as u32).max(1),
-    )
-}
-
-/// 水印位置：5 居中、1 左上、3 右上、7 左下，其它按右下。
-fn watermark_position(
-    position: i64,
-    canvas_width: u32,
-    canvas_height: u32,
-    width: u32,
-    height: u32,
-    edge: u32,
-) -> (i64, i64) {
-    let right = canvas_width as i64 - edge as i64 - width as i64;
-    let bottom = canvas_height as i64 - edge as i64 - height as i64;
-    match position {
-        5 => (
-            (canvas_width.saturating_sub(width) / 2) as i64,
-            (canvas_height.saturating_sub(height) / 2) as i64,
-        ),
-        1 => (edge as i64, edge as i64),
-        3 => (right, edge as i64),
-        7 => (edge as i64, bottom),
-        _ => (right, bottom),
-    }
 }
 
 // ---------------------------- 标题生成图片 ---------------------------------
@@ -10360,7 +10833,7 @@ fn render_titleimage_svg(
         }
     }
 
-    // 与 Go `drawTitle` 一致：按文字数量自适应字号，超宽自动折行并居中。
+    // 与 `drawTitle` 一致：按文字数量自适应字号，超宽自动折行并居中。
     let max_text_width = (width.saturating_sub(100) as usize).max(1);
     let real_size = (max_text_width / text.chars().count().max(1))
         .clamp(font_size.min(100).max(1), 100);
@@ -10401,7 +10874,7 @@ fn render_titleimage_svg(
 
 /// `GET /system/api/plugin/titleimage/preview`
 ///
-/// 对齐 Go 版 `PluginTitleImagePreview`：按当前配置生成一张可直接查看的
+/// `PluginTitleImagePreview`：按当前配置生成一张可直接查看的
 /// `data:image/svg+xml;base64,` 图片（内嵌字体、背景图、噪声）。
 async fn manage_titleimage_preview(
     State(state): State<AppState>,
@@ -10424,14 +10897,14 @@ async fn manage_titleimage_preview(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("欢迎使用安企CMS")
+        .unwrap_or("欢迎使用 RustCMS")
         .to_string();
 
     // 字体资源（可选）；存在时以 @font-face 内嵌，保证预览与生成效果一致。
     let font_path = config.get("font_path").and_then(Value::as_str).unwrap_or("");
     let font_data = read_public_asset(&public_dir, font_path).await;
 
-    // 背景图（可选）；与 Go 版本一致，多张时随机取一张。
+    // 背景图（可选）；与既有实现本一致，多张时随机取一张。
     let mut background = None;
     if let Some(items) = config.get("bg_images").and_then(Value::as_array) {
         if !items.is_empty() {
@@ -10444,6 +10917,30 @@ async fn manage_titleimage_preview(
         }
     }
 
+    let background_bytes = background
+        .as_ref()
+        .map(|(_, bytes)| bytes.as_slice());
+
+    // 位图管线优先（与既有接口契约一致）：找到可用字体就直接画成 PNG —— 预览即所得，
+    // 不依赖浏览器的 @font-face 光栅化。
+    let face = load_titleimage_face(&public_dir, &config).await;
+    if let Some(face) = face.as_ref() {
+        if let Ok(image) = crate::models::titleimage::draw::render(
+            &config,
+            &text,
+            Some(face),
+            background_bytes,
+        ) {
+            if let Ok(bytes) = crate::models::titleimage::image_ops::encode(&image, "png") {
+                return ok(json!(format!(
+                    "data:image/png;base64,{}",
+                    image_base64(&bytes)
+                )));
+            }
+        }
+    }
+
+    // 兜底：一个字体都找不到时仍能出图（内嵌 @font-face，由浏览器渲染文字）
     let svg = render_titleimage_svg(
         &config,
         &text,
@@ -10457,6 +10954,19 @@ async fn manage_titleimage_preview(
         "data:image/svg+xml;base64,{}",
         image_base64(svg.as_bytes())
     )))
+}
+
+/// 载入标题图字体（文件读取放阻塞线程池，字体动辄几 MB，别卡住 async 运行时）。
+async fn load_titleimage_face(
+    public_dir: &std::path::Path,
+    config: &Value,
+) -> Option<crate::models::watermark::font::Face> {
+    let dir = public_dir.to_path_buf();
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || crate::models::titleimage::draw::load_face(&dir, &config))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// `POST /system/api/plugin/titleimage/upload`（multipart：`name` + `file`）
@@ -10521,13 +11031,15 @@ async fn manage_titleimage_upload(
     ok(json!(path))
 }
 
-/// 后台批量生成标题图片：为无图文档生成 SVG 并写回 `images`。
+/// 后台批量生成标题图片：为无图文档生成 PNG（找不到字体时退化为 SVG）并写回 `images`。
 async fn generate_all_title_images(pool: sqlx::mysql::MySqlPool, public_dir: std::path::PathBuf) {
     let Ok(config) = titleimage::config_get(&pool).await else {
         return;
     };
     let font_path = config.get("font_path").and_then(Value::as_str).unwrap_or("");
     let font_data = read_public_asset(&public_dir, font_path).await;
+    // 字体只解析一次（几千条文档时省掉重复解析；解析失败会退回 SVG 管线）
+    let face = load_titleimage_face(&public_dir, &config).await;
     let bg_images: Vec<String> = config
         .get("bg_images")
         .and_then(Value::as_array)
@@ -10569,23 +11081,33 @@ async fn generate_all_title_images(pool: sqlx::mysql::MySqlPool, public_dir: std
                     .await
                     .map(|bytes| (bg_images[index].clone(), bytes))
             };
-            let svg = render_titleimage_svg(
-                &config,
-                &title,
-                font_data.as_ref(),
-                background
-                    .as_ref()
-                    .map(|(relative, bytes)| (relative.as_str(), bytes.as_slice())),
-            );
-            let relative = format!(
-                "uploads/titleimage/generated/{}.svg",
-                attachment::md5_hex(title.as_bytes())
-            );
+            let background_bytes = background.as_ref().map(|(_, bytes)| bytes.as_slice());
+            let hash = attachment::md5_hex(title.as_bytes());
+            let (relative, bytes) = match face.as_ref().and_then(|face| {
+                crate::models::titleimage::draw::render(&config, &title, Some(face), background_bytes)
+                    .ok()
+                    .and_then(|image| {
+                        crate::models::titleimage::image_ops::encode(&image, "png").ok()
+                    })
+            }) {
+                Some(bytes) => (format!("uploads/titleimage/generated/{hash}.png"), bytes),
+                None => {
+                    let svg = render_titleimage_svg(
+                        &config,
+                        &title,
+                        font_data.as_ref(),
+                        background
+                            .as_ref()
+                            .map(|(relative, bytes)| (relative.as_str(), bytes.as_slice())),
+                    );
+                    (format!("uploads/titleimage/generated/{hash}.svg"), svg.into_bytes())
+                }
+            };
             let path = public_dir.join(&relative);
             if let Some(parent) = path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            if tokio::fs::write(&path, svg.as_bytes()).await.is_err() {
+            if tokio::fs::write(&path, &bytes).await.is_err() {
                 continue;
             }
 
@@ -12172,8 +12694,11 @@ async fn manage_watermark_config_save(
 
 /// `GET /system/api/plugin/watermark/preview`
 ///
-/// 对齐 Go 版 `PluginWatermarkPreview`：用当前配置在 800×600 纯色底图上
-/// 生成水印效果，返回可直接查看的 `data:image/svg+xml;base64,` 图片。
+/// `PluginWatermarkPreview`：用当前配置在 800×600 纯色底图上
+/// 生成水印效果，返回可直接查看的 `data:image/png;base64,` 图片。
+///
+/// 预览与批量生成共用 [`watermark::render::draw_with_font`]（图片水印与文字水印同一条
+/// 渲染路径），所以预览看到的就是最终效果 —— 不会出现「预览能看、批量没效果」。
 async fn manage_watermark_preview(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -12187,115 +12712,34 @@ async fn manage_watermark_preview(State(state): State<AppState>, headers: Header
     };
     let public_dir = state.with_config(|config| config.public_dir());
 
-    const PREVIEW_WIDTH: u32 = 800;
-    const PREVIEW_HEIGHT: u32 = 600;
-    let size = config
-        .get("size")
-        .and_then(Value::as_i64)
-        .unwrap_or(20)
-        .clamp(1, 200) as u32;
-    let position = config
-        .get("position")
-        .and_then(Value::as_i64)
-        .unwrap_or(9);
-    let opacity = config
-        .get("opacity")
-        .and_then(Value::as_i64)
-        .unwrap_or(100)
-        .clamp(1, 100);
     let watermark_type = config.get("type").and_then(Value::as_i64).unwrap_or(0);
-
-    let max_width = (PREVIEW_WIDTH * size / 100).max(1);
-    let max_height = (PREVIEW_HEIGHT * size / 100).max(1);
-    let edge = (PREVIEW_WIDTH / 15).min(50);
-
-    let mut svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{PREVIEW_WIDTH}" height="{PREVIEW_HEIGHT}" viewBox="0 0 {PREVIEW_WIDTH} {PREVIEW_HEIGHT}"><rect x="0" y="0" width="{PREVIEW_WIDTH}" height="{PREVIEW_HEIGHT}" fill="#607d8b"/>"##
-    );
-
-    if watermark_type == 0 {
-        // 图片水印
-        let image_path = config
-            .get("image_path")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let Some(bytes) = read_public_asset(&public_dir, image_path).await else {
-            return fail("水印图片未配置或无法读取");
-        };
-        let (source_width, source_height) = attachment::image_size(&bytes);
-        let (mark_width, mark_height) = fit_mark(source_width, source_height, max_width, max_height);
-        let (x, y) = watermark_position(
-            position,
-            PREVIEW_WIDTH,
-            PREVIEW_HEIGHT,
-            mark_width,
-            mark_height,
-            edge,
-        );
-        svg.push_str(&format!(
-            r#"<image x="{x}" y="{y}" width="{mark_width}" height="{mark_height}" preserveAspectRatio="xMidYMid meet" opacity="{}" href="data:{};base64,{}"/>"#,
-            opacity as f64 / 100.0,
-            image_mime_of(image_path),
-            image_base64(&bytes)
-        ));
+    let asset_key = if watermark_type == 0 {
+        "image_path"
     } else {
-        // 文字水印
-        let text = config
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if text.is_empty() {
-            return fail("水印文字未配置");
-        }
-        let font_path = config.get("font_path").and_then(Value::as_str).unwrap_or("");
-        let font_data = read_public_asset(&public_dir, font_path).await;
-        let color = hex_color_or(
-            config.get("color").and_then(Value::as_str).unwrap_or(""),
-            "#ffffff",
-        );
-
-        // 与 Go 一致：中文按 1 个字号、英文按 0.5 个字号估算文字宽度
-        let text_width: u32 = text
-            .chars()
-            .map(|ch| if ch.is_ascii() { (size / 2).max(1) } else { size })
-            .sum();
-        let mark_width = text_width + text_width / 10;
-        let mark_height = size + size / 10;
-        let (x, y) = watermark_position(
-            position,
-            PREVIEW_WIDTH,
-            PREVIEW_HEIGHT,
-            mark_width,
-            mark_height,
-            edge,
-        );
-
-        if let Some(bytes) = &font_data {
-            svg.push_str(&format!(
-                r#"<defs><style>@font-face{{font-family:'WatermarkFont';src:url(data:font/ttf;base64,{}) format('truetype');}}</style></defs>"#,
-                image_base64(bytes)
-            ));
-        }
-        let font_family = if font_data.is_some() {
-            "WatermarkFont, sans-serif"
+        "font_path"
+    };
+    let asset_path = config
+        .get(asset_key)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let asset = read_public_asset(&public_dir, asset_path).await;
+    if asset.is_none() {
+        return fail(if watermark_type == 0 {
+            "水印图片未配置或无法读取"
         } else {
-            "sans-serif"
-        };
-        svg.push_str(&format!(
-            r#"<text x="{x}" y="{}" fill="{color}" font-size="{size}" font-family="{font_family}" opacity="{}">{}</text>"#,
-            y + size as i64,
-            opacity as f64 / 100.0,
-            xml_escape(&text)
-        ));
+            "水印字体未配置或无法读取"
+        });
     }
-    svg.push_str("</svg>");
 
-    ok(json!(format!(
-        "data:image/svg+xml;base64,{}",
-        image_base64(svg.as_bytes())
-    )))
+    let preview = if watermark_type == 0 {
+        watermark::render::preview_data_url(&config, asset.as_deref(), None)
+    } else {
+        watermark::render::preview_data_url(&config, None, asset.as_deref())
+    };
+    match preview {
+        Ok(url) => ok(json!(url)),
+        Err(err) => fail(err),
+    }
 }
 
 /// `POST /system/api/plugin/watermark/upload`（multipart：`name` + `file`）
@@ -12355,43 +12799,10 @@ async fn manage_watermark_upload(
     ok(json!(path))
 }
 
-/// 后台批量添加图片水印（当前图片引擎支持 PNG/BMP）。
+/// 后台批量加水印：图片水印与文字水印都走 [`watermark::apply_file`] 的同一条渲染路径，
+/// 这样「预览 / 单文件 / 批量」三处不会出现效果不一致。
 async fn generate_all_watermarks(pool: sqlx::mysql::MySqlPool, public_dir: std::path::PathBuf) {
     let Ok(config) = watermark::config_get(&pool).await else {
-        return;
-    };
-    if config.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
-        return;
-    }
-    let size = config
-        .get("size")
-        .and_then(Value::as_i64)
-        .unwrap_or(20)
-        .clamp(1, 200) as u32;
-    let position = config
-        .get("position")
-        .and_then(Value::as_i64)
-        .unwrap_or(9);
-    let opacity = config
-        .get("opacity")
-        .and_then(Value::as_i64)
-        .unwrap_or(100)
-        .clamp(0, 100) as u8;
-    let min_size = config
-        .get("min_size")
-        .and_then(Value::as_i64)
-        .unwrap_or(400)
-        .max(1) as u32;
-
-    let image_path = config
-        .get("image_path")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let Ok(mark_bytes) = tokio::fs::read(public_dir.join(image_path.trim_start_matches('/'))).await
-    else {
-        return;
-    };
-    let Ok(mark_source) = crate::models::titleimage::image_ops::decode(&mark_bytes) else {
         return;
     };
 
@@ -12417,35 +12828,9 @@ async fn generate_all_watermarks(pool: sqlx::mysql::MySqlPool, public_dir: std::
             if !crate::models::titleimage::image_ops::supports_extension(&ext) {
                 continue;
             }
-            let Ok(bytes) = tokio::fs::read(public_dir.join(&location)).await else {
-                continue;
-            };
-            let Ok(mut image) = crate::models::titleimage::image_ops::decode(&bytes) else {
-                continue;
-            };
-            if image.width < min_size && image.height < min_size {
-                continue;
-            }
-
-            let max_width = (image.width * size / 100).max(1);
-            let max_height = (image.height * size / 100).max(1);
-            let mark = crate::models::titleimage::image_ops::resize_fit(
-                &mark_source, max_width, max_height,
-            );
-            let edge = (image.width / 15).min(50);
-            let (x, y) = watermark_position(
-                position,
-                image.width,
-                image.height,
-                mark.width,
-                mark.height,
-                edge,
-            );
-            image.composite(&mark, x, y, opacity);
-            let Ok(encoded) = crate::models::titleimage::image_ops::encode(&image, &ext) else {
-                continue;
-            };
-            if tokio::fs::write(public_dir.join(&location), encoded)
+            // 小于最小尺寸、素材缺失、格式不支持都会返回 Err：跳过且**不标记**，
+            // 这样修好配置后还能再处理到它。
+            if watermark::apply_file(&public_dir, &location, &config)
                 .await
                 .is_err()
             {
@@ -12474,21 +12859,43 @@ async fn manage_watermark_generate(State(state): State<AppState>, headers: Heade
     if !config.get("open").and_then(Value::as_bool).unwrap_or(false) {
         return ok_msg("水印插件未开启");
     }
-    if config.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
-        return fail("当前图片引擎暂只支持图片水印（PNG/BMP）批量处理");
-    }
-    let image_path = config
-        .get("image_path")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+
+    // 先把「素材是否可用」验在前面：批量是后台任务，报错只能靠这一步拦住。
     let public_dir = state.with_config(|config| config.public_dir());
-    let Ok(mark_bytes) = tokio::fs::read(public_dir.join(image_path.trim_start_matches('/'))).await
-    else {
-        return fail("水印图片未配置或无法读取");
-    };
-    if crate::models::titleimage::image_ops::decode(&mark_bytes).is_err() {
-        return fail("水印图片格式不受支持（当前引擎支持 PNG/BMP）");
+    if config.get("type").and_then(Value::as_i64).unwrap_or(0) == 0 {
+        let image_path = config
+            .get("image_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Ok(mark_bytes) = tokio::fs::read(public_dir.join(image_path.trim_start_matches('/'))).await
+        else {
+            return fail("水印图片未配置或无法读取");
+        };
+        if crate::models::titleimage::image_ops::decode(&mark_bytes).is_err() {
+            return fail("水印图片格式不受支持（当前引擎支持 PNG / JPEG / BMP）");
+        }
+    } else {
+        if config
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return fail("水印文字未配置");
+        }
+        let font_path = config
+            .get("font_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Ok(font_bytes) = tokio::fs::read(public_dir.join(font_path.trim_start_matches('/'))).await
+        else {
+            return fail("水印字体未配置或无法读取");
+        };
+        if let Err(err) = watermark::font::Face::parse(&font_bytes) {
+            return fail(err);
+        }
     }
+
     let pool = pool.clone();
     tokio::spawn(async move {
         generate_all_watermarks(pool, public_dir).await;
@@ -12571,7 +12978,7 @@ async fn manage_limiter_setting_save(
 
 /// `GET /system/api/plugin/limiter/blockedips`
 ///
-/// 返回进程内封禁列表（`{ip, block_time}`，对齐 Go `GetBlockIPs`）。
+/// 返回进程内封禁列表（`{ip, block_time}`，按 `GetBlockIPs` 的语义）。
 async fn manage_limiter_blocked(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -12997,7 +13404,7 @@ fn html_cache_root(state: &AppState) -> std::path::PathBuf {
     plugin::html_cache_root(&state.with_config(|config| config.cache_dir()))
 }
 
-/// 把站点内链接转成缓存文件相对路径，等价 Go 的 `transToLocalPath`。
+/// 把站点内链接转成缓存文件相对路径，等价于既有的 `transToLocalPath`。
 fn html_cache_local_path(link: &str) -> String {
     plugin::html_cache_local_path(link)
 }
@@ -14102,7 +14509,7 @@ async fn manage_aigenerate_setting_save(
 
 /// `GET /system/api/aigenerate/checkapi`
 ///
-/// 对齐 Go `CheckOpenAIAPIValid`：请求配置的 OpenAI 接口地址，
+/// 按 `CheckOpenAIAPIValid` 的语义：请求配置的 OpenAI 接口地址，
 /// 只要能拿到 HTTP 响应就算可达（401 等鉴权失败也算网络通）。
 /// 未配置接口地址时直接提示去配置，不再默认请求 OpenAI。
 async fn manage_aigenerate_checkapi(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -14125,7 +14532,8 @@ async fn manage_aigenerate_checkapi(State(state): State<AppState>, headers: Head
         Ok(_) => ok_msg("服务器可以正常访问 AI 接口"),
         Err(err) => {
             tracing::warn!("检测 AI 接口失败（{link}）：{err:#}");
-            let detail = anqi_short_text(&format!("{err:#}"), 120);
+            // 只回前 120 个字符，避免把整段多层错误链塞给前端
+            let detail: String = format!("{err:#}").chars().take(120).collect();
             fail(format!("已配置 AI 接口但无法访问：{detail}"))
         }
     }
@@ -14139,7 +14547,7 @@ async fn manage_aigenerate_plans(State(state): State<AppState>, headers: HeaderM
     ok(json!([]))
 }
 
-/// AI 写作请求体（对齐 Go `request.KeywordRequest` 的 `id` / `title`）。
+/// AI 写作请求体（按 `KeywordRequest` 的语义，取 `id` / `title`）。
 #[derive(Debug, Deserialize, Default)]
 struct AiGenerateKeywordBody {
     #[serde(default)]
@@ -14157,7 +14565,7 @@ async fn ai_generate_config(pool: &sqlx::MySqlPool) -> Value {
 }
 
 /// 解析该关键词要写入的分类：关键词自带分类 → 配置的 `category_id` →
-/// 配置的 `category_ids` 首个 → 第一个内容列表分类（对齐 Go 兜底逻辑）。
+/// 配置的 `category_ids` 首个 → 第一个内容列表分类（按既有兜底逻辑）。
 async fn ai_generate_category(
     pool: &sqlx::MySqlPool,
     config: &Value,
@@ -14189,8 +14597,8 @@ async fn ai_generate_category(
     fallback.ok_or_else(|| "请先在 AI 写作配置里选择文档分类".to_string())
 }
 
-/// 生成单个关键词的文章并落库（对齐 Go `AnqiAiGenerateArticle` +
-/// `AnqiSyncAiPlanResult`）：云端 `/ai/generate` 异步提交，之后每 10 秒
+/// 生成单个关键词的文章并落库（按 `CloudAiGenerateArticle` 的语义 +
+/// `CloudSyncAiPlanResult`）：云端 `/ai/generate` 异步提交，之后每 10 秒
 /// `/ai/syncplan` 轮询一次，最多 30 次（5 分钟）。
 ///
 /// 返回 `Ok(None)` 表示同名文档已存在（视为已生成过，跳过）。
@@ -14209,7 +14617,7 @@ async fn ai_generate_article_for_keyword(
         "demand": demand,
         "async": true,
     });
-    let result = anqi_cloud_post(pool, "/ai/generate", &payload)
+    let result = cloud_cloud_post(pool, "/ai/generate", &payload)
         .await?
         .get("data")
         .cloned()
@@ -14218,7 +14626,7 @@ async fn ai_generate_article_for_keyword(
     if req_id <= 0 {
         return Err("云端未返回任务编号（req_id）".to_string());
     }
-    let result = anqi_ai_wait_plan(pool, req_id, result).await?;
+    let result = cloud_ai_wait_plan(pool, req_id, result).await?;
 
     let title = result
         .get("title")
@@ -14266,7 +14674,7 @@ async fn manage_aigenerate_article_collect(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = ensure_anqi_bound(pool).await {
+    if let Err(msg) = ensure_cloud_bound(pool).await {
         return fail(msg);
     }
     let keyword = if !body.title.trim().is_empty() {
@@ -14319,7 +14727,7 @@ async fn manage_aigenerate_article_start(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = ensure_anqi_bound(pool).await {
+    if let Err(msg) = ensure_cloud_bound(pool).await {
         return fail(msg);
     }
     let pool = pool.clone();
@@ -14655,7 +15063,7 @@ async fn push_to_search_engines(
 
 /// 用服务账号 JWT 换 Google OAuth token，并逐条调用 Indexing API。
 ///
-/// 对齐 Go `PushGoogleIndexing`：请求体只有 `url` + `type: URL_UPDATED`，
+/// 按 `PushGoogleIndexing` 的语义：请求体只有 `url` + `type: URL_UPDATED`，
 /// 响应只记录状态码与原始 body；任一成功即视为部分成功。
 async fn google_push_urls(
     google_json: &str,
@@ -15610,9 +16018,9 @@ struct RetailerListQuery {
 
 /// `GET /system/api/plugin/retailer/list`
 ///
-/// Go 版 `PluginGetRetailers`：`become_retailer = 1`（自动成为分销员）时只列
-/// `is_retailer = 1` 的会员；注意 Go 版 real_name 筛选误读了 `user_name`
-/// 参数（`realName := ctx.URLParam("user_name")`），这里保持一致。
+/// 既有实现 `PluginGetRetailers`：`become_retailer = 1`（自动成为分销员）时只列
+/// `is_retailer = 1` 的会员；注意既有实现的 real_name 筛选误读了 `user_name`
+/// 参数（按 `user_name` 取值），这里保持一致。
 async fn manage_retailer_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15824,7 +16232,7 @@ async fn manage_commission_detail(
 
 /// `GET /system/api/plugin/pay/accounts`
 ///
-/// Go 版 `PluginGetPaymentAccounts`：全部支付账户，`id desc`。
+/// 既有实现 `PluginGetPaymentAccounts`：全部支付账户，`id desc`。
 async fn manage_pay_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -15862,7 +16270,7 @@ async fn manage_pay_detail(
 
 /// `POST /system/api/plugin/pay/detail`
 ///
-/// Go 版 `PluginSavePaymentAccount`：新增或更新支付账户（pay_config 整体覆盖）。
+/// 既有实现 `PluginSavePaymentAccount`：新增或更新支付账户（pay_config 整体覆盖）。
 async fn manage_pay_save(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15921,7 +16329,7 @@ async fn manage_pay_delete(
 
 /// `POST /system/api/plugin/pay/upload`（multipart：`name` + `file`）
 ///
-/// Go 版 `PluginPayUploadFile`：支付证书落 `<data>/cert/<md5>.pem`。
+/// 既有实现 `PluginPayUploadFile`：支付证书落 `<data>/cert/<md5>.pem`。
 async fn manage_pay_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15969,7 +16377,7 @@ async fn manage_pay_upload(
     if let Err(err) = tokio::fs::create_dir_all(&cert_dir).await {
         return failed(err.into());
     }
-    // 与 Go 一致：按内容 md5 命名，后缀固定 .pem
+    // 与既有接口契约一致：按内容 md5 命名，后缀固定 .pem
     let file_name = format!("{}.pem", attachment::md5_hex(&bytes));
     if let Err(err) = tokio::fs::write(cert_dir.join(&file_name), &bytes).await {
         return failed(err.into());
@@ -16145,7 +16553,7 @@ struct WithdrawApplyBody {
 
 /// `POST /system/api/plugin/withdraw/apply`
 ///
-/// Go 版 `PluginWithdrawSetApply`：为分销员申请提现（汇总待提现佣金）。
+/// 既有实现 `PluginWithdrawSetApply`：为分销员申请提现（汇总待提现佣金）。
 async fn manage_withdraw_apply(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16183,7 +16591,7 @@ async fn manage_withdraw_apply(
 
 /// `GET /system/api/plugin/sendmail/list`
 ///
-/// Go 版 `PluginSendmailList`：`<cache>/mail.log` 的 JSON 行，倒序分页。
+/// 既有实现 `PluginSendmailList`：`<cache>/mail.log` 的 JSON 行，倒序分页。
 async fn manage_sendmail_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16209,7 +16617,7 @@ async fn manage_sendmail_list(
 
 /// `GET /system/api/plugin/sendmail/setting`
 ///
-/// 授权码非空时以 `********` 掩码返回（Go `SendmailPasswordMask`）。
+/// 授权码非空时以 `********` 掩码返回（`SendmailPasswordMask` 的语义）。
 async fn manage_sendmail_setting(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
@@ -16225,7 +16633,7 @@ async fn manage_sendmail_setting(State(state): State<AppState>, headers: HeaderM
 
 /// `POST /system/api/plugin/sendmail/setting`
 ///
-/// 逐字段覆盖；授权码等于掩码时沿用原值（Go `PluginSendmailSettingForm`）。
+/// 逐字段覆盖；授权码等于掩码时沿用原值（`PluginSendmailSettingForm` 的语义）。
 async fn manage_sendmail_setting_save(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16316,7 +16724,7 @@ async fn manage_sendmail_template_save(
     }
 }
 
-/// 组装模板预览的渲染数据（Go `PluginSendmailTemplatePreview` 的 data 常量）。
+/// 组装模板预览的渲染数据（`PluginSendmailTemplatePreview` 的 data 常量）。
 async fn preview_data(pool: &sqlx::MySqlPool) -> Value {
     let site_name = site_setting::get_section(pool, "system")
         .await
@@ -16357,7 +16765,7 @@ async fn preview_data(pool: &sqlx::MySqlPool) -> Value {
 
 /// `POST /system/api/plugin/sendmail/template/preview`
 ///
-/// 只传 key、没传 content 时，用库里的模板补全后再渲染（对齐 Go 版）。
+/// 只传 key、没传 content 时，用库里的模板补全后再渲染（与既有约定一致）。
 async fn manage_sendmail_template_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16530,7 +16938,7 @@ async fn manage_backup_list(State(state): State<AppState>, headers: HeaderMap) -
 
 /// `POST /system/api/plugin/backup/dump`
 ///
-/// 异步执行备份（无 zip 依赖，产出纯 SQL 文件），立即返回（Go 版同样异步）。
+/// 异步执行备份（无 zip 依赖，产出纯 SQL 文件），立即返回（既有实现同样异步）。
 async fn manage_backup_dump(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16580,7 +16988,7 @@ async fn manage_backup_status(State(state): State<AppState>, headers: HeaderMap)
 
 /// `POST /system/api/plugin/backup/restore`
 ///
-/// 异步执行恢复；`.zip` 备份明确未实现。Go 版恢复后会重载配置并重启，
+/// 异步执行恢复；`.zip` 备份明确未实现。既有实现恢复后会重载配置并重启，
 /// 本项目为单进程，不自动重启（模板引擎需重启进程后生效）。
 async fn manage_backup_restore(
     State(state): State<AppState>,
@@ -16649,7 +17057,7 @@ struct BackupNameQuery {
 
 /// `GET /system/api/plugin/backup/export?name=`
 ///
-/// 把备份文件作为附件返回（浏览器下载；Go 版允许 query 传 token，
+/// 把备份文件作为附件返回（浏览器下载；既有实现允许 query 传 token，
 /// 这里仍走 `require_admin`）。
 async fn manage_backup_export(
     State(state): State<AppState>,
@@ -16697,7 +17105,7 @@ async fn manage_backup_export(
 
 /// `POST /system/api/plugin/backup/import`（multipart：`file`）
 ///
-/// 只收单文件上传；Go 版的分片上传（chunks/chunk/md5）字段读掉但不支持。
+/// 只收单文件上传；既有的分片上传（chunks/chunk/md5）字段读掉但不支持。
 async fn manage_backup_import(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16836,6 +17244,10 @@ async fn manage_backup_remark(
 }
 
 /// 便于测试：数据库可用时把连接池塞进状态。
+///
+/// 返回 `None` 表示「没有可用的库」——所有调用点都是 `let Some(app) = ... else { return }`，
+/// 于是连库用例在受限环境下自动跳过（约定见 `docs/coverage-plan.md`：`test_pool` 为
+/// `None` 即跳过，`cargo test` 不能红）。缺库却硬跑只会拿到「数据库未配置」，断言必红。
 #[cfg(test)]
 async fn test_app() -> Option<Router> {
     test_app_with_token(None).await
@@ -16843,10 +17255,11 @@ async fn test_app() -> Option<Router> {
 
 #[cfg(test)]
 async fn test_app_with_token(token: Option<&str>) -> Option<Router> {
-    let pool = crate::models::test_pool().await;
+    // 这些路由用例的数据全部来自真实库（首页区块、分类、归档、后台令牌），
+    // 没库时接口统一回「数据库未配置」，因此直接判定为跳过。
+    let pool = crate::models::test_pool().await?;
     // 测试进程的 CWD 不一定是 crate 根，模板目录用 manifest 相对路径固定下来
-    let template_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../template/default")
+    let template_dir = crate::models::test_template_dir()
         .to_string_lossy()
         .to_string();
     // 上传类用例把文件写到临时目录，绝不碰仓库里的 public/uploads
@@ -16865,7 +17278,7 @@ async fn test_app_with_token(token: Option<&str>) -> Option<Router> {
         path: Some(config_path),
         ..Default::default()
     };
-    Some(router(AppState::new(config, pool)))
+    Some(router(AppState::new(config, Some(pool))))
 }
 
 #[cfg(test)]
@@ -17419,7 +17832,7 @@ mod tests {
         let body = body_json(res).await;
         assert_eq!(body["code"], 0, "{body}");
         assert_eq!(body["data"]["admin"]["user_name"], user_name);
-        // 1 号用户组即超管（Go 版 IsSuper）
+        // 1 号用户组即超管（既有实现 IsSuper）
         assert_eq!(body["data"]["admin"]["is_super"], true, "{body}");
 
         let ok_logs: i64 = sqlx::query_scalar(
@@ -17552,7 +17965,7 @@ mod tests {
         let body = body_json(res).await;
         assert_eq!(body["msg"], "账号不能为空", "{body}");
 
-        // 不带旧密码也能改密（Go 版就是这样：后台已登录即可重置）
+        // 不带旧密码也能改密（既有实现就是这样：后台已登录即可重置）
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -18273,7 +18686,7 @@ mod tests {
             json!(["archive/list", "archive/detail"]),
             "{body}"
         );
-        // 保存时状态恒为启用（与 Go 版一致）
+        // 保存时状态恒为启用（与既有接口契约一致）
         assert_eq!(body["data"]["status"], 1, "{body}");
 
         // 更新
@@ -18643,7 +19056,7 @@ mod tests {
             let menus = group["menus"].as_array().unwrap();
             assert!(!menus.is_empty(), "分组没有菜单项：{group}");
             for menu in menus {
-                // Go 数据里「多站点」分组的菜单项 group_key 就是 `tool`，不校验两者一致
+                // 既有实现数据里「多站点」分组的菜单项 group_key 就是 `tool`，不校验两者一致
                 assert!(
                     menu["group_key"].as_str().is_some_and(|value| !value.is_empty()),
                     "{menu}"
@@ -18797,7 +19210,8 @@ mod tests {
         assert!(html.contains("<!DOCTYPE html>"), "首页没走模板");
         assert!(!html.contains("{%"), "首页残留模板标签");
         assert!(!html.contains("{{"), "首页残留变量占位");
-        assert!(html.contains("ind-pro"), "首页区块缺失");
+        // 当前默认模板首页是 `fs-hero` 版式（旧模板的 `ind-pro` 区块已下线）
+        assert!(html.contains("fs-hero"), "首页区块缺失");
 
         // 模块列表 /news/
         let res = app.clone().oneshot(request("GET", "/news/")).await.unwrap();
@@ -22585,7 +22999,7 @@ mod tests {
         assert_eq!(body["data"]["height"], 600, "{body}");
         assert_eq!(body["data"]["open"], true, "{body}");
 
-        // 预览：返回可直接查看的 SVG data URI
+        // 预览：有字体时出位图 PNG（与既有接口契约一致），一个字体都没有才退回 SVG
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -22598,13 +23012,20 @@ mod tests {
             .unwrap();
         let body = body_json(res).await;
         assert_eq!(body["code"], 0, "{body}");
+        let preview = body["data"].as_str().unwrap_or("");
         assert!(
-            body["data"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("data:image/svg+xml;base64,"),
+            preview.starts_with("data:image/png;base64,")
+                || preview.starts_with("data:image/svg+xml;base64,"),
             "{body}"
         );
+        // 走位图管线时顺带校验 PNG 魔数（`iVBORw0KGgo` 是 89 50 4E 47 0D 0A 1A 0A 的 base64 开头）
+        if let Some(encoded) = preview.strip_prefix("data:image/png;base64,") {
+            assert!(
+                encoded.starts_with("iVBORw0KGgo"),
+                "预览不是合法 PNG：{:.24}",
+                encoded
+            );
+        }
 
         let res = app
             .clone()
@@ -26570,7 +26991,7 @@ mod tests {
         assert_eq!(body["data"]["file_status"], true, "{body}");
         assert!(body["data"]["last_update"].as_i64().unwrap() > 0, "{body}");
 
-        // 构建刚结束：status 还挂着「已完成」状态（与 Go 内存状态一致）
+        // 构建刚结束：status 还挂着「已完成」状态（与既有接口契约一致）
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -26609,7 +27030,7 @@ mod tests {
     // ---------------------------- 云端服务账号 ----------------------------
 
     #[tokio::test]
-    async fn anqi_info_unimplemented_writes_and_validations() {
+    async fn cloud_info_login_and_validation() {
         let _guard = crate::models::db_lock().await;
         let Some(pool) = crate::models::test_pool().await else {
             return;
@@ -26617,10 +27038,10 @@ mod tests {
         let Some(app) = test_app().await else {
             return;
         };
-        seed_temp_admin(&pool, 990002, "rustcms_anqi_admin", "anqi-pass-123").await;
-        let token = login_admin(&app, "10.13.13.1", "rustcms_anqi_admin", "anqi-pass-123").await;
+        seed_temp_admin(&pool, 990002, "rustcms_cloud_admin", "cloud-pass-123").await;
+        let token = login_admin(&app, "10.13.13.1", "rustcms_cloud_admin", "cloud-pass-123").await;
 
-        let anqi_backup = crate::models::setting::get_raw(&pool, "anqi").await.unwrap();
+        let cloud_backup = crate::models::setting::get_raw(&pool, "anqi").await.unwrap();
         crate::models::setting::remove(&pool, "anqi").await.unwrap();
 
         // 未登录
@@ -26670,36 +27091,30 @@ mod tests {
         assert_eq!(body["data"]["user_name"], "tester");
         assert_eq!(body["data"]["valid"], false);
 
-        // 登录：空参 / 正常参数都明确未实现（外呼）
-        let res = app
-            .clone()
-            .oneshot(bearer_request(
-                "POST",
-                "/system/api/anqi/login",
-                &token,
-                json!({"user_name": "", "password": ""}),
-            ))
-            .await
-            .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["code"], -1, "{body}");
-        assert!(body["msg"].as_str().unwrap().contains("请输入"), "{body}");
+        // 登录：缺账号 / 缺密码都在本地拦下（不发任何云端请求）
+        for payload in [
+            json!({"user_name": "", "password": ""}),
+            json!({"user_name": "  ", "password": "p"}),
+            json!({"user_name": "u", "password": ""}),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(bearer_request(
+                    "POST",
+                    "/system/api/anqi/login",
+                    &token,
+                    payload.clone(),
+                ))
+                .await
+                .unwrap();
+            let body = body_json(res).await;
+            assert_eq!(body["code"], -1, "{payload}：{body}");
+            assert_eq!(body["msg"], "请输入云端服务账号和密码", "{payload}：{body}");
+        }
+        // 账号密码齐全时会真的外呼云端（auth.本项目.com）：测试不连真网，
+        // 该分支由 `cloud::parse_envelope` / `api_base_from` / `cloud_translate` 的纯逻辑用例覆盖。
 
-        let res = app
-            .clone()
-            .oneshot(bearer_request(
-                "POST",
-                "/system/api/anqi/login",
-                &token,
-                json!({"user_name": "u", "password": "p"}),
-            ))
-            .await
-            .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["code"], -1, "{body}");
-        assert!(body["msg"].as_str().unwrap().contains("尚未实现"), "{body}");
-
-        // restart / extract：明确未实现
+        // restart：测试构建里必须直接拒绝，绝不能在用例里拉起进程再 `exit(0)`
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -26710,7 +27125,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_json(res).await["code"], -1);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], -1, "{body}");
+        assert!(body["msg"].as_str().unwrap().contains("测试环境"), "{body}");
 
         let res = app
             .clone()
@@ -26756,7 +27173,7 @@ mod tests {
         assert_eq!(body["code"], -1, "{body}");
         assert!(body["msg"].as_str().unwrap().contains("to_language"), "{body}");
 
-        // stream/data：无任务时与 Go 未知 stream_id 行为一致
+        // stream/data：无任务时与既有接口契约一致
         let res = app
             .clone()
             .oneshot(bearer_request(
@@ -26772,7 +27189,7 @@ mod tests {
         assert_eq!(body["msg"], "finished");
         assert_eq!(body["data"], "");
 
-        match anqi_backup {
+        match cloud_backup {
             Some(raw) => crate::models::setting::save_raw(&pool, "anqi", &raw).await.unwrap(),
             None => crate::models::setting::remove(&pool, "anqi").await.unwrap(),
         }
@@ -26793,7 +27210,7 @@ mod tests {
         seed_temp_admin(&pool, 990002, "rustcms_ai_admin", "ai-pass-123").await;
         let token = login_admin(&app, "10.13.13.1", "rustcms_ai_admin", "ai-pass-123").await;
 
-        // ai_agents / ai_chat_messages 表由 Go 建，不存在时相关断言降级
+        // ai_agents / ai_chat_messages 表由既有实现建，不存在时相关断言降级
         async fn table_exists(pool: &sqlx::MySqlPool, name: &str) -> bool {
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM information_schema.tables \
@@ -26979,7 +27396,7 @@ mod tests {
             assert_eq!(body["code"], -1, "{uri}：{body}");
         }
 
-        // confirm：参数校验与 Go 一致
+        // confirm：参数校验与既有接口契约一致
         let res = app
             .clone()
             .oneshot(bearer_request(

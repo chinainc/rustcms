@@ -1,6 +1,6 @@
 //! 模板引擎（类 Django 模板语法）。
 //!
-//! 覆盖 Go 版 `view.DjangoEngine`（pongo2 + 自定义标签）里最常用的语法：
+//! 覆盖类 Django 模板语法里最常用的部分：
 //!
 //! - `{{ expr }}`，支持 `a.b.c`、函数调用、`|escape` 之类的过滤器
 //! - `{% if %}` / `{% else %}` / `{% elif %}` / `{% endif %}`
@@ -8,7 +8,7 @@
 //! - `{% extends 'base.html' %}` + `{% block name %}`（子模板覆盖父模板）
 //! - `{% include "partial/x.html" %}`
 //! - 自定义标签：`{% archiveList articles with ... %}…{% endarchiveList %}`（块标签）
-//!   与 `{% categoryDetail with name="Title" %}`（行内标签）
+//! 与 `{% categoryDetail with name="Title" %}`（行内标签）
 //! - `{%-` / `-%}` 空白裁剪、`{# 注释 #}`
 //!
 //! 标签的数据由 [`Provider`] 提供，这样模板层不需要知道数据库。
@@ -307,8 +307,8 @@ fn apply_filter(value: Value, name: &str, _args: &[Value]) -> Value {
     }
 }
 
-/// Go 的时间格式串（`2006-01-02 15:04:05`）转 chrono 的 strftime。
-fn go_layout_to_chrono(layout: &str) -> String {
+/// 把 `2006-01-02 15:04:05` 这类参考格式串转成 chrono 的 strftime。
+pub(crate) fn go_layout_to_chrono(layout: &str) -> String {
     layout
         .replace("2006", "%Y")
         .replace("01", "%m")
@@ -442,7 +442,7 @@ impl<'a> ExprParser<'a> {
                     self.eat(",");
                 }
             } else if self.eat(":") {
-                // pongo2 风格：`{{ x|default:'/search' }}`
+                // 模板过滤器风格：`{{ x|default:'/search' }}`
                 args.push(self.parse_primary()?);
             }
             expr = Expr::Filter(Box::new(expr), name, args);
@@ -950,7 +950,7 @@ impl Engine {
                     }
                     Node::For { var, iter, body } => {
                         let items = iter.eval(scope);
-                        // pongo2 允许直接遍历字符串（按字符逐个迭代）
+                        // 模板允许直接遍历字符串（按字符逐个迭代）
                         let list: Vec<Value> = match items {
                             Value::Array(items) => items,
                             Value::Object(map) => map.values().cloned().collect(),
@@ -964,7 +964,7 @@ impl Engine {
                         for (index, item) in list.into_iter().enumerate() {
                             let mut nested = scope.clone();
                             nested.insert(var.clone(), item);
-                            // pongo2 的 forloop 对象：Counter/First/Last
+                            // forloop 对象：Counter/First/Last
                             let mut info = Map::new();
                             info.insert("Counter".into(), Value::from(index + 1));
                             info.insert("First".into(), Value::Bool(index == 0));

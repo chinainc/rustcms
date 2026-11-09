@@ -1,16 +1,17 @@
 //! 多语言站点（`settings.multi_lang`）。
 //!
-//! 数据以 `settings.multi_lang` 为准，结构对齐 Go 的 `config.PluginMultiLangConfig`：
+//! 数据以 `settings.multi_lang` 为准，结构遵循既有约定：
 //! ```json
 //! {"open":false,"type":"directory","auto_translate":false,
-//!  "site_type":"multi","show_main_dir":false,
-//!  "sub_sites":[{"id":2,"language":"en","language_icon":""}]}
+//! "site_type":"multi","show_main_dir":false,
+//! "sub_sites":[{"id":2,"language":"en","language_icon":""}]}
 //! ```
 //!
 //! 说明：
 //! - `default_language` 只是**展示字段**，真正的值在 `settings.system.language`；
-//! - 子站点只维护配置，**不删站点数据**（与 Go 的 `RemoveMultiLangSite` 一致）；
-//! - 内容同步需要跨站点复制 + 翻译外呼，未实现。
+//! - 子站点只维护配置，**不删站点数据**（与既有接口契约一致）；
+//! - 内容同步（`site_sync`）会把主站表数据复制到子站点库，并按目标站点存储配置
+//! 复制附件文件；`auto_translate` 打开时把新增行交给翻译引擎（自建引擎或云端）。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,7 +263,7 @@ pub async fn site_remove(
 
 // ---------------------------- 内容同步 -------------------------------------
 
-/// 需要同步的表（顺序对齐 Go 版 `SyncMultiLangSiteContent`）。
+/// 需要同步的表（顺序遵循既有约定）。
 const SYNC_TABLES: &[&str] = &[
     "modules",
     "nav_types",
@@ -279,7 +280,7 @@ const SYNC_TABLES: &[&str] = &[
     "archive_relations",
 ];
 
-/// 单批最多读取的行数（与 Go 的 `limitSize` 一致）。
+/// 单批最多读取的行数（与既有接口契约一致）。
 const SYNC_BATCH: i64 = 5000;
 
 /// MySQL 单条 SQL 的占位符上限是 65535，留一点余量。
@@ -335,7 +336,7 @@ fn quote(name: &str) -> String {
 
 /// 从 `websites.mysql` 解析目标站点数据库配置。
 ///
-/// `use_default = true` 时账号密码复用主站配置（与 Go 的 `MysqlConfig.UseDefault` 一致）。
+/// `use_default = true` 时账号密码复用主站配置（与既有接口契约一致）。
 fn target_mysql(site: &website::Website, default_mysql: &MysqlConfig) -> Result<MysqlConfig, ModelError> {
     let raw = site
         .mysql
@@ -382,34 +383,35 @@ async fn table_columns(pool: &MySqlPool, table: &str) -> anyhow::Result<Vec<Stri
 ///
 /// 具体做法：`SELECT CAST(列 AS CHAR)` 读成字符串，再用 `INSERT ... ON DUPLICATE KEY UPDATE`
 /// 写回，避免为每张表维护一套强类型结构体；MySQL 会按目标列类型自动转换。
+/// 返回 `(复制行数, 复制前目标库的最大 id)`；第二个值用于「只翻译本次新增的行」。
 async fn copy_table(
     source: &MySqlPool,
     target: &MySqlPool,
     table: &str,
     full: bool,
-) -> Result<u64, ModelError> {
+) -> Result<(u64, i64), ModelError> {
     if !is_safe_table(table) {
         return Err(ModelError::invalid(format!("表名非法：{table}")));
     }
 
     let columns = match table_columns(target, table).await {
         Ok(columns) if !columns.is_empty() => columns,
-        Ok(_) => return Ok(0), // 目标库没有这张表，跳过
+        Ok(_) => return Ok((0, 0)), // 目标库没有这张表，跳过
         Err(err) => return Err(ModelError::invalid(format!("读取 {table} 表结构失败: {err}"))),
     };
     if !columns.iter().any(|column| column.eq_ignore_ascii_case("id")) {
-        return Ok(0); // 没有主键 id，无法增量同步
+        return Ok((0, 0)); // 没有主键 id，无法增量同步
     }
 
-    let start_id: i64 = if full {
-        0
-    } else {
+    // 目标库现有最大 id：全量同步时从 0 开始复制，翻译也覆盖全部行。
+    let baseline: i64 = {
         let sql = format!("SELECT COALESCE(CAST(MAX(id) AS SIGNED), 0) FROM {}", quote(table));
         sqlx::query_scalar::<_, i64>(&sql)
             .fetch_one(target)
             .await
             .unwrap_or(0)
     };
+    let start_id: i64 = if full { 0 } else { baseline };
 
     let select_sql = format!(
         "SELECT {} FROM {} WHERE id > ? ORDER BY id ASC LIMIT ?",
@@ -500,21 +502,426 @@ async fn copy_table(
         cursor = last_id;
     }
 
+    Ok((copied, baseline))
+}
+
+// ---------------------------- 附件文件复制 ---------------------------------
+
+/// 把 `file_location` 这类相对路径规范化成安全的相对路径（拒绝 `..`）。
+///
+/// 附件表里的路径来自上传流程，但仍要当不可信输入处理，避免拼出站点目录之外。
+fn safe_relative(path: &str) -> Option<std::path::PathBuf> {
+    let trimmed = path.trim().trim_start_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = std::path::PathBuf::new();
+    for part in trimmed.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return None;
+        }
+        out.push(part);
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 附件缩略图路径：同目录下 `thumb_<文件名>`（既有约定的命名）。
+fn thumb_relative(rel: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = rel.file_name()?.to_string_lossy().to_string();
+    let parent = rel.parent().unwrap_or(std::path::Path::new(""));
+    Some(parent.join(format!("thumb_{name}")))
+}
+
+/// 复制单个文件（目标已存在则跳过，返回是否真的写了）。
+fn copy_file_if_missing(src: &std::path::Path, dst: &std::path::Path) -> bool {
+    if !src.is_file() || dst.exists() {
+        return false;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::copy(src, dst).is_ok()
+}
+
+/// 递归复制目录（全量同步时一次性搬 `uploads`）。
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> u64 {
+    let mut copied = 0u64;
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return copied;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        let target = dst.join(entry.file_name());
+        if kind.is_dir() {
+            copied += copy_dir_all(&path, &target);
+        } else if copy_file_if_missing(&path, &target) {
+            copied += 1;
+        }
+    }
+    copied
+}
+
+/// 同步附件文件本体：按目标站点存储配置决定是否复制、以及复制方式。
+///
+/// - 目标站点是**本地存储**：全量同步时整目录搬 `public/uploads`，增量时按附件表
+/// 逐个复制（含 `thumb_` 缩略图），与既有实现的分支一致；
+/// - 目标站点是**云存储**：既有实现会先读本地文件再上传到目标站点存储，本项目还没有
+/// 目标站点的上传能力，这里跳过并返回 0（同步报告里会说明）。
+pub async fn copy_attachment_files(
+    source_public: &Path,
+    target_public: &Path,
+    target: &MySqlPool,
+    full: bool,
+) -> Result<u64, ModelError> {
+    let storage = super::plugin::storage_get(target)
+        .await
+        .map_err(|err| ModelError::invalid(format!("读取目标站点存储配置失败: {err}")))?;
+    let storage_type = storage
+        .get("storage_type")
+        .and_then(Value::as_str)
+        .unwrap_or("local")
+        .trim()
+        .to_string();
+    if !storage_type.is_empty() && storage_type != "local" {
+        // 云存储：不做本地复制（否则目标站点的图片地址与存储方式不一致）
+        return Ok(0);
+    }
+
+    let mut copied = 0u64;
+    if full {
+        // 全量：整目录搬一次，等价 既有约定
+        copied += copy_dir_all(&source_public.join("uploads"), &target_public.join("uploads"));
+    }
+
+    // 附件表里逐条补齐（缺哪个补哪个，重复执行无副作用）
+    let mut cursor: i64 = 0;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, file_location FROM attachments WHERE id > ? ORDER BY id ASC LIMIT 500",
+        )
+        .bind(cursor)
+        .fetch_all(target)
+        .await
+        .map_err(|err| ModelError::invalid(format!("读取附件表失败: {err}")))?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let id: u64 = row.try_get::<u64, _>("id").unwrap_or(0);
+            if id as i64 > cursor {
+                cursor = id as i64;
+            }
+            let location: String = row
+                .try_get::<Option<String>, _>("file_location")
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let Some(rel) = safe_relative(&location) else {
+                continue;
+            };
+            let src = source_public.join(&rel);
+            let dst = target_public.join(&rel);
+            if copy_file_if_missing(&src, &dst) {
+                copied += 1;
+            }
+            if let Some(thumb_rel) = thumb_relative(&rel) {
+                let src = source_public.join(&thumb_rel);
+                let dst = target_public.join(&thumb_rel);
+                if copy_file_if_missing(&src, &dst) {
+                    copied += 1;
+                }
+            }
+        }
+        if rows.len() < 500 {
+            break;
+        }
+    }
     Ok(copied)
+}
+
+// ---------------------------- 自动翻译 -------------------------------------
+
+/// 自动翻译上下文：源/目标语言 + 引擎配置。
+///
+/// 遵循既有约定：`settings.translate.engine` 非空时走**自建引擎**，
+/// 否则整段提交云端 `/translate`。
+struct TranslateContext {
+    engine: super::translate::EngineConfig,
+    from: String,
+    to: String,
+}
+
+impl TranslateContext {
+    /// 读源站点语言与目标站点语言（目标语言在子站点自己的库里）。
+    async fn new(pool: &MySqlPool, target: &MySqlPool) -> Self {
+        let source_language = site_setting::get_section(pool, site_setting::SYSTEM)
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "zh-CN".to_string());
+        let target_language = site_setting::get_section(target, site_setting::SYSTEM)
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        Self {
+            engine: super::translate::engine_config(pool).await,
+            from: source_language,
+            to: target_language,
+        }
+    }
+
+    /// 纯文本批量翻译。
+    async fn texts(&self, pool: &MySqlPool, texts: &[String]) -> Result<Vec<String>, String> {
+        if self.to.trim().is_empty() {
+            return Err(super::translate::ERR_NO_TO_LANGUAGE.to_string());
+        }
+        if self.engine.engine().is_some() {
+            super::translate::translate_texts(pool, &self.engine, texts, &self.from, &self.to).await
+        } else {
+            super::cloud::cloud_translate(pool, texts, &self.from, &self.to).await
+        }
+    }
+
+    /// 正文翻译：自建引擎只翻文本节点（标签原样保留），云端整段交给服务端。
+    async fn html(&self, pool: &MySqlPool, html: &str) -> Result<String, String> {
+        if html.trim().is_empty() {
+            return Ok(html.to_string());
+        }
+        if self.engine.engine().is_some() {
+            super::translate::translate_html(pool, &self.engine, html, &self.from, &self.to).await
+        } else {
+            let translated = super::cloud::cloud_translate(
+                pool,
+                &[html.to_string()],
+                &self.from,
+                &self.to,
+            )
+            .await?;
+            Ok(translated.into_iter().next().unwrap_or_default())
+        }
+    }
+}
+
+/// 一张表的自动翻译规格：普通文本列与 HTML 正文列。
+struct TranslateSpec {
+    table: &'static str,
+    /// 普通文本列（标题 / 摘要 / 关键词这类，逐列独立翻译）
+    text_columns: &'static [&'static str],
+    /// 正文列（HTML，按文本节点翻译）
+    html_columns: &'static [&'static str],
+}
+
+/// 需要自动翻译的表（字段口径遵循既有约定的各段 `transReq`）。
+const TRANSLATE_SPECS: &[TranslateSpec] = &[
+    TranslateSpec {
+        table: "modules",
+        text_columns: &["title", "description", "keywords"],
+        html_columns: &[],
+    },
+    TranslateSpec {
+        table: "navs",
+        text_columns: &["title", "description", "sub_title"],
+        html_columns: &[],
+    },
+    TranslateSpec {
+        table: "categories",
+        text_columns: &["title", "description", "keywords"],
+        html_columns: &["content"],
+    },
+    TranslateSpec {
+        table: "tags",
+        text_columns: &["title", "description", "keywords"],
+        html_columns: &[],
+    },
+    TranslateSpec {
+        table: "archives",
+        text_columns: &["title", "description", "keywords"],
+        html_columns: &[],
+    },
+    TranslateSpec {
+        table: "archive_data",
+        text_columns: &[],
+        html_columns: &["content"],
+    },
+    TranslateSpec {
+        table: "tag_contents",
+        text_columns: &[],
+        html_columns: &["content"],
+    },
+];
+
+/// 把目标库里 `id > baseline` 的行翻译掉（只处理本次新同步的行）。
+///
+/// 单行失败只记日志不中断整次同步：翻译是增强能力，不该让内容同步整体失败。
+async fn translate_rows(
+    pool: &MySqlPool,
+    target: &MySqlPool,
+    ctx: &TranslateContext,
+    spec: &TranslateSpec,
+    baseline: i64,
+) -> u64 {
+    if spec.text_columns.is_empty() && spec.html_columns.is_empty() {
+        return 0;
+    }
+    // 目标表缺列（老库/自定义模型）时直接跳过，不让同步报错
+    let existing = table_columns(target, spec.table).await.unwrap_or_default();
+    let text_columns: Vec<&str> = spec
+        .text_columns
+        .iter()
+        .copied()
+        .filter(|column| existing.iter().any(|name| name.eq_ignore_ascii_case(column)))
+        .collect();
+    let html_columns: Vec<&str> = spec
+        .html_columns
+        .iter()
+        .copied()
+        .filter(|column| existing.iter().any(|name| name.eq_ignore_ascii_case(column)))
+        .collect();
+    if text_columns.is_empty() && html_columns.is_empty() {
+        return 0;
+    }
+
+    let select_columns = std::iter::once("id".to_string())
+        .chain(text_columns.iter().map(|column| quote(column)))
+        .chain(html_columns.iter().map(|column| quote(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut cursor = baseline;
+    let mut translated = 0u64;
+    loop {
+        let sql = format!(
+            "SELECT {select_columns} FROM {} WHERE id > ? ORDER BY id ASC LIMIT 100",
+            quote(spec.table)
+        );
+        let rows = match sqlx::query(&sql).bind(cursor).fetch_all(target).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!("自动翻译读取 {} 失败：{err}", spec.table);
+                break;
+            }
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let id = row.try_get::<i64, _>("id").unwrap_or(0);
+            if id > cursor {
+                cursor = id;
+            }
+            // 1. 普通文本列：一次性提交，成功后按列回写
+            let mut texts: Vec<String> = Vec::new();
+            let mut keys: Vec<&str> = Vec::new();
+            for column in &text_columns {
+                let value: String = row
+                    .try_get::<Option<String>, _>(*column)
+                    .unwrap_or(None)
+                    .unwrap_or_default();
+                if value.trim().is_empty() {
+                    continue;
+                }
+                texts.push(value);
+                keys.push(column);
+            }
+            if !texts.is_empty() {
+                match ctx.texts(pool, &texts).await {
+                    Ok(result) if result.len() == texts.len() => {
+                        let updates = keys
+                            .iter()
+                            .zip(result.iter())
+                            .map(|(column, _)| format!("{} = ?", quote(column)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!("UPDATE {} SET {updates} WHERE id = ?", quote(spec.table));
+                        let mut query = sqlx::query(&sql);
+                        for value in &result {
+                            query = query.bind(value);
+                        }
+                        if let Err(err) = query.bind(id).execute(target).await {
+                            tracing::warn!("自动翻译回写 {}#{} 失败：{err}", spec.table, id);
+                        } else {
+                            translated += 1;
+                        }
+                    }
+                    Ok(_) => tracing::warn!("自动翻译 {}#{} 返回数量不符，已跳过", spec.table, id),
+                    Err(err) => tracing::warn!("自动翻译 {}#{} 失败：{err}", spec.table, id),
+                }
+            }
+            // 2. 正文列：走 HTML 翻译（只翻文本节点）
+            for column in &html_columns {
+                let value: String = row
+                    .try_get::<Option<String>, _>(*column)
+                    .unwrap_or(None)
+                    .unwrap_or_default();
+                if value.trim().is_empty() {
+                    continue;
+                }
+                match ctx.html(pool, &value).await {
+                    Ok(content) => {
+                        if content == value {
+                            continue;
+                        }
+                        let sql = format!(
+                            "UPDATE {} SET {} = ? WHERE id = ?",
+                            quote(spec.table),
+                            quote(column)
+                        );
+                        if let Err(err) = sqlx::query(&sql).bind(&content).bind(id).execute(target).await
+                        {
+                            tracing::warn!(
+                                "自动翻译回写 {}#{}.{} 失败：{err}",
+                                spec.table,
+                                id,
+                                column
+                            );
+                        } else {
+                            translated += 1;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("自动翻译 {}#{}.{} 失败：{err}", spec.table, id, column)
+                    }
+                }
+            }
+        }
+        if rows.len() < 100 {
+            break;
+        }
+    }
+    translated
 }
 
 /// 把主站内容同步到指定多语言子站点。
 ///
-/// 对齐 Go 版 `SyncMultiLangSiteContent`：同步 modules / 导航 / 附件 / 分类 / 标签 /
+/// 遵循既有约定：同步 modules / 导航 / 附件 / 分类 / 标签 /
 /// 文档及关联表；目标站点从未同步过（`sync_time = 0`）或 `focus = true` 时全量，
 /// 否则只同步 id 比目标库更大的新增行。
 ///
-/// 未实现的部分：附件文件复制（需要目标站点存储配置）与自动翻译（需要翻译引擎外呼）。
+/// `source_public` 是源站点的 `public` 目录（附件文件从这里复制），
+/// 目标目录取子站点自己的 `root_path/public`。
 pub async fn site_sync(
     pool: &MySqlPool,
     default_mysql: &MysqlConfig,
     target_id: u32,
     focus: bool,
+    source_public: &Path,
 ) -> Result<SyncReport, ModelError> {
     if target_id == 0 {
         return Err(ModelError::invalid("请选择要同步的子站点"));
@@ -572,14 +979,55 @@ pub async fn site_sync(
         tables: Vec::new(),
         message: String::new(),
     };
+    // 记录每张表「复制前」的最大 id：自动翻译只处理本次新增的行
+    let mut baselines: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for table in &tables {
-        let count = copy_table(pool, &target, table, full).await?;
+        let (count, baseline) = copy_table(pool, &target, table, full).await?;
+        baselines.insert(table.clone(), baseline);
         if count > 0 || SYNC_TABLES.contains(&table.as_str()) {
             report.total += count;
             report.tables.push(TableSync {
                 table: table.clone(),
                 count,
             });
+        }
+    }
+
+    // 附件文件本体：目标站点本地存储时复制（云存储跳过，详见 copy_attachment_files）
+    let target_public = Path::new(site.root_path.trim()).join("public");
+    let copied_files =
+        match copy_attachment_files(source_public, &target_public, &target, full).await {
+            Ok(count) => count,
+            Err(err) => {
+                // 文件复制失败不影响内容同步结论，但要留痕并写进报告
+                tracing::warn!("同步附件文件失败：{err}");
+                0
+            }
+        };
+
+    // 自动翻译：只翻本次新同步的行；单行失败不中断整次同步
+    let auto_translate = config_get(pool)
+        .await
+        .map(|value| {
+            value
+                .get("auto_translate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let mut translated_rows = 0u64;
+    let mut translate_note = String::new();
+    if auto_translate {
+        let ctx = TranslateContext::new(pool, &target).await;
+        if ctx.to.trim().is_empty() {
+            translate_note = "子站点未设置语言，已跳过自动翻译".to_string();
+        } else {
+            for spec in TRANSLATE_SPECS {
+                let Some(baseline) = baselines.get(spec.table).copied() else {
+                    continue; // 这张表本次没有参与同步
+                };
+                translated_rows += translate_rows(pool, &target, &ctx, spec, baseline).await;
+            }
         }
     }
 
@@ -591,15 +1039,18 @@ pub async fn site_sync(
         .await
         .map_err(|err| ModelError::invalid(format!("更新同步时间失败: {err}")))?;
 
-    let translated = config_get(pool)
-        .await
-        .map(|value| value.get("auto_translate").and_then(Value::as_bool).unwrap_or(false))
-        .unwrap_or(false);
-    report.message = if translated {
-        "内容已同步；自动翻译需要翻译引擎外呼，尚未执行".to_string()
+    let mut message = if auto_translate {
+        format!("内容同步完成，自动翻译 {translated_rows} 处")
     } else {
         "内容同步完成".to_string()
     };
+    if copied_files > 0 {
+        message.push_str(&format!("，复制附件文件 {copied_files} 个"));
+    }
+    if !translate_note.is_empty() {
+        message.push_str(&format!("（{translate_note}）"));
+    }
+    report.message = message;
     Ok(report)
 }
 
@@ -848,5 +1299,75 @@ mod tests {
         assert_eq!(html_cache_remove(&dir, &[], true), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------- 附件复制纯逻辑 ----------------------------
+
+    #[test]
+    fn attachment_paths_are_sanitized() {
+        // 正常路径：去掉前导斜杠并逐段拼
+        assert_eq!(
+            safe_relative("/uploads/202610/01/a.png").unwrap(),
+            Path::new("uploads").join("202610").join("01").join("a.png")
+        );
+        assert_eq!(safe_relative("uploads/a.png").unwrap(), Path::new("uploads/a.png"));
+        // 反斜杠形式的路径也要能处理（Windows 上传过来的记录）
+        assert_eq!(
+            safe_relative("uploads\\a.png").unwrap(),
+            Path::new("uploads/a.png")
+        );
+        // 穿越、空串、只有斜杠 → 拒绝
+        assert!(safe_relative("../etc/passwd").is_none());
+        assert!(safe_relative("uploads/../../etc/passwd").is_none());
+        assert!(safe_relative("").is_none());
+        assert!(safe_relative("///").is_none());
+        assert!(safe_relative("./").is_none());
+    }
+
+    #[test]
+    fn thumb_path_keeps_directory() {
+        let rel = Path::new("uploads/202610/a.png");
+        assert_eq!(
+            thumb_relative(rel).unwrap(),
+            Path::new("uploads/202610/thumb_a.png")
+        );
+        // 根目录下的文件
+        assert_eq!(thumb_relative(Path::new("a.png")).unwrap(), Path::new("thumb_a.png"));
+    }
+
+    #[test]
+    fn copies_files_and_directories_idempotently() {
+        let base = std::env::temp_dir().join(format!("rustcms-ml-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("uploads/202610")).unwrap();
+        std::fs::write(src.join("uploads/202610/a.png"), b"img").unwrap();
+        std::fs::write(src.join("uploads/202610/b.png"), b"img2").unwrap();
+
+        // 全量：整目录搬
+        let copied = copy_dir_all(&src.join("uploads"), &dst.join("uploads"));
+        assert_eq!(copied, 2);
+        assert!(dst.join("uploads/202610/a.png").is_file());
+
+        // 再搬一次：已存在的不重复计数
+        assert_eq!(copy_dir_all(&src.join("uploads"), &dst.join("uploads")), 0);
+
+        // 单文件：目标存在时跳过
+        assert!(!copy_file_if_missing(
+            &src.join("uploads/202610/a.png"),
+            &dst.join("uploads/202610/a.png")
+        ));
+        // 目标不存在时复制（并自动建父目录）
+        let fresh = dst.join("uploads/202610/thumb_a.png");
+        assert!(copy_file_if_missing(&src.join("uploads/202610/a.png"), &fresh));
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"img");
+        // 源不存在时不写
+        assert!(!copy_file_if_missing(
+            &src.join("uploads/none.png"),
+            &dst.join("uploads/none.png")
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

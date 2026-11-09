@@ -1,8 +1,8 @@
-//! 邮件发送配置、模板与发送记录（`pluginSendmail.go`、Go `provider/sendmail.go`）。
+//! 邮件发送配置、模板与发送记录。
 //!
-//! 配置存 `settings.sendmail`（Go `provider.SendmailSettingKey`），对象结构：
+//! 配置存 `settings.sendmail`，对象结构：
 //! `{server, use_ssl, port, account, password, recipient, templates[]}`。
-//! 模板是「默认模板 + 配置覆盖」两层结构（Go `DefaultEmailTemplates` + 合并规则）；
+//! 模板是「默认模板 + 配置覆盖」两层结构（内置默认表 + 合并规则）；
 //! `readonly` 模板的 subject/content 不可覆盖。
 //! 发送记录是 `<cache>/mail.log` 里的 JSON 行（每行一条 `MailLog`）。
 
@@ -13,17 +13,17 @@ use std::path::Path;
 
 use super::{site_setting, ModelError};
 
-/// 邮件配置键（Go `provider.SendmailSettingKey`）。
+/// 邮件配置键。
 pub const SENDMAIL_SETTING: &str = "sendmail";
 
-/// SMTP 授权码掩码（Go `SendmailPasswordMask`）：读取时替换真实授权码，
+/// SMTP 授权码掩码：读取时替换真实授权码，
 /// 保存时原样回传表示「未修改」，沿用库里的真实值。
 pub const PASSWORD_MASK: &str = "********";
 
-/// 发送记录文件名（Go `MailLogFile`，位于 `<cache>/` 下）。
+/// 发送记录文件名（位于 `<cache>/` 下）。
 pub const MAIL_LOG_FILE: &str = "mail.log";
 
-/// 邮件模板（Go `config.EmailTemplate`）。
+/// 邮件模板。
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailTemplate {
     pub open: bool,
@@ -44,7 +44,7 @@ impl EmailTemplate {
     }
 }
 
-/// 发送记录（Go `model.MailLog`，mail.log 里每行一个 JSON）。
+/// 发送记录（mail.log 里每行一个 JSON）。
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MailLog {
     pub created_time: i64,
@@ -53,7 +53,7 @@ pub struct MailLog {
     pub address: String,
 }
 
-/// 默认邮件模板（与 Go `provider.DefaultEmailTemplates` 逐字一致）。
+/// 内置默认邮件模板。
 pub fn default_templates() -> Vec<EmailTemplate> {
     vec![
         EmailTemplate {
@@ -191,7 +191,7 @@ async fn raw_templates(pool: &MySqlPool) -> anyhow::Result<Vec<Value>> {
         .unwrap_or_default())
 }
 
-/// GET /setting：配置 + 授权码掩码（Go `PluginSendmailSetting`）。
+/// GET /setting：配置 + 授权码掩码。
 pub async fn config_get_masked(pool: &MySqlPool) -> anyhow::Result<Value> {
     let mut value = config_get(pool).await?;
     if let Value::Object(map) = &mut value {
@@ -207,7 +207,7 @@ pub async fn config_get_masked(pool: &MySqlPool) -> anyhow::Result<Value> {
 }
 
 /// POST /setting：逐字段覆盖（server/use_ssl/port/account/password/recipient），
-/// 授权码等于掩码时沿用原值（Go `PluginSendmailSettingForm`）。
+/// 授权码等于掩码时沿用原值。
 pub async fn config_save(pool: &MySqlPool, patch: &Value) -> Result<Value, ModelError> {
     if !patch.is_object() {
         return Err(ModelError::invalid("配置格式错误"));
@@ -235,7 +235,7 @@ pub async fn config_save(pool: &MySqlPool, patch: &Value) -> Result<Value, Model
         .map_err(|err| ModelError::invalid(format!("读取失败: {err}")))
 }
 
-/// GET /templates：默认模板 + 配置覆盖（Go `GetEmailTemplates`）。
+/// GET /templates：默认模板 + 配置覆盖。
 pub async fn templates_list(pool: &MySqlPool) -> anyhow::Result<Vec<Value>> {
     let overrides = raw_templates(pool).await?;
     let mut result = Vec::new();
@@ -258,7 +258,7 @@ pub async fn templates_list(pool: &MySqlPool) -> anyhow::Result<Vec<Value>> {
     Ok(result)
 }
 
-/// GET /template?key=：合并后的单个模板（Go `GetEmailTemplateInfo`）。
+/// GET /template?key=：合并后的单个模板。
 /// 返回 `None` 表示模板不存在；`readonly` 模板不应用 subject/content 覆盖。
 pub async fn template_get(pool: &MySqlPool, key: &str) -> anyhow::Result<Option<Value>> {
     let mut template = match default_templates().into_iter().find(|t| t.key == key) {
@@ -283,7 +283,7 @@ pub async fn template_get(pool: &MySqlPool, key: &str) -> anyhow::Result<Option<
     Ok(Some(template.to_json()))
 }
 
-/// POST /template：按 key 保存 {open, delay, subject, content}（Go `SaveEmailTemplateInfo`）。
+/// POST /template：按 key 保存 {open, delay, subject, content}。
 pub async fn template_save(
     pool: &MySqlPool,
     body: &Value,
@@ -324,7 +324,7 @@ pub async fn template_save(
     Ok(entry)
 }
 
-/// 把 Go 时间布局（如 `2006-01-02 15:04:05`）转成 chrono 格式串。
+/// 把时间布局串（如 `2006-01-02 15:04:05`）转成 chrono 格式串。
 fn go_layout_to_chrono(layout: &str) -> String {
     const TOKENS: [(&str, &str); 7] = [
         ("2006", "%Y"),
@@ -430,12 +430,12 @@ fn render_expression(expr: &str, data: &Value) -> String {
     value
 }
 
-/// 渲染 pongo2 风格邮件模板（Go `RenderEmailTemplate` 的 Rust 对应实现）。
+/// 渲染 pongo2 风格邮件模板。
 ///
 /// 支持 `{% system with name="X" %}`、`{{ path|filter }}`、
 /// `{% for key, value in map %}..{% endfor %}`（单层，map 迭代）；
-/// 其余 tag（如 archiveList）原样保留。渲染失败由调用方按 Go 行为
-/// 把错误文本写回 subject/content。
+/// 其余 tag（如 archiveList）原样保留。渲染失败由调用方把错误文本
+/// 写回 subject/content。
 pub fn render_template(template: &str, data: &Value) -> Result<String, String> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -518,7 +518,7 @@ pub fn render_template(template: &str, data: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-/// 把非 HTML 内容转成简单段落 HTML（Go `library.MarkdownToHTML` 的简化版）。
+/// 把非 HTML 内容转成简单段落 HTML（简化版 Markdown 支持）。
 fn markdown_to_html(content: &str) -> String {
     if content.trim().is_empty() {
         return String::new();
@@ -536,7 +536,7 @@ fn markdown_to_html(content: &str) -> String {
     html
 }
 
-/// 预览渲染（Go `PluginSendmailTemplatePreview` 的模型层）：
+/// 预览渲染（模型层）：
 /// 返回渲染后的 {subject, content}，渲染失败时把错误文本写回对应字段。
 pub fn render_preview(subject: &str, content: &str, data: &Value) -> Value {
     let mut subject = subject.to_string();
@@ -556,7 +556,7 @@ pub fn render_preview(subject: &str, content: &str, data: &Value) -> Value {
             content = err;
         }
     }
-    // content 先按 Markdown 转 HTML（与 Go 一致：非 < 开头才转）
+    // content 先按 Markdown 转 HTML（非 < 开头才转）
     if !content.starts_with('<') {
         content = markdown_to_html(&content);
     }
@@ -576,7 +576,7 @@ pub fn render_preview(subject: &str, content: &str, data: &Value) -> Value {
 
 /// 读取发送记录（`<cache>/mail.log` 的 JSON 行，倒序分页）。
 ///
-/// 返回 `(本页记录, 总数)`；文件不存在返回空（Go `GetLastSendmailList`）。
+/// 返回 `(本页记录, 总数)`；文件不存在返回空。
 pub fn mail_log_list(cache_dir: &Path, page: i64, page_size: i64) -> (Vec<MailLog>, i64) {
     let page = page.max(1);
     let page_size = if page_size < 1 { 20 } else { page_size.min(200) };
@@ -585,7 +585,7 @@ pub fn mail_log_list(cache_dir: &Path, page: i64, page_size: i64) -> (Vec<MailLo
     let Ok(content) = std::fs::read_to_string(cache_dir.join(MAIL_LOG_FILE)) else {
         return (Vec::new(), 0);
     };
-    // Go 版从文件尾部倒着读：等价于全量行倒序
+    // 从文件尾部倒着读：等价于全量行倒序
     let mut lines: Vec<&str> = content.lines().rev().collect();
     let total = lines.len() as i64;
     let selected: Vec<MailLog> = lines
@@ -595,7 +595,7 @@ pub fn mail_log_list(cache_dir: &Path, page: i64, page_size: i64) -> (Vec<MailLo
         .filter_map(|line| serde_json::from_str::<MailLog>(line).ok())
         .collect();
     let mut total = total;
-    // 对齐 Go 的修正：最后一页不满时 total 修正为 offset + len
+    // 修正：最后一页不满时 total 修正为 offset + len
     if page_size as usize > selected.len() {
         total = offset + selected.len() as i64;
     }
@@ -669,7 +669,7 @@ mod tests {
         .unwrap();
         assert!(out.contains("[测试站]: 张三 的留言"), "{out}");
         assert!(out.contains("19.99"), "{out}");
-        // dateFormat 按 Go 布局输出本地时间：只断言包含日期部分
+        // dateFormat 按布局串输出本地时间：只断言包含日期部分
         assert!(out.contains("-"), "{out}");
 
         // for 循环 + 变量

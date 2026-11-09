@@ -1,7 +1,7 @@
-//! 用户提现记录（`pluginWithdraw.go`、Go `provider/withdraw.go`）。
+//! 用户提现记录。
 //!
-//! 状态：0 等待处理 / 1 已同意 / 2 已提现 / -1 提现错误（与 Go `config/constant.go` 一致）。
-//! 申请提现（Go `RetailerApplyWithdraw`）：汇总该分销员 `status = 0` 的佣金，
+//! 状态：0 等待处理 / 1 已同意 / 2 已提现 / -1 提现错误（按既有约定）。
+//! 申请提现：汇总该分销员 `status = 0` 的佣金，
 //! 整体生成一条提现记录，并把佣金批量置为已提现（`withdraw_id` 回填）。
 //! 审核通过 / 打款完成时给用户记一条「支出 / 提现」财务流水；余额提现在申请时
 //! 已写入 `order_id = W<id>` 的流水，此时只把那条流水标记为已完成，不再重复记账。
@@ -12,14 +12,14 @@ use sqlx::FromRow;
 
 use super::ModelError;
 
-/// 财务流水方向：支出（Go `config.FinanceOutput`）。
+/// 财务流水方向：支出。
 const FINANCE_OUTPUT: i8 = 2;
-/// 财务流水动作：提现（Go `config.FinanceActionWithdraw`）。
+/// 财务流水动作：提现。
 const FINANCE_ACTION_WITHDRAW: i8 = 5;
-/// 佣金状态：已提现（Go `config.CommissionStatusPaid`）。
+/// 佣金状态：已提现。
 const COMMISSION_STATUS_PAID: i8 = 1;
 
-/// 提现记录（列表联表补 `user_name`，对应 Go `model.UserWithdraw`）。
+/// 提现记录（列表联表补 `user_name`，对应既有约定）。
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct UserWithdraw {
     pub id: u32,
@@ -33,11 +33,11 @@ pub struct UserWithdraw {
     pub error_times: i32,
     pub last_time: i64,
     pub remark: String,
-    /// 联表字段：详情接口与 Go 一致返回空串，列表接口带出用户名。
+    /// 联表字段：详情接口与既有接口契约一致返回空串，列表接口带出用户名。
     pub user_name: String,
 }
 
-/// 分页查提现记录（`id desc`，联表补 `user_name`，Go `GetWithdrawList`）。
+/// 分页查提现记录（`id desc`，联表补 `user_name`，既有约定）。
 pub async fn list(
     pool: &MySqlPool,
     page: i64,
@@ -62,7 +62,7 @@ pub async fn list(
     Ok((total, rows))
 }
 
-/// 按 ID 取提现记录（不联表，`user_name` 为空串，Go `GetWithdrawById`）。
+/// 按 ID 取提现记录（不联表，`user_name` 为空串，既有约定）。
 pub async fn get(pool: &MySqlPool, id: u32) -> Result<Option<UserWithdraw>, ModelError> {
     sqlx::query_as::<_, UserWithdraw>(
         "SELECT w.*, '' AS user_name FROM user_withdraws w WHERE w.id = ?",
@@ -73,9 +73,9 @@ pub async fn get(pool: &MySqlPool, id: u32) -> Result<Option<UserWithdraw>, Mode
     .map_err(|err| ModelError::invalid(format!("查询失败: {err}")))
 }
 
-/// 为分销员申请提现（Go `RetailerApplyWithdraw`），返回新建的提现记录。
+/// 为分销员申请提现，返回新建的提现记录。
 pub async fn apply(pool: &MySqlPool, user_id: u32) -> Result<UserWithdraw, ModelError> {
-    // SUM() 返回 DECIMAL，必须 CAST 后再解码（项目约定的 schema 坑）
+    // SUM 返回 DECIMAL，必须 CAST 后再解码（项目约定的 schema 坑）
     let total: i64 = sqlx::query_scalar(
         "SELECT CAST(COALESCE(SUM(amount), 0) AS SIGNED) FROM commissions WHERE user_id = ? AND status = 0",
     )
@@ -127,7 +127,7 @@ pub async fn apply(pool: &MySqlPool, user_id: u32) -> Result<UserWithdraw, Model
 }
 
 /// 余额提现在申请时已写入 `order_id = W<id>` 的流水：把它标记为已完成。
-/// 返回 true 表示已处理，调用方不要再记账（Go `markBalanceWithdrawDone`）。
+/// 返回 true 表示已处理，调用方不要再记账。
 async fn mark_balance_withdraw_done(pool: &MySqlPool, withdraw: &UserWithdraw) -> bool {
     let order_id = format!("W{}", withdraw.id);
     let found: Option<(u32, i8)> =
@@ -150,7 +150,7 @@ async fn mark_balance_withdraw_done(pool: &MySqlPool, withdraw: &UserWithdraw) -
     true
 }
 
-/// 记一条「支出 / 提现」财务流水（Go `SetUserWithdrawApproval` / `SetUserWithdrawFinished` 共用）。
+/// 记一条「支出 / 提现」财务流水（既有约定 / `SetUserWithdrawFinished` 共用）。
 async fn record_finance(pool: &MySqlPool, withdraw: &UserWithdraw) -> Result<(), ModelError> {
     let balance: i64 = sqlx::query_scalar("SELECT balance FROM users WHERE id = ?")
         .bind(withdraw.user_id)
@@ -176,7 +176,7 @@ async fn record_finance(pool: &MySqlPool, withdraw: &UserWithdraw) -> Result<(),
     Ok(())
 }
 
-/// 审核通过（状态置 1，Go `SetUserWithdrawApproval`）。
+/// 审核通过（状态置 1，既有约定）。
 pub async fn set_approval(pool: &MySqlPool, id: u32) -> Result<(), ModelError> {
     let withdraw = get(pool, id)
         .await?
@@ -195,7 +195,7 @@ pub async fn set_approval(pool: &MySqlPool, id: u32) -> Result<(), ModelError> {
     record_finance(pool, &withdraw).await
 }
 
-/// 标记打款完成（状态置 2 + 成功时间，Go `SetUserWithdrawFinished`）。
+/// 标记打款完成（状态置 2 + 成功时间，既有约定）。
 pub async fn set_finished(pool: &MySqlPool, id: u32) -> Result<(), ModelError> {
     let withdraw = get(pool, id)
         .await?

@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkRustCMS=self.webpackChunkRustCMS||[]).push([[4209],{14209:(function(M,n,t){t.r(n),t.d(n,{default:function(){return s}});var O=t(96540),u=t(5419),E=t(74848);function s(){var C=(0,u.useOutletContext)();return(0,E.jsx)(u.Outlet,{context:C})}})}]);

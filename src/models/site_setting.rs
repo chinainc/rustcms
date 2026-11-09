@@ -1,8 +1,8 @@
 //! 站点设置（`settings` 表里的各个配置段）。
 //!
-//! 对齐 Go 版 `controller/manageController/setting.go` + `provider/setting.go`：
+//! 行为约定：
 //! - `system` / `content` / `index` / `contact` / `safe` / `ai_setting` 存在
-//!   `settings` 表，值是 JSON 对象，保存走「字段级 merge」；
+//! `settings` 表，值是 JSON 对象，保存走「字段级 merge」；
 //! - `diy_fields` 是 JSON **数组**，保存整份覆盖；
 //! - `banner` 形如 `{"banner":[{"type":"default","list":[{...}]}]}`；
 //! - `cache_type` 是**纯字符串**（`file` / `memory`），不是 JSON。

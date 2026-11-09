@@ -1,6 +1,6 @@
-//! 分销佣金记录（`pluginCommission.go`）。
+//! 分销佣金记录。
 //!
-//! `commissions` 表 + `users` 联表补 `user_name`（Go `GetCommissionList`）。
+//! `commissions` 表 + `users` 联表补 `user_name`。
 //! `status`：0 未提现 / 1 已提现 / -1 退款等原因失效。
 
 use serde::{Deserialize, Serialize};

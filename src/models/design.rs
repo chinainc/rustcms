@@ -1,6 +1,6 @@
 //! 模板设计器（纯文件系统）。
 //!
-//! 对齐 Go 版 `provider/design.go` 的目录约定：
+//! 目录约定：
 //! - 模板源码：`<root>/template/<package>/`（元信息在同目录 `config.json`）；
 //! - 模板静态资源：`<root>/public/static/<package>/`；
 //! - 历史版本：`<root>/cache/.history/<package>/<md5(文件相对路径)>/<md5(内容)>`。
@@ -221,7 +221,7 @@ impl DesignStore {
         let mut info = match self.read_config(package) {
             Some(info) => info,
             None => {
-                // 目录存在但没有 config.json：按 Go 的行为「尝试生成」
+                // 目录存在但没有 config.json：按 既有实现的行为「尝试生成」
                 if !self.template_root.join(package).is_dir() {
                     return Err(ModelError::invalid("模板不存在"));
                 }

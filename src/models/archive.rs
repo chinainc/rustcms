@@ -1,6 +1,6 @@
 //! 内容模型（表 `archives` + 正文表 `archive_data`）。
 //!
-//! 列表查询复刻 Go 版 `provider.GetArchiveList` 的两段式做法：
+//! 列表查询采用两段式做法：
 //! 先按排序取一页 ID，再按 ID 回捞整行并按原顺序重排，
 //! 避免大表 `SELECT *` 参与排序带来的临时表与顺序漂移。
 
@@ -250,6 +250,34 @@ pub async fn get(pool: &MySqlPool, id: i64) -> anyhow::Result<Option<Archive>> {
         .bind(id)
         .fetch_optional(pool)
         .await?;
+    Ok(row)
+}
+
+/// 同模块、同栏目下的上一篇 / 下一篇（按 ID 排序）。
+pub async fn adjacent(
+    pool: &MySqlPool,
+    id: i64,
+    module_id: u32,
+    category_id: u32,
+    previous: bool,
+) -> anyhow::Result<Option<Archive>> {
+    let mut builder = QueryBuilder::<MySql>::new("SELECT * FROM archives WHERE 1 = 1");
+    builder.push(" AND module_id = ").push_bind(module_id);
+    if category_id > 0 {
+        builder.push(" AND category_id = ").push_bind(category_id);
+    }
+    if previous {
+        builder
+            .push(" AND id < ")
+            .push_bind(id)
+            .push(" ORDER BY id DESC LIMIT 1");
+    } else {
+        builder
+            .push(" AND id > ")
+            .push_bind(id)
+            .push(" ORDER BY id ASC LIMIT 1");
+    }
+    let row = builder.build_query_as::<Archive>().fetch_optional(pool).await?;
     Ok(row)
 }
 

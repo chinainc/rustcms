@@ -1,4 +1,4 @@
-//! 城市分站（`places` 表，`pluginPlace.go`）。
+//! 城市分站（`places` 表）。
 //!
 //! 注意：`latitude` / `longitude` 是 `decimal(10,6)`，sqlx 不能直接解码成 `f64`，
 //! 这里统一 `CAST(... AS CHAR)` 再按字符串返回。

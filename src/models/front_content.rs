@@ -1,14 +1,13 @@
 //! 前台内容数据访问（批次 A）。
 //!
-//! 对应 Go 版 `provider/apiService.go` 里的 `ApiGet*` 系列，以及
-//! `provider/{archive,category,tag,place,nav,link}.go` 里的只读查询。
+//! 覆盖内容 / 栏目 / 标签 / 城市站 / 导航 / 友链的只读查询，供前台接口使用。
 //!
 //! 只服务**前台只读**接口；写库动作（友链新增/删除）复用 `models::link`，
 //! 正文/分类/模块的写入不在本批范围。
 //!
-//! 路径约定：Go 版把这些接口挂在 `/api` party 下（`route/base.go`），
+//! 路径约定：这些接口亦可挂在 `/api` party 下，
 //! 本批按主线要求把路由落在站点根（`/archive/list` 等），
-//! 同时在 `api_content::router()` 里补了 `/api/...` 别名。
+//! 同时在 `api_content::router` 里补了 `/api/...` 别名。
 
 use std::collections::HashMap;
 
@@ -32,7 +31,7 @@ const PLACE_COLUMNS: &str = "id, created_time, updated_time, title, seo_title, k
 
 /// 排序串白名单：只接受「列名 [asc|desc]」。
 ///
-/// 对齐 Go 版 `provider.ParseOrderBy`：非法片段整段丢弃，
+/// 按既有约定 `ParseOrderBy`：非法片段整段丢弃，
 /// `rand` 是唯一放行的表达式，列名不带点时补表前缀。
 pub fn parse_order(raw: &str, prefix: &str) -> String {
     let raw = raw.trim();
@@ -90,7 +89,7 @@ fn is_order_column(column: &str) -> bool {
 // 内容（archives）
 // ---------------------------------------------------------------------------
 
-/// 前台内容列表的查询条件（对应 Go 的 `request.ApiArchiveListRequest`）。
+/// 前台内容列表的查询条件（对应 `ApiArchiveListRequest`）。
 #[derive(Debug, Clone, Default)]
 pub struct ArchiveListQuery {
     pub id: Option<i64>,
@@ -112,7 +111,7 @@ pub struct ArchiveListQuery {
     pub page: u32,
     pub limit: u32,
     pub offset: u32,
-    /// 从草稿表 `archive_drafts` 读（Go 的 `draft` 参数）。
+    /// 从草稿表 `archive_drafts` 读（`draft` 参数）。
     pub draft: bool,
 }
 
@@ -125,7 +124,7 @@ fn category_column(multi_category: bool) -> &'static str {
     }
 }
 
-/// 估算内容总数（对齐 Go 的 `GetExplainCount`）。
+/// 估算内容总数（对齐 `GetExplainCount`）。
 ///
 /// 优先走 `EXPLAIN` 读 rows（避免大表全量 count），失败再回退 `COUNT(*)`。
 pub async fn estimated_archive_count(pool: &MySqlPool) -> i64 {
@@ -165,7 +164,7 @@ fn parse_leading_digits(value: &str) -> Option<i64> {
 /// 拼 WHERE 条件（计数与取 ID 两段共用，保证口径一致）。
 ///
 /// - `multi_category` 打开时分类条件走 `archive_categories` 关联表；
-/// - `prefix_search` 为真时关键字只做前缀匹配（Go：内容超过 10 万时的口径）。
+/// - `prefix_search` 为真时关键字只做前缀匹配（内容超过 10 万时的口径）。
 fn push_archive_filters(
     builder: &mut QueryBuilder<'_, MySql>,
     query: &ArchiveListQuery,
@@ -238,7 +237,7 @@ fn push_archive_filters(
     }
 }
 
-/// 分页取内容（对齐 Go 的 `GetArchiveList`：先取 ID 再回捞整行）。
+/// 分页取内容（对齐 `GetArchiveList`：先取 ID 再回捞整行）。
 pub async fn archive_list(
     pool: &MySqlPool,
     query: &ArchiveListQuery,
@@ -251,7 +250,7 @@ pub async fn archive_list(
         "archives"
     };
     // 多分类：分类条件落在 archive_categories 上，需要 join 关联表
-    // （对齐 Go 的 `INNER JOIN archive_categories ON archives.id = archive_categories.archive_id`）。
+    // （对齐 `INNER JOIN archive_categories ON archives.id = archive_categories.archive_id`）。
     let joined = multi && (!query.category_ids.is_empty() || !query.exclude_category_ids.is_empty());
     let source = if joined {
         format!(
@@ -263,7 +262,7 @@ pub async fn archive_list(
     };
     let table = if query.draft { "archive_drafts" } else { "archives" };
 
-    // 内容超过 10 万时关键字只匹配开头（对齐 Go 的 `GetExplainCount` 分支）。
+    // 内容超过 10 万时关键字只匹配开头（对齐 `GetExplainCount` 分支）。
     let keyword = query.q.as_deref().map(str::trim).unwrap_or_default();
     let prefix_search = !keyword.is_empty() && estimated_archive_count(pool).await > 100_000;
 
@@ -279,7 +278,7 @@ pub async fn archive_list(
     let mut ids_builder = QueryBuilder::<MySql>::new(format!("SELECT archives.id FROM {source}"));
     push_archive_filters(&mut ids_builder, query, prefix_search);
     if joined {
-        // 一个内容可能命中多个分类，去重（对齐 Go 的 `Group("archives.id")`）。
+        // 一个内容可能命中多个分类，去重（对齐 `Group("archives.id")`）。
         ids_builder.push(" GROUP BY archives.id");
     }
     let order = order.trim();
@@ -445,7 +444,7 @@ pub async fn related_archives(
 // 相关文档（`type=related`）
 // ---------------------------------------------------------------------------
 
-/// 相关文档的关联方式（Go 的 `like` 参数）。
+/// 相关文档的关联方式（`like` 参数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveRelation {
     /// `like=keywords`：按关键字相似度取。
@@ -459,7 +458,7 @@ pub enum ArchiveRelation {
 }
 
 impl ArchiveRelation {
-    /// 解析 Go 的 `like` 参数；空值返回 `None`（走默认逻辑）。
+    /// 解析 `like` 参数；空值返回 `None`（走默认逻辑）。
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim() {
             "keywords" => Some(Self::Keywords),
@@ -471,7 +470,7 @@ impl ArchiveRelation {
     }
 }
 
-/// 相关文档查询条件（Go 的 `type=related` 分支）。
+/// 相关文档查询条件（`type=related` 分支）。
 #[derive(Debug, Clone, Default)]
 pub struct RelatedQuery {
     /// 基准内容 ID。
@@ -493,7 +492,7 @@ pub struct RelatedQuery {
 /// 组装相关文档的 FROM 子句。
 ///
 /// 返回 `(source, need_group)`：`need_group` 为真时同一内容可能命中多行，
-/// 需要 `GROUP BY archives.id` 去重（对齐 Go 的 `Group("archives.id")`）。
+/// 需要 `GROUP BY archives.id` 去重（对齐 `Group("archives.id")`）。
 fn related_source(query: &RelatedQuery, prefix_join: &str) -> (String, bool) {
     let mut source = String::from("archives");
     let mut need_group = false;
@@ -513,7 +512,7 @@ fn related_source(query: &RelatedQuery, prefix_join: &str) -> (String, bool) {
     (source, need_group)
 }
 
-/// 追加相关文档的栏目/模型范围条件（对齐 Go 的三个 where 分支）。
+/// 追加相关文档的栏目/模型范围条件（三个 where 分支）。
 fn push_related_scope(builder: &mut QueryBuilder<'_, MySql>, query: &RelatedQuery) {
     if query.category_id > 0 {
         builder
@@ -540,7 +539,7 @@ fn push_related_scope(builder: &mut QueryBuilder<'_, MySql>, query: &RelatedQuer
     }
 }
 
-/// 相关文档列表（对齐 Go 的 `ApiGetArchives` 里 `type == "related"` 分支）。
+/// 相关文档列表（对齐 `ApiGetArchives` 里 `type == "related"` 分支）。
 pub async fn related_list(
     pool: &MySqlPool,
     like: &str,
@@ -588,7 +587,7 @@ async fn related_by_keywords(
         .push_bind(query.offset as i64);
     let ids: Vec<i64> = ids_builder.build_query_scalar().fetch_all(pool).await?;
     let rows = fetch_archive_rows(pool, "archives", &ids).await?;
-    // Go 的 keywords 分支不统计总数（total 保持 0）。
+    // keywords 分支不统计总数（total 保持 0）。
     Ok((rows, 0))
 }
 
@@ -686,7 +685,7 @@ async fn related_by_tag(
     Ok((rows, total))
 }
 
-/// `like=id`：当前内容前后各取一半（对齐 Go 的合并与截断规则）。
+/// `like=id`：当前内容前后各取一半（两侧合并后再按截断规则取用）。
 async fn related_by_neighbors(
     pool: &MySqlPool,
     query: &RelatedQuery,
@@ -710,7 +709,7 @@ async fn related_by_neighbors(
     if merged.len() > limit {
         merged.truncate(limit);
     }
-    // Go 的 id 分支同样不统计总数。
+    // id 分支同样不统计总数。
     Ok((merged, 0))
 }
 
@@ -723,7 +722,7 @@ async fn related_neighbors_side(
     let mut source = String::from("archives");
     let mut need_group = false;
     if query.multi_category {
-        // 多分类时把栏目条件放在 ON 上（对齐 Go 的 JOIN 写法）。
+        // 多分类时把栏目条件放在 ON 上（对齐 JOIN 写法）。
         source.push_str(&format!(
             " INNER JOIN archive_categories ON archives.id = archive_categories.archive_id \
              AND archive_categories.category_id = {}",
@@ -826,7 +825,7 @@ pub async fn archive_content(pool: &MySqlPool, id: i64) -> anyhow::Result<String
 
 /// 会员的用户组等级（`users.group_id` → `user_groups.level`）。
 ///
-/// 用于对齐 Go 的阅读等级校验：`archive.read_level` 与会员等级比较。
+/// 阅读等级校验：`archive.read_level` 与会员等级比较。
 pub async fn member_level(pool: &MySqlPool, user_id: u32) -> Option<i32> {
     let level: Option<i32> = sqlx::query_scalar(
         "SELECT CAST(g.`level` AS SIGNED) FROM users u \
@@ -849,7 +848,7 @@ pub const CATEGORY_TYPE_ARCHIVE: u32 = 1;
 /// 分类类型：单页。
 pub const CATEGORY_TYPE_PAGE: u32 = 3;
 
-/// 前台分类列表（对齐 Go 的 `GetCategoriesFromCache` + 分页切片）。
+/// 前台分类列表（对齐 `GetCategoriesFromCache` + 分页切片）。
 ///
 /// - 只返回 `status = 1` 的正式分类；
 /// - `parent_id = 0 && module_id > 0` 时按模块过滤（单页除外）；
@@ -879,7 +878,7 @@ pub async fn api_categories(
     Ok((slice_page(rows, offset, limit), total))
 }
 
-/// 切片：Go 的 `offset/limit` 语义（`limit = 0` 表示不限）。
+/// 切片：`offset/limit` 语义（`limit = 0` 表示不限）。
 fn slice_page<T: Clone>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     if offset >= rows.len() {
         return Vec::new();
@@ -896,7 +895,7 @@ fn slice_page<T: Clone>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
 // 城市站（places）
 // ---------------------------------------------------------------------------
 
-/// 前台城市站列表（对齐 Go 的 `GetPlacesFromCache`）。
+/// 前台城市站列表（对齐 `GetPlacesFromCache`）。
 pub async fn api_places(
     pool: &MySqlPool,
     parent_id: u32,
@@ -919,7 +918,7 @@ pub async fn api_places(
 // 标签（tags）
 // ---------------------------------------------------------------------------
 
-/// 前台标签列表（对齐 Go 的 `GetTagList`）。
+/// 前台标签列表（对齐 `GetTagList`）。
 pub async fn api_tags(
     pool: &MySqlPool,
     item_id: i64,
@@ -1005,7 +1004,7 @@ pub async fn api_navs(pool: &MySqlPool, type_id: u32) -> anyhow::Result<Vec<NavN
 
 /// 前台幻灯片（`settings.banner` 里按分组拍平）。
 ///
-/// 对齐 Go 的 `ApiGetBanners`：只取 `type` 相同的分组，图片地址补存储域名。
+/// 对齐 `ApiGetBanners`：只取 `type` 相同的分组，图片地址补存储域名。
 pub async fn api_banners(
     pool: &MySqlPool,
     kind: &str,
@@ -1101,7 +1100,7 @@ pub async fn site_urls(pool: &MySqlPool) -> anyhow::Result<SiteUrls> {
     })
 }
 
-/// 拼接存储地址（与 Go 的 `config.JoinStorageUrl` 同口径）。
+/// 拼接存储地址（与 `JoinStorageUrl` 同口径）。
 pub fn join_storage_url(base: &str, path: &str) -> String {
     let path = path.trim();
     if path.is_empty() {
@@ -1205,7 +1204,12 @@ impl LinkBuilder {
 
     /// 单页地址。
     pub fn page(&self, category: &Category) -> String {
-        self.absolute(&url::page_url(self.mode, &category.url_token, 1))
+        self.absolute(&url::page_url_for(
+            self.mode,
+            category.id,
+            &category.url_token,
+            1,
+        ))
     }
 
     /// 标签地址。
@@ -1223,9 +1227,9 @@ impl LinkBuilder {
 // 输出整形
 // ---------------------------------------------------------------------------
 
-/// 内容输出结构：Go 的 `model.Archive` + 计算字段。
+/// 内容输出结构：`Archive` + 计算字段。
 ///
-/// Go 把内容直接序列化（表字段 + `category`/`data`/`tags`/`extra` 等计算字段），
+/// 直接把内容序列化（表字段 + `category`/`data`/`tags`/`extra` 等计算字段），
 /// Rust 侧不能改 `models::archive.rs`，这里在序列化结果上补齐计算字段。
 pub fn archive_json(archive: &Archive) -> Value {
     let mut value = serde_json::to_value(archive).unwrap_or_else(|_| json!({}));
@@ -1251,7 +1255,7 @@ pub fn archive_json(archive: &Archive) -> Value {
     value
 }
 
-/// 分类输出结构：Go 的 `model.Category` + 计算字段。
+/// 分类输出结构：`Category` + 计算字段。
 pub fn category_json(category: &Category) -> Value {
     let mut value = serde_json::to_value(category).unwrap_or_else(|_| json!({}));
     if let Value::Object(map) = &mut value {
@@ -1265,7 +1269,7 @@ pub fn category_json(category: &Category) -> Value {
     value
 }
 
-/// 标签输出结构：Go 的 `model.Tag` + 计算字段。
+/// 标签输出结构：`Tag` + 计算字段。
 pub fn tag_json(tag: &Tag) -> Value {
     let mut value = serde_json::to_value(tag).unwrap_or_else(|_| json!({}));
     if let Value::Object(map) = &mut value {
@@ -1277,7 +1281,7 @@ pub fn tag_json(tag: &Tag) -> Value {
     value
 }
 
-/// 城市站输出结构：Go 的 `model.Place` + 计算字段。
+/// 城市站输出结构：`Place` + 计算字段。
 pub fn place_json(place: &Place) -> Value {
     let mut value = serde_json::to_value(place).unwrap_or_else(|_| json!({}));
     if let Value::Object(map) = &mut value {
@@ -1291,7 +1295,7 @@ pub fn place_json(place: &Place) -> Value {
     value
 }
 
-/// 友情链接输出结构（Go 的 `model.Link`）。
+/// 友情链接输出结构（`Link`）。
 pub fn link_json(link: &Link) -> Value {
     let mut value = serde_json::to_value(link).unwrap_or_else(|_| json!({}));
     if let Value::Object(map) = &mut value {
@@ -1307,7 +1311,7 @@ pub fn link_json(link: &Link) -> Value {
 
 /// 生成 `response.WebInfo` 形状的元信息。
 ///
-/// 对齐 Go 的 `Website.GetMetadata`：`match` 参数决定查什么，
+/// 对齐 `Website.GetMetadata`：`match` 参数决定查什么，
 /// 查不到时返回 404 与「404 Not Found」。
 pub async fn metadata(
     pool: &MySqlPool,
@@ -1490,7 +1494,7 @@ pub async fn metadata(
 // 友情链接
 // ---------------------------------------------------------------------------
 
-/// 按「链接 + 名称」找友情链接（对齐 Go 的 `GetLinkByLinkAndTitle`）。
+/// 按「链接 + 名称」找友情链接（对齐 `GetLinkByLinkAndTitle`）。
 pub async fn friendlink_find(
     pool: &MySqlPool,
     link: &str,

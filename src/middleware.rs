@@ -1,7 +1,7 @@
 //! 全局中间件：CORS 与安全响应头。
 //!
-//! 语义对齐 Go 版 `middleware/options.go`（回显 Origin + 允许携带凭据）
-//! 与 `middleware/secure.go`（防点击劫持 / Referer / 浏览器功能权限）。
+//! 跨域策略（回显 Origin + 允许携带凭据）与安全响应头
+//! （防点击劫持 / Referer / 浏览器功能权限）。
 
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -57,7 +57,7 @@ pub async fn cors(req: Request, next: Next) -> Response {
 
 /// 给 JSON / 文本响应补上 `charset=utf-8`。
 ///
-/// `axum` 的 `Json` 只写 `application/json`，而 Go 版（Iris）会带 `; charset=UTF-8`；
+/// `axum` 的 `Json` 只写 `application/json`，而 JSON 响应约定会带 `; charset=UTF-8`；
 /// Windows PowerShell 5.1 等老客户端缺了 charset 会按 Latin-1 解码，中文全成乱码。
 pub async fn utf8_charset(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;

@@ -1,0 +1,22 @@
+RustCMS Windows 解压即用说明
+
+1. 解压到任意目录（路径尽量不要带空格和中文）。
+2. 首次运行「启动.bat」，脚本会把 config.sample.json 复制成 config.json。
+3. 用记事本打开 config.json，填好 mysql.* 数据库连接（默认库名 rustcms）；server.port 是监听端口，默认 9001，可自行修改。
+   注意：RustCMS 复用既有站点数据库结构，请先确保目标库已导入对应的表结构。
+4. 再次运行「启动.bat」，浏览器打开 http://127.0.0.1:9001/system/ 进入后台。
+5. 停止服务运行「停止.bat」。
+
+目录说明
+  rustcms.exe        主程序
+  config.json        站点配置（不会随升级覆盖）
+  config.sample.json 配置示例
+  template/          模板
+  public/            静态资源（public/upload 下的上传文件不会被升级覆盖）
+  logs/ cache/       运行时目录
+  version.json       版本标记
+
+升级
+  后台「系统升级」页上传 rustcms-v<版本>-windows-upgrade.zip 即可；
+  也可以把 version.json 与升级包放到静态目录，配置 settings.upgrade.version_url 后在线升级。
+  升级会替换主程序、模板与静态资源，不会覆盖 config.json、logs/、cache/、public/upload/。

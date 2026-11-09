@@ -1,10 +1,10 @@
 //! 多站点（表 `websites`）。
 //!
-//! Go 版每个站点有**独立的 MySQL 连接**（`websites.mysql` 存 JSON 连接串），
+//! 既有实现每个站点有**独立的 MySQL 连接**（`websites.mysql` 存 JSON 连接串），
 //! Rust 侧目前是「单连接池」架构，因此这里只实现站点记录的读取与维护，
 //! 真正的多站点数据隔离（切换连接池）尚未实现。
 //!
-//! 对齐 Go 版 `controller/manageController/website.go` 中的
+//! 遵循既有约定中的
 //! `GetWebsiteList` / `GetWebsiteInfo` / `DeleteWebsite` / `GetCurrentSiteInfo`。
 
 use std::time::Duration;
@@ -23,7 +23,7 @@ pub struct Website {
     pub updated_time: Option<i64>,
     pub root_path: String,
     pub name: String,
-    /// JSON 形式的 MySQL 连接串（Go 版用它建独立连接池）
+    /// JSON 形式的 MySQL 连接串（既有实现用它建独立连接池）
     pub mysql: Option<String>,
     pub token_secret: String,
     pub status: u8,
@@ -183,10 +183,10 @@ pub async fn delete(pool: &MySqlPool, id: u32) -> Result<(), ModelError> {
 }
 
 // ---------------------------------------------------------------------------
-// 子站点切换登录（对齐 Go `LoginSubWebsite` + `provider.SignAdminSSO`）
+// 子站点切换登录（与既有 SSO 签发约定一致）
 // ---------------------------------------------------------------------------
 
-/// SSO 票据有效期（秒），与 Go 版 `provider.AdminSSOTTL` 一致。
+/// SSO 票据有效期（秒），与既有接口契约一致。
 const ADMIN_SSO_TTL_SECS: i64 = 120;
 
 /// 生成一次性票据：`<过期时间戳>:<16 字节随机十六进制>`。
@@ -204,7 +204,7 @@ pub fn sign_admin_sso(token_secret: &str, user_name: &str, nonce: &str) -> Strin
     hmac_sha256_hex(token_secret.as_bytes(), message.as_bytes())
 }
 
-/// 登录链接里的查询参数转义（对齐 Go 的 `url.QueryEscape` 语义）。
+/// 登录链接里的查询参数转义（遵循既有约定语义）。
 fn query_escape(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -218,7 +218,7 @@ fn query_escape(value: &str) -> String {
     output
 }
 
-/// 去掉登录地址里的目录部分（Go 版：`path` 长度大于 1 时清空 path）。
+/// 去掉登录地址里的目录部分（既有实现：`path` 长度大于 1 时清空 path）。
 fn clear_url_path(raw: &str) -> String {
     let mut value = raw.trim().to_string();
     if let Some(hash) = value.find('#') {
@@ -282,7 +282,7 @@ async fn read_site_login_meta(
     Ok((base_url, admin_url, admin))
 }
 
-/// 生成以子站点身份登录后台的一次性链接（Go：`LoginSubWebsite`）。
+/// 生成以子站点身份登录后台的一次性链接（既有实现：`LoginSubWebsite`）。
 pub async fn login_sub_site(
     pool: &MySqlPool,
     config: &crate::config::ServerJson,
@@ -340,7 +340,7 @@ pub async fn login_sub_site(
 }
 
 // ---------------------------------------------------------------------------
-// HMAC-SHA256（Go 版用 HMAC-SHA256 签发 SSO，签名必须与标准实现逐字节一致）
+// HMAC-SHA256（既有实现用 HMAC-SHA256 签发 SSO，签名必须与标准实现逐字节一致）
 // ---------------------------------------------------------------------------
 
 const SHA256_K: [u32; 64] = [

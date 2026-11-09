@@ -1,7 +1,6 @@
 //! 会员认证（实名 / 企业认证，表 `user_auths`）。
 //!
-//! 对齐 Go 版 `controller/manageController/userAuth.go` +
-//! `provider` 里的 `GetUserAuthList` / `AuditUserAuth`：
+//! 行为约定：
 //! - `status`：`0` 待审核、`1` 已通过、`-1` 已驳回；
 //! - 驳回必须填原因（`remark`）；
 //! - 审核通过/驳回都记录 `audit_time` 与 `audit_admin_id`。

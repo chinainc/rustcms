@@ -6,7 +6,7 @@
 //! - [`smtp`]：SMTP 发信（明文会话 + 走 curl 的 TLS 后端）；
 //! - [`packer`]：ZIP / tar.gz 打包解包（纯标准库实现 inflate）；
 //! - [`ratelimit`]：访问频率限制与 IP 黑名单；
-//! - [`tblsync`]：数据库表结构自动迁移（对齐 GORM AutoMigrate）。
+//! - [`tblsync`]：数据库表结构自动迁移（建表 / 补列 / 改列 / 建索引，不删列）。
 //!
 //! 设计约束：这一层**不引入任何新依赖**，只用主 crate 已经编译过的
 //! `tokio` / `serde` / `sqlx` / `anyhow` / `chrono` / `tracing`，

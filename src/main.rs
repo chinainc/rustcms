@@ -1,6 +1,6 @@
 //! rustcms：基于 Rust 的内容管理系统。
 //!
-//! 启动链路对齐 Go 版：读取 config.json → 初始化日志 → 连接 MySQL → 启动 HTTP 服务。
+//! 启动链路：读取 config.json → 初始化日志 → 连接 MySQL → 启动 HTTP 服务。
 
 mod api_admin_gap;
 mod api_content;
@@ -9,8 +9,10 @@ mod api_member;
 mod api_trade;
 mod auth;
 mod config;
+mod crond;
 mod db;
 mod front;
+mod install;
 mod login_guard;
 mod middleware;
 mod models;
@@ -21,7 +23,7 @@ mod template;
 
 use tracing_subscriber::EnvFilter;
 
-use config::ServerJson;
+use config::{LoadOutcome, ServerJson};
 
 #[tokio::main]
 async fn main() {
@@ -30,14 +32,31 @@ async fn main() {
         std::process::exit(code);
     }
 
-    let config = match ServerJson::load() {
-        Ok(config) => config,
+    let outcome = match ServerJson::load_for_start() {
+        Ok(outcome) => outcome,
         Err(err) => {
             eprintln!("启动失败：{err:#}");
             std::process::exit(1);
         }
     };
 
+    match outcome {
+        LoadOutcome::Ready(config) => run_server(config).await,
+        LoadOutcome::NeedsInstall(config) => {
+            init_tracing(&config.server.log_level);
+            eprintln!("[!] 未检测到数据库配置，进入安装模式");
+            let state = state::AppState::new(config, None);
+            if let Err(err) = install::run(state).await {
+                tracing::error!("{err:#}");
+                eprintln!("安装模式启动失败：{err:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// 正常模式：连库并启动 HTTP 服务。
+async fn run_server(config: ServerJson) {
     init_tracing(&config.server.log_level);
 
     tracing::info!(
@@ -117,7 +136,7 @@ fn init_tracing(log_level: &str) {
         .try_init();
 }
 
-/// Go 版的 `release` 视作 info。
+/// `release` 视作 info。
 fn default_filter(log_level: &str) -> &'static str {
     match log_level.trim().to_ascii_lowercase().as_str() {
         "error" => "error",

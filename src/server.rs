@@ -22,6 +22,11 @@ pub fn build_app(state: AppState) -> axum::Router {
 /// 启动 HTTP 服务，直到收到退出信号。
 pub async fn run(state: AppState) -> Result<()> {
     let port = state.with_config(|c| c.port());
+    if port == 0 {
+        anyhow::bail!(
+            "server.port 未配置：请在 config.json 的 server 段填写监听端口（例如 \"port\": 9001）"
+        );
+    }
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     // 进程内限流器只在内存里保存状态，重启后按 settings.limiter 重新装载
@@ -32,6 +37,9 @@ pub async fn run(state: AppState) -> Result<()> {
     }
 
     let app = build_app(state.clone());
+
+    // 进程内定时任务：定时发布、回收站清理
+    crate::crond::start(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

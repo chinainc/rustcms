@@ -1,4 +1,4 @@
-//! 留言（`guestbooks` 表，`pluginGuestbook.go`）。
+//! 留言（`guestbooks` 表，既有约定）。
 //!
 //! `status`：0 = 待审核，1 = 正常，2 = 垃圾。
 //! 配置存 `settings.guestbook`，其中 `fields` 是自定义字段（含系统的
@@ -250,7 +250,7 @@ pub async fn export(pool: &MySqlPool) -> anyhow::Result<(Vec<String>, Vec<Vec<Va
                 };
                 item.push(Value::String(value));
             } else {
-                // Go 先按 `name` 取，取不到再忽略
+                // 先按 `name` 取，取不到再忽略
                 let name = field
                     .get("name")
                     .and_then(Value::as_str)

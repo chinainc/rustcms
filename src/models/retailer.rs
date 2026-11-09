@@ -1,9 +1,8 @@
-//! 分销员配置与身份（`pluginRetailer.go`）。
+//! 分销员配置与身份。
 //!
-//! 配置存 `settings.retailer`（Go `provider.RetailerSettingKey`），
-//! 身份存 `users.is_retailer`。与 Go 版一致：保存配置只认
-//! `allow_self` / `become_retailer` 两个字段（`become_retailer = 1`
-//! 表示自动成为分销员，列表只显示 `is_retailer = 1` 的会员）。
+//! 配置存 `settings.retailer`，身份存 `users.is_retailer`。
+//! 保存配置只认 `allow_self` / `become_retailer` 两个字段
+//! （`become_retailer = 1` 表示自动成为分销员，列表只显示 `is_retailer = 1` 的会员）。
 
 use serde_json::{json, Map, Value};
 use sqlx::mysql::MySqlPool;
@@ -23,7 +22,7 @@ pub async fn config_get(pool: &MySqlPool) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-/// 保存分销员配置（字段级 merge，只落 Go 版认的两个字段）。
+/// 保存分销员配置（字段级 merge，只落 既有实现认的两个字段）。
 pub async fn config_save(pool: &MySqlPool, patch: &Value) -> Result<Value, ModelError> {
     if !patch.is_object() {
         return Err(ModelError::invalid("配置格式错误"));

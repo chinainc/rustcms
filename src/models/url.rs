@@ -1,6 +1,6 @@
 //! URL 规则（伪静态）与路径匹配。
 //!
-//! 对齐 Go 版 `provider/rewrite.go`：`settings.rewrite` 的 `mode` 决定内置规则，
+//! `settings.rewrite` 的 `mode` 决定内置规则，
 //! 0=ID 模式、1=模型+别名、2=栏目别名+ID、3=栏目别名+内容别名、4=自定义正则。
 //!
 //! 生成与解析共用同一张规则表：`(_{page})` 这类圆括号段表示「可选」，
@@ -32,11 +32,11 @@ pub enum Kind {
     ArchiveIndex,
     TagIndex,
     Tag,
-    /// 搜索页（Go 默认 `/search(/{module})`）
+    /// 搜索页（既有实现默认 `/search(/{module})`）
     Search,
-    /// 用户列表（Go 默认 `/peoples(/{page})`）
+    /// 用户列表（既有实现默认 `/peoples(/{page})`）
     PeopleIndex,
-    /// 用户主页（Go 默认 `/people/{id}.html`）
+    /// 用户主页（既有实现默认 `/people/{id}.html`）
     People,
 }
 
@@ -47,7 +47,7 @@ const NUMBER_PATTERNS: &[(Kind, &str)] = &[
     (Kind::ArchiveIndex, "/{module}(_{page})"),
     (Kind::TagIndex, "/tags(/{page})"),
     (Kind::Tag, "/tag/{id}(/{page})"),
-    // Go 版 GetRewritePattern 对所有模式统一补的默认规则
+    // 所有模式统一补的默认规则
     (Kind::Search, "/search(/{module})"),
     (Kind::PeopleIndex, "/peoples(/{page})"),
     (Kind::People, "/people/{id}.html"),
@@ -208,6 +208,18 @@ pub fn page_url(mode: i32, filename: &str, page: u32) -> String {
     fill(pattern(mode, Kind::Page), &values, page)
 }
 
+/// 单页地址（带 ID，兼容 ID 模式与字符串模式）。
+///
+/// ID 模式的规则是 `/{id}.html`，只传 `filename` 时会残留 `{id}` 占位符；
+/// 生成侧统一用本函数，调用方无需判断当前伪静态模式。
+pub fn page_url_for(mode: i32, id: u32, filename: &str, page: u32) -> String {
+    let values = [
+        ("id", id.to_string()),
+        ("filename", filename.to_string()),
+    ];
+    fill(pattern(mode, Kind::Page), &values, page)
+}
+
 /// 标签详情页地址（字符串模式用 `{filename}`，其余用 `{id}`）。
 pub fn tag_url(mode: i32, id: u32, filename: &str, page: u32) -> String {
     let values = [
@@ -336,6 +348,10 @@ mod tests {
         assert_eq!(archive_index_url(MODE_STRING2, "news", 2), "/news_2");
         assert_eq!(page_url(MODE_STRING2, "about", 1), "/about.html");
 
+        // 带 ID 的单页生成：ID 模式用 id，字符串模式用别名
+        assert_eq!(page_url_for(MODE_NUMBER, 7, "about", 1), "/7.html");
+        assert_eq!(page_url_for(MODE_STRING2, 7, "about", 1), "/about.html");
+
         // 标签页
         assert_eq!(tag_index_url(MODE_STRING2, 1), "/tags/");
         assert_eq!(tag_index_url(MODE_STRING2, 2), "/tags/2");
@@ -370,7 +386,7 @@ mod tests {
         assert!(match_path(MODE_STRING2, Kind::Archive, "/zixun/").is_none());
         assert!(match_path(MODE_STRING2, Kind::Category, "/zixun/11.html").is_none());
 
-        // 搜索页与用户页（Go 默认规则）
+        // 搜索页与用户页（既有实现默认规则）
         let search = match_path(MODE_STRING2, Kind::Search, "/search/").unwrap();
         assert_eq!(search.len(), 0);
         let search2 = match_path(MODE_STRING2, Kind::Search, "/search/article").unwrap();

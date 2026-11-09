@@ -1,6 +1,6 @@
 //! 附件（表 `attachments`）。
 //!
-//! 对齐 Go 版 `provider/attachment.go`：
+//! 行为约定：
 //! - 列表按 `status = 1`、`updated_time DESC`；
 //! - 上传按 MD5 去重（`file_md5` 是唯一索引），同一份文件只存一条；
 //! - 落盘路径为 `uploads/YYYYMM/DD/<文件名>`。
@@ -67,7 +67,7 @@ pub fn extension_of(file_name: &str) -> String {
     }
 }
 
-/// 扩展名是否可接受（对齐 Go：拒绝 php / jsp），并补齐常见脚本/可执行扩展名。
+/// 扩展名是否可接受（遵循既有约定：拒绝 php / jsp），并补齐常见脚本/可执行扩展名。
 pub fn is_allowed_ext(ext: &str) -> bool {
     !matches!(
         ext,

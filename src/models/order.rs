@@ -1,6 +1,6 @@
-//! 订单 / 支付单 / 财务流水（`pluginOrder.go`、`pluginFinance.go`）。
+//! 订单 / 支付单 / 财务流水。
 //!
-//! 状态枚举（与 Go `config/constant.go` 一致）：
+//! 状态枚举（取值固定如下）：
 //! 订单 `status`：-1 已取消 / 0 待支付 / 1 已支付 / 2 配送中 / 3 已完成 / 8 退款中 / 9 已退款。
 //! 财务 `direction`：1 收入 / 2 支出；`action`：2 购买等。
 
@@ -325,7 +325,7 @@ pub async fn set_pay(pool: &MySqlPool, order_id: &str, pay_way: &str) -> Result<
     };
 
     // 订单状态流转：no_process（或 vip）付款即完成，否则停在「已支付待发货」
-    // （对齐 Go SuccessPaidOrder：置 Paid=1，NoProcess 时再 SetOrderFinished→3）
+    // （遵循既有约定 SuccessPaidOrder：置 Paid=1，NoProcess 时再 SetOrderFinished→3）
     let no_process = config_get(pool)
         .await
         .ok()

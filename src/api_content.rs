@@ -1,13 +1,12 @@
 //! 前台内容 API（批次 A）。
 //!
-//! 对应 Go 版 `controller/api.go`、`apiArchive.go`、`apiTag.go`
-//! 里挂在 `/api` party 下的**前台只读**接口（`route/base.go` 第 117~144 行），
-//! 外加友链接口（`route/base.go` 第 69~72 行）与前台投稿（`api.Post("/archive/publish")`）。
+//! 覆盖挂在 `/api` 分组下的**前台只读**接口（内容列表 / 详情 / 相关、
+//! 栏目、标签），外加友链接口与前台投稿（`/archive/publish`）。
 //!
 //! 路径按主线要求**不带 `/api` 前缀**（如 `/archive/list`），
-//! 同时注册 `/api/...` 别名，保证 Go 版原始地址同样可用。
+//! 同时注册 `/api/...` 别名，保证既有调用地址同样可用。
 //!
-//! 响应信封与 Go 版一致：成功 `{"code":0,"msg":"","data":...}`，
+//! 响应信封：成功 `{"code":0,"msg":"","data":...}`，
 //! 列表接口额外带顶层 `total`，失败 `{"code":1,"msg":"..."}`。
 
 use std::collections::HashMap;
@@ -66,7 +65,7 @@ pub fn router() -> Router<AppState> {
     router = api_route!(router, "/friendlink/create", post, friendlink_create);
     router = api_route!(router, "/friendlink/delete", post, friendlink_delete);
     router = api_route!(router, "/archive/publish", post, archive_publish);
-    // 友链校验（Go 版 GET / POST 都支持）
+    // 友链校验（既有实现 GET / POST 都支持）
     router = router
         .route("/friendlink/check", axum::routing::get(friendlink_check))
         .route("/friendlink/check", axum::routing::post(friendlink_check))
@@ -76,7 +75,7 @@ pub fn router() -> Router<AppState> {
 }
 
 // ---------------------------------------------------------------------------
-// 参数解析（对齐 Go 的 iris 取参语义：取不到就当零值，不报错）
+// 参数解析（取不到就当零值，不报错）
 // ---------------------------------------------------------------------------
 
 fn q_str(q: &HashMap<String, String>, key: &str) -> String {
@@ -95,7 +94,7 @@ fn q_u32(q: &HashMap<String, String>, key: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Go 的 `URLParamBool` 语义：`1/t/true/yes/on` 都算真。
+/// 既有的 `URLParamBool` 语义：`1/t/true/yes/on` 都算真。
 fn q_bool(q: &HashMap<String, String>, key: &str, default: bool) -> bool {
     match q.get(key) {
         Some(raw) => parse_bool(raw),
@@ -122,7 +121,7 @@ fn q_id_list(q: &HashMap<String, String>, key: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// `limit` 参数：支持 `offset,limit` 与 `limit` 两种写法（对齐 Go）。
+/// `limit` 参数：支持 `offset,limit` 与 `limit` 两种写法（按既有约定）。
 ///
 /// 返回 `(offset, limit)`；参数缺省时 `limit` 取 `default_limit`。
 fn q_limit(q: &HashMap<String, String>, max_limit: u32, default_limit: u32) -> (u32, u32) {
@@ -148,7 +147,7 @@ fn q_limit(q: &HashMap<String, String>, max_limit: u32, default_limit: u32) -> (
     (offset, limit)
 }
 
-/// 列表响应：顶层额外带 `total`（对齐 Go 的列表接口）。
+/// 列表响应：顶层额外带 `total`（按既有列表接口）。
 fn ok_total(total: i64, data: Value) -> Response {
     Json(json!({ "code": 0, "msg": "", "total": total, "data": data })).into_response()
 }
@@ -197,7 +196,7 @@ async fn request_user_id(pool: &sqlx::MySqlPool, headers: &HeaderMap) -> Option<
     claims.subject(auth::TokenKind::User)
 }
 
-/// 百分号编码（对齐 Go 的 `url.QueryEscape`）。
+/// 百分号编码（按 `url.QueryEscape` 的语义）。
 fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -213,7 +212,7 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-/// 拼查询串（对齐 Go 的 `url.Values.Encode`：键名排序、空格转 `+`）。
+/// 拼查询串（按 `url.Values.Encode` 的语义：键名排序、空格转 `+`）。
 fn encode_query(params: &[(String, String)]) -> String {
     let mut sorted: Vec<&(String, String)> = params.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -235,7 +234,7 @@ fn filter_link(prefix: &str, params: &[(String, String)], field: &str, value: &s
     format!("{prefix}{}", encode_query(&items))
 }
 
-/// 内容最大条数（`settings.content.max_limit`，Go 默认 100）。
+/// 内容最大条数（`settings.content.max_limit`，既有实现默认 100）。
 async fn max_limit(pool: &sqlx::MySqlPool) -> u32 {
     content_settings(pool)
         .await
@@ -283,7 +282,7 @@ async fn archive_list(
     let exclude_category_ids = q_id_list(&q, "excludeCategoryId");
     let mut module_id = q_u32(&q, "moduleId");
 
-    // categoryId → 模型推导（Go：仅当 modelId == 0 时取第一个分类的模型）
+    // categoryId → 模型推导（既有实现：仅当 modelId == 0 时取第一个分类的模型）
     if module_id == 0 && !category_ids.is_empty() {
         if let Some(category) = category::get(pool, category_ids[0]).await.unwrap_or(None) {
             module_id = category.module_id;
@@ -305,7 +304,7 @@ async fn archive_list(
         category_ids = expanded;
     }
 
-    // userId > 0 时覆盖 authorId（Go 的写法）
+    // userId > 0 时覆盖 authorId（既有的写法）
     let user_id = q_u32(&q, "userId");
     let author_id = if user_id > 0 {
         Some(user_id)
@@ -331,7 +330,7 @@ async fn archive_list(
     if list_type == "page" && page > 1 {
         offset = (page - 1) * limit;
     }
-    // 相关文档（Go 的 `type=related` 分支）走独立逻辑。
+    // 相关文档（既有的 `type=related` 分支）走独立逻辑。
     if list_type == "related" {
         return archive_list_related(pool, &q, &content).await;
     }
@@ -433,7 +432,7 @@ async fn archive_list(
     ok_total(total, Value::Array(data))
 }
 
-/// `GET /archive/list?type=related` —— 相关文档（对齐 Go 的 `ApiGetArchives` related 分支）。
+/// `GET /archive/list?type=related` —— 相关文档（按 `ApiGetArchives` 的语义 related 分支）。
 async fn archive_list_related(
     pool: &sqlx::MySqlPool,
     q: &HashMap<String, String>,
@@ -460,7 +459,7 @@ async fn archive_list_related(
     let like = q_str(q, "like");
     let mut keywords = q_str(q, "keywords");
 
-    // 只取第一个栏目的模型（对齐 Go 的 controller）。
+    // 只取第一个栏目的模型（既有接口即如此）。
     if module_id == 0 && !category_ids.is_empty() {
         if let Some(item) = category::get(pool, category_ids[0]).await.unwrap_or(None) {
             module_id = item.module_id;
@@ -468,7 +467,7 @@ async fn archive_list_related(
     }
     let mut category_id = category_ids.first().copied().unwrap_or(0);
 
-    // like != relation 时，用基准内容自身的栏目与关键字（对齐 Go）。
+    // like != relation 时，用基准内容自身的栏目与关键字（按既有约定）。
     if like != "relation" && archive_id > 0 {
         if let Ok(Some(row)) = archive::get(pool, archive_id).await {
             category_id = row.category_id;
@@ -508,7 +507,7 @@ async fn archive_list_related(
     ok_total(total, Value::Array(data))
 }
 
-/// 把内容行转成 Go 版的 JSON 结构。
+/// 把内容行转成既有的 JSON 结构。
 async fn archive_list_json(
     pool: &sqlx::MySqlPool,
     rows: &[archive::Archive],
@@ -626,12 +625,12 @@ async fn archive_detail(
     let builder = links(pool).await;
     let mut value = front_content::archive_json(&row);
     let content = front_content::archive_content(pool, row.id).await.unwrap_or_default();
-    // 密码保护：密码不对时不回传正文（对齐 Go 的 `ArchiveData = nil`）。
+    // 密码保护：密码不对时不回传正文（按 `ArchiveData = nil` 的语义）。
     let password = q_str(&q, "password");
     let password_valid = !row.password.is_empty() && password == row.password;
-    // 阅读等级：未登录读者看不到付费正文（对齐 Go 的 ReadLevel 分支）。
+    // 阅读等级：未登录读者看不到付费正文（按既有 ReadLevel 分支）。
     let read_level = row.read_level;
-    // 作者本人、等级足够的会员可以看正文（对齐 Go 的 HasOrdered）。
+    // 作者本人、等级足够的会员可以看正文（按既有 HasOrdered）。
     let mut has_ordered = row.price == 0 && row.read_level == 0;
     if let Some(uid) = request_user_id(pool, &headers).await {
         if row.user_id == uid {
@@ -679,12 +678,12 @@ async fn archive_detail(
             if password_valid {
                 map.insert("password_valid".into(), json!(true));
             } else {
-                // 密码不正确：正文与正文数据都不下发（对齐 Go）。
+                // 密码不正确：正文与正文数据都不下发（按既有约定）。
                 map.insert("content".into(), json!(""));
                 map.insert("data".into(), Value::Null);
             }
         } else if read_level > 0 && !has_ordered {
-            // 需要会员等级才能阅读：只给提示文案（对齐 Go 的 TplTr 提示）。
+            // 需要会员等级才能阅读：只给提示文案（按既有 TplTr 提示）。
             let tip = format!("该内容需要用户等级{read_level}以上才能阅读");
             map.insert("content".into(), json!(tip));
             map.insert("data".into(), json!({ "id": row.id, "content": tip }));
@@ -750,7 +749,7 @@ async fn archive_params(
     if q_bool(&q, "sorted", true) {
         return ok(Value::Array(fields));
     }
-    // sorted=false：按字段标识建 map（对齐 Go）
+    // sorted=false：按字段标识建 map（按既有约定）
     let mut map = Map::new();
     for field in item.field_defs() {
         let mut value = serde_json::to_value(&field).unwrap_or_else(|_| json!({}));
@@ -791,7 +790,7 @@ async fn archive_filters(
         }
     };
 
-    // 筛选链接的基准地址：栏目页优先，否则用模型列表页（对齐 Go 的 urlMatch）。
+    // 筛选链接的基准地址：栏目页优先，否则用模型列表页（按既有 urlMatch）。
     let current_category = q_u32(&q, "categoryId");
     let base_link = if current_category > 0 {
         match category::get(pool, current_category).await.unwrap_or(None) {
@@ -822,7 +821,7 @@ async fn archive_filters(
         if values.is_empty() {
             continue;
         }
-        // 当前选中的取值（对齐 Go 的 `tmpUrlParam`）。
+        // 当前选中的取值（按 `tmpUrlParam` 的语义）。
         let current_values: Vec<String> = q
             .get(&field.field_name)
             .map(|raw| {
@@ -1328,7 +1327,7 @@ async fn tag_data_list(
 // 城市站
 // ---------------------------------------------------------------------------
 
-/// 城市站插件是否开启（Go 的 `PluginPlace.Open`）。
+/// 城市站插件是否开启（按 `PluginPlace.Open` 的语义）。
 async fn place_open(pool: &sqlx::MySqlPool) -> bool {
     place::setting_get(pool)
         .await
@@ -1461,7 +1460,7 @@ async fn languages(State(state): State<AppState>) -> Response {
     let config = multilang::config_get(pool).await.unwrap_or_else(|_| json!({}));
     let open = config.get("open").and_then(Value::as_bool).unwrap_or(false);
     if !open {
-        // Go：多语言未开启时返回 nil（JSON 里是 null）。
+        // 既有实现：多语言未开启时返回 nil（JSON 里是 null）。
         return ok(Value::Null);
     }
     match multilang::sites(pool).await {
@@ -1497,7 +1496,7 @@ async fn banner_list(
 // 友情链接
 // ---------------------------------------------------------------------------
 
-/// 校验友链接口令牌（Go 的 `VerifyApiLinkToken`）。
+/// 校验友链接口令牌（按 `VerifyApiLinkToken` 的语义）。
 async fn check_link_token(
     pool: &sqlx::MySqlPool,
     headers: &HeaderMap,
@@ -1723,7 +1722,7 @@ async fn archive_publish(
         return fail("请先登录会员账号后再发布内容");
     };
 
-    // 带 id 时是编辑：只允许改自己的内容（对齐 Go 的归属校验）。
+    // 带 id 时是编辑：只允许改自己的内容（按既有归属校验）。
     let archive_id = form
         .get("id")
         .and_then(|value| value.trim().parse::<i64>().ok())
@@ -1826,7 +1825,7 @@ async fn archive_publish(
 // 请求体解析
 // ---------------------------------------------------------------------------
 
-/// 解析请求体：JSON 或表单（Go 的接口两种都收）。
+/// 解析请求体：JSON 或表单（既有的接口两种都收）。
 fn parse_body(headers: &HeaderMap, body: &Bytes) -> HashMap<String, String> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -1899,7 +1898,7 @@ mod tests {
     #[test]
     fn parses_limit_parameter() {
         let mut q = HashMap::new();
-        // 缺省：Go 的默认值
+        // 缺省：既有的默认值
         assert_eq!(q_limit(&q, 100, 10), (0, 10));
         // 单值
         q.insert("limit".into(), "20".into());

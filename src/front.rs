@@ -1,26 +1,23 @@
-//! 前台路由核心管线（对齐 Go 版 `route/base.go` 的 `/{path:path}` 兜底链路）。
+//! 前台路由核心管线（`/{path:path}` 兜底链路）。
 //!
-//! 处理顺序与 Go 一致：
-//! 1. [`check_301`]（`middleware.Check301`）：查 `redirects` 表做 301 跳转；
-//! 2. [`parse_user_token`]（`middleware.ParseUserToken`）：解析会员 JWT /
-//!    API Key，账号被禁用时直接回 JSON（与 Go 一致）；
-//! 3. [`FrontCtx::serve_file`]（`controller.FileServe`）：public/ 静态文件、
-//!    默认 robots.txt、favicon 缺省 400；
-//! 4. [`FrontCtx::check_close_site`]（`controller.CheckCloseSite`）：闭站 /
-//!    禁蜘蛛 / UA、IP 黑名单；
-//! 5. [`parse_route`]（`controller.ParseRoute`）：伪静态规则按 Go 的顺序
-//!    （search → archiveIndex → people → tag → page → category → archive）
-//!    逐一匹配并做存在性校验；
-//! 6. 按匹配结果渲染对应页面（模板选择优先级与 Go 各 controller 一致），
-//!    全部落空则 [`not_found`]。
+//! 处理顺序：
+//! 1. [`check_301`]：查 `redirects` 表做 301 跳转；
+//! 2. [`parse_user_token`]：解析会员 JWT / API Key，账号被禁用时直接回 JSON；
+//! 3. [`FrontCtx::serve_file`]：public/ 静态文件、默认 robots.txt、favicon 缺省 400；
+//! 4. [`FrontCtx::check_close_site`]：闭站 / 禁蜘蛛 / UA、IP 黑名单；
+//! 5. [`parse_route`]：伪静态规则按固定顺序
+//! （search → archiveIndex → people → tag → page → category → archive）
+//! 逐一匹配并做存在性校验；
+//! 6. 按匹配结果渲染对应页面（模板选择优先级见各渲染函数），
+//! 全部落空则 [`not_found`]。
 //!
-//! 整个解析渲染包在 30s 超时里（对齐 `middleware.HandlerTimeout`）。
+//! 整个解析渲染包在 30s 超时里。
 //!
-//! 与 Go 的已知差异（都有注释）：
-//! - 多语言子站、城市分站（place）、HTML 缓存、蜘蛛访问日志未移植；
+//! 尚未实现的能力（都留有注释）：
+//! - 多语言子站、城市分站（place）、HTML 缓存、蜘蛛访问日志；
 //! - mode 4（自定义正则）在 `settings.rewrite.patten` 为空时回落到
-//!   字符串模式 2 的规则（`models::url` 的既有约定）；patten 非空时按行解析；
-//! - 会员主页 /people、/peoples 规则能匹配但明确提示未移植（会员中心未到批次）。
+//! 字符串模式 2 的规则（`models::url` 的既有约定）；patten 非空时按行解析；
+//! - 会员主页 /people、/peoples 规则能匹配但明确提示未实现（会员中心未到批次）。
 
 use std::time::Duration;
 
@@ -36,13 +33,12 @@ use crate::state::AppState;
 use crate::template::site_provider::SiteProvider;
 use crate::template::Scope;
 
-/// 对齐 Go 版 `currentSite.Content.MaxPage`。
+/// 列表分页的页码上限。
 const MAX_PAGE: u32 = 1000;
-/// 对齐 Go 版 `middleware.HandlerTimeout` 的 30 秒。
+/// 单次请求的处理超时：30 秒。
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 前台兜底入口（对齐 `app.Get("/{path:path}", middleware.Check301,
-/// middleware.ParseUserToken, middleware.HandlerTimeout, controller.ReRouteContext)`）。
+/// 前台兜底入口（301 检查 → 会员令牌解析 → 超时 → 路由分发）。
 pub async fn reroute(State(state): State<AppState>, req: Request) -> Response {
     // 客户端 IP 只从代理头取（直连场景拿不到 SocketAddr 时跳过 IP 黑名单检查）
     let headers = req.headers().clone();
@@ -81,6 +77,29 @@ async fn pipeline(state: AppState, req: Request, ip: Option<String>) -> Response
         return res;
     }
 
+    // 后台管理前端（SPA）：/system 及其前端路由回退到 public/system/index.html
+    if path == "/system"
+        || path == "/system/"
+        || (path.starts_with("/system/")
+            && !path.starts_with("/system/api")
+            && !path.rsplit('/').next().unwrap_or("").contains('.'))
+    {
+        let method = req.method().as_str();
+        if method == "GET" || method == "HEAD" {
+            let base = state.with_config(|c| c.public_dir());
+            if let Ok(bytes) = std::fs::read(base.join("system").join("index.html")) {
+                return (
+                    [(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("text/html; charset=utf-8"),
+                    )],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // 页面请求没配数据库时：首页保留探活文本，其余 404
     let Some(pool) = state.db().cloned() else {
         if path == "/" {
@@ -97,7 +116,7 @@ async fn pipeline(state: AppState, req: Request, ip: Option<String>) -> Response
         return res;
     }
 
-    // middleware.ParseUserToken（账号被禁用时 Go 直接回 JSON 并中断链路）
+    // 会员令牌解析（账号被禁用时直接回 JSON 并中断链路）
     let (front_user, renew_token) = match parse_user_token(&pool, &headers).await {
         Ok(value) => value,
         Err(res) => return res,
@@ -123,7 +142,7 @@ async fn pipeline(state: AppState, req: Request, ip: Option<String>) -> Response
     with_renew(res, &renew_token)
 }
 
-/// 登录过期前 1 小时内下发续签令牌（对齐 Go 的 `update-token` 响应头）。
+/// 登录过期前 1 小时内下发续签令牌（`update-token` 响应头）。
 fn with_renew(mut res: Response, renew_token: &Option<String>) -> Response {
     if let Some(token) = renew_token {
         if let Ok(value) = header::HeaderValue::from_str(token) {
@@ -156,14 +175,14 @@ async fn check_301(pool: &MySqlPool, uri: &str) -> Option<Response> {
 pub struct FrontUser {
     pub id: u32,
     pub info: Value,
-    /// 会员分组（对齐 Go 的 `ctx.ViewData("userGroup", userGroup)`）
+    /// 会员分组（遵循既有约定）
     pub group: Value,
 }
 
 /// `middleware.ParseUserToken`。
 ///
 /// 返回 `(会员信息, 续签令牌)`；会员被禁用时返回 `Err(JSON 响应)`
-/// （与 Go 的 `{"code":1001,"msg":"ThisAccountHasBeenDisabled"}` 一致）。
+/// （账号被禁用时回 `{"code":1001,"msg":"ThisAccountHasBeenDisabled"}`）。
 async fn parse_user_token(
     pool: &MySqlPool,
     headers: &HeaderMap,
@@ -202,7 +221,7 @@ async fn parse_user_token(
     let mut renew = None;
     if let Ok(claims) = auth::verify(TokenKind::User, &secret, &token) {
         if let Some(id) = claims.subject(TokenKind::User) {
-            // 登录过期时间在 1 小时内则续签（对齐 Go）
+            // 登录过期时间在 1 小时内则续签
             if let Ok(expire) = claims.expire.trim().parse::<i64>() {
                 if expire < chrono::Utc::now().timestamp() + 3600 {
                     if let Ok((new_token, _)) = auth::issue(TokenKind::User, &secret, id, false) {
@@ -211,7 +230,7 @@ async fn parse_user_token(
                 }
             }
             if let Ok(Some(info)) = user::get(pool, id).await {
-                // 账号被禁用：Go 直接回 JSON 并中断
+                // 账号被禁用：直接回 JSON 并中断
                 if !info.status {
                     return Err((
                         StatusCode::OK,
@@ -232,7 +251,7 @@ async fn parse_user_token(
         }
     }
 
-    // JWT 无效/未携带时回退到会员 API Key（对齐 Go 的 GetUserByApiToken）
+    // JWT 无效/未携带时回退到会员 API Key（遵循既有约定 GetUserByApiToken）
     let api_token: Option<u32> =
         sqlx::query_scalar::<_, u32>("SELECT id FROM users WHERE api_token = ? AND status = 1 LIMIT 1")
             .bind(&token)
@@ -312,13 +331,13 @@ fn rewrite_legacy_sitemap_path(path: &str) -> Option<String> {
         .then(|| format!("/sitemap-{}", path.trim_start_matches('/')))
 }
 
-/// sitemap 文件不存在时按配置自动生成（Go `FileServe` 的 `PluginSitemap` 分支）。
+/// sitemap 文件不存在时按配置自动生成（既有约定的 `PluginSitemap` 分支）。
 ///
-/// 与 Go 一致：只有 `settings.sitemap` 已配置时才生成，生成后重新读取产物。
-/// 与 Go 的差异：Rust 版 sitemap 不分片，只产出 `sitemap.{type}`。
+/// 只有 `settings.sitemap` 已配置时才生成，生成后重新读取产物。
+/// 注意：sitemap 不分片，只产出 `sitemap.{type}`。
 async fn auto_build_sitemap(state: &AppState, path: &str) -> Option<Response> {
     let pool = state.db().cloned()?;
-    // Go 的 PluginSitemap 为 nil（未配置）时不自动生成
+    // 未配置 sitemap 时不自动生成
     crate::models::setting::get_raw(&pool, crate::models::plugin::SITEMAP)
         .await
         .ok()
@@ -358,12 +377,12 @@ impl FrontCtx {
         // 旧 sitemap 路径先改写（/archive*.xml|txt → /sitemap-archive*.xml|txt）
         let rewritten = rewrite_legacy_sitemap_path(path);
         let path = rewritten.as_deref().unwrap_or(path);
-        // 目录类请求交给路由（Go：uri 以 / 结尾不 serve 文件）
+        // 目录类请求交给路由（既有实现：uri 以 / 结尾不 serve 文件）
         if path == "/" || path.ends_with('/') {
             return None;
         }
         let rel = path.trim_start_matches('/');
-        // 防路径穿越：逐段校验（Go 用 filepath.Clean + 前缀校验）
+        // 防路径穿越：逐段校验（既有实现用 filepath.Clean + 前缀校验）
         if rel.is_empty()
             || rel.split('/').any(|seg| {
                 seg.is_empty() || seg == ".." || seg.contains('\\') || seg.starts_with('.')
@@ -387,11 +406,11 @@ impl FrontCtx {
             }
         }
 
-        // 避开 favicon.ico（对齐 Go：文件不存在时 400）
+        // 避开 favicon.ico（文件不存在时 400）
         if path.ends_with("favicon.ico") {
             return Some(StatusCode::BAD_REQUEST.into_response());
         }
-        // robots.txt 缺省内容（对齐 Go 的自动生成；Sitemap 行依赖 base_url，略）
+        // robots.txt 缺省内容（遵循既有约定自动生成；Sitemap 行依赖 base_url，略）
         if path == "/robots.txt" {
             return Some((
                 [(
@@ -403,7 +422,7 @@ impl FrontCtx {
                 .into_response());
         }
         // sitemap.xml / sitemap.txt 及子文件：文件存在时已被上面的逻辑服务；
-        // 不存在时按 settings.sitemap 自动生成一次（Go 的 PluginSitemap 分支）
+        // 不存在时按 settings.sitemap 自动生成一次（既有实现的 PluginSitemap 分支）
         let sitemap_name = path.trim_start_matches('/');
         if !sitemap_name.contains('/')
             && sitemap_name.starts_with("sitemap")
@@ -476,7 +495,7 @@ impl FrontCtx {
                         if rule.is_empty() {
                             continue;
                         }
-                        // 移除子网掩码与末尾 .0（对齐 Go）
+                        // 移除子网掩码与末尾 .0
                         rule = rule.split('/').next().unwrap_or(rule);
                         while rule.ends_with(".0") {
                             rule = rule.trim_end_matches(".0");
@@ -542,6 +561,7 @@ impl FrontCtx {
             RouteMatch::Tag { id, token, page } => self.render_tag_page(id, token, page).await,
             RouteMatch::Page { token } => self.render_single_page(&token).await,
             RouteMatch::Category { token, page } => self.render_category_page(&token, page).await,
+            RouteMatch::Account { template } => self.render_account(template).await,
             RouteMatch::Archive {
                 id,
                 token,
@@ -551,7 +571,7 @@ impl FrontCtx {
             RouteMatch::Search { module } => self.render_search(module, page).await,
             RouteMatch::NotImplemented(what) => (
                 StatusCode::NOT_FOUND,
-                html_response(show_message(&format!("{what} 尚未移植"))),
+                html_response(show_message(&format!("{what} 尚未实现"))),
             )
                 .into_response(),
             RouteMatch::NotFound => self.not_found().await,
@@ -564,7 +584,7 @@ impl FrontCtx {
 
     /// 当前页面类型对应的 HTML 缓存 TTL（秒）；不缓存返回 None。
     ///
-    /// 对齐 Go `LoadCachedHtml`：未开启、登录用户、`Cache-Control: no-cache`、
+    /// 遵循既有约定：未开启、登录用户、`Cache-Control: no-cache`、
     /// 以及不在缓存范围内的页面（搜索 / 404 等）都跳过。
     async fn html_cache_ttl(&self, matched: &RouteMatch) -> Option<u64> {
         if self.front_user.is_some() {
@@ -678,14 +698,28 @@ impl FrontCtx {
         if self.path.trim_start_matches('/').is_empty() {
             return RouteMatch::Index;
         }
-        // 静态资源目录没命中文件时直接 404（对齐 Go）
+        // 静态资源目录没命中文件时直接 404
         if param.starts_with("/uploads/")
             || param.starts_with("/static/")
             || param.starts_with("/system/")
         {
             return RouteMatch::NotFound;
         }
-        // 固化链接（Go 的 GetFixedLinkFromCache）
+        // 账户页：直接渲染固定模板（`api_member` 只挂了 POST，
+        // GET 落到本兜底入口）。不加会得到 404，首页的登录 / 注册链接就是死链。
+        match param.as_str() {
+            "/login" => return RouteMatch::Account {
+                template: "login.html",
+            },
+            "/register" => return RouteMatch::Account {
+                template: "register.html",
+            },
+            "/forget" => return RouteMatch::Account {
+                template: "forget.html",
+            },
+            _ => {}
+        }
+        // 固化链接（按分类缓存其地址）
         if let Ok(Some(id)) =
             sqlx::query_scalar::<_, i64>("SELECT id FROM archives WHERE fixed_link = ? LIMIT 1")
                 .bind(&self.path)
@@ -707,7 +741,7 @@ impl FrontCtx {
                 .unwrap_or(1)
         };
 
-        // 规则顺序对齐 Go：search → archiveIndex → peopleIndex → people →
+        // 规则顺序：search → archiveIndex → peopleIndex → people →
         // tagIndex → tag → page → category → archive
         if let Some(values) = url::match_path(mode, url::Kind::Search, param) {
             return RouteMatch::Search {
@@ -716,7 +750,7 @@ impl FrontCtx {
         }
         if let Some(values) = url::match_path(mode, url::Kind::ArchiveIndex, param) {
             if let Some(token) = values.get("module") {
-                // 模块必须真实存在（按 url_token 匹配，对齐 Go），否则继续
+                // 模块必须真实存在（按 url_token 匹配），否则继续
                 if let Ok(Some(item)) = module::get_by_token(&self.pool, token).await {
                     let _ = item;
                     return RouteMatch::ArchiveIndex {
@@ -744,26 +778,39 @@ impl FrontCtx {
             };
         }
         if let Some(values) = url::match_path(mode, url::Kind::Page, param) {
-            if let Some(token) = values.get("filename") {
-                // 必须是单页类型分类（对齐 Go 的校验），否则继续
-                if let Ok(Some(item)) = category::get_by_token(&self.pool, token).await {
-                    if item.is_page() && item.status == 1 {
-                        return RouteMatch::Page {
-                            token: token.clone(),
-                        };
-                    }
+            // ID 模式规则是 `/{id}.html`，字符串模式是 `/{filename}.html`；
+            // 两种占位符都要认，否则 ID 模式下单页会全部落空。
+            let id = values.get("id").and_then(|v| v.parse::<u32>().ok());
+            let token = values.get("filename").cloned().filter(|v| !v.is_empty());
+            let item = match (id, token.as_deref()) {
+                (Some(id), _) => category::get(&self.pool, id).await.ok().flatten(),
+                (None, Some(token)) => category::get_by_token(&self.pool, token).await.ok().flatten(),
+                _ => None,
+            };
+            if let Some(item) = item {
+                // 必须是单页类型分类
+                if item.is_page() && item.status == 1 {
+                    return RouteMatch::Page {
+                        token: item.url_token,
+                    };
                 }
             }
         }
         if let Some(values) = url::match_path(mode, url::Kind::Category, param) {
-            if let Some(token) = values.get("catname") {
-                if let Ok(Some(item)) = category::get_by_token(&self.pool, token).await {
-                    if !item.is_page() && item.status == 1 {
-                        return RouteMatch::Category {
-                            token: token.clone(),
-                            page: page(&values),
-                        };
-                    }
+            // 同上：ID 模式用 `{catid}`，字符串模式用 `{catname}`。
+            let id = values.get("catid").and_then(|v| v.parse::<u32>().ok());
+            let token = values.get("catname").cloned().filter(|v| !v.is_empty());
+            let item = match (id, token.as_deref()) {
+                (Some(id), _) => category::get(&self.pool, id).await.ok().flatten(),
+                (None, Some(token)) => category::get_by_token(&self.pool, token).await.ok().flatten(),
+                _ => None,
+            };
+            if let Some(item) = item {
+                if !item.is_page() && item.status == 1 {
+                    return RouteMatch::Category {
+                        token: item.url_token,
+                        page: page(&values),
+                    };
                 }
             }
         }
@@ -792,12 +839,12 @@ impl FrontCtx {
             .map(|name| name.to_string())
     }
 
-    /// 公共模板上下文（对齐 Go 的 Common 中间件注入的变量）。
+    /// 公共模板上下文（遵循既有约定 Common 中间件注入的变量）。
     fn base_scope(&self, page: u32) -> Scope {
         let mut scope = Scope::new();
         scope.insert("currentPage".into(), Value::from(page));
         scope.insert("version".into(), Value::from(env!("CARGO_PKG_VERSION")));
-        // 手机端模板切换未移植，固定 false；UA 简单判断用于变量本身
+        // 手机端模板切换未实现，固定 false；UA 简单判断用于变量本身
         let ua = self
             .headers
             .get(header::USER_AGENT)
@@ -817,9 +864,30 @@ impl FrontCtx {
     async fn render_with(&self, template: &str, scope: &Scope, provider: &SiteProvider) -> Response {
         match self.state.templates().render(template, scope, provider).await {
             Ok(html) => html_response(html),
-            // 渲染失败 → 500 页（对齐 Go 的 OnErrorCode(500)）
+            // 渲染失败 → 500 页
             Err(err) => internal_error(&self.state, &self.pool, &format!("{err:#}")).await,
         }
+    }
+
+    /// 账户页（登录 / 注册 / 找回密码）：既有实现由 controller 直接渲染固定模板。
+    ///
+    /// 这几条路径在 `api_member` 里只挂了 POST，GET 落到本兜底入口；
+    /// 不单独渲染的话首页的「登录 / 注册」链接就是 404。
+    async fn render_account(&self, template: &str) -> Response {
+        let Some(template) = self.template_exist(&[template]) else {
+            return self.not_found().await;
+        };
+        let Ok(provider) = SiteProvider::new(self.pool.clone(), 0).await else {
+            return self.not_found().await;
+        };
+        let mut scope = self.base_scope(1);
+        let redirect = query_params(&self.query)
+            .get("redirect")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        scope.insert("redirect".into(), Value::String(redirect));
+        self.render_with(&template, &scope, &provider).await
     }
 
     /// 首页（`controller.IndexPage`）。
@@ -870,7 +938,7 @@ impl FrontCtx {
         self.render_category(&item, page).await
     }
 
-    /// 栏目渲染（供 `/preview/list/:cid` 复用）：模板优先级对齐 Go
+    /// 栏目渲染（供 `/preview/list/:cid` 复用）：模板优先级遵循既有约定
     /// `CategoryPage`：设置的 template → {模块}/{url_token}.html →
     /// {模块}/list-{id}.html → {模块}/list.html → {模块}_list.html。
     pub async fn render_category(&self, item: &Category, page: u32) -> Response {
@@ -974,7 +1042,7 @@ impl FrontCtx {
         let Ok(Some(item)) = found else {
             return self.not_found().await;
         };
-        // module / catname 校验（对齐 Go：对不上直接 404）
+        // module / catname 校验（对不上直接 404）
         if let Some(token) = &module_token {
             match module::get_by_token(&self.pool, token).await {
                 Ok(Some(m)) if m.id == item.module_id => {}
@@ -1008,7 +1076,7 @@ impl FrontCtx {
             })
             .unwrap_or_else(|| "article".to_string());
 
-        // 模板优先级对齐 Go `ArchiveDetail`：内容设置的 template →
+        // 模板优先级遵循既有约定：内容设置的 template →
         // 栏目的 detail_template → {模块}/detail-{id}.html → {模块}/detail.html
         // → {模块}_detail.html
         let mut tpl = item.template.trim().to_string();
@@ -1062,7 +1130,7 @@ impl FrontCtx {
 
     /// 标签详情页（`controller.TagPage`）。
     async fn render_tag_page(&self, id: Option<u32>, token: Option<String>, page: u32) -> Response {
-        // 优先 url_token（对齐 Go）
+        // 优先 url_token（遵循既有约定）
         let found = match (token.as_deref(), id) {
             (Some(token), _) if !token.is_empty() => tag::get_by_token(&self.pool, token).await,
             (_, Some(id)) => tag::get(&self.pool, id).await,
@@ -1098,7 +1166,7 @@ impl FrontCtx {
         if let Some(token) = &module_token {
             match module::get_by_token(&self.pool, token).await {
                 Ok(Some(item)) => module_row = Some(item),
-                // 模块不存在（对齐 Go：UndefinedModel 提示）
+                // 模块不存在（遵循既有约定：UndefinedModel 提示）
                 _ => {
                     return (
                         StatusCode::NOT_FOUND,
@@ -1212,7 +1280,7 @@ async fn internal_error(state: &AppState, pool: &MySqlPool, message: &str) -> Re
         .into_response()
 }
 
-/// `controller.ShowMessage`：内联样式的提示页（Go 版逐字对齐，含返回按钮）。
+/// `controller.ShowMessage`：内联样式的提示页（既有实现逐字对齐，含返回按钮）。
 fn show_message(message: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=utf-8>\
@@ -1241,7 +1309,7 @@ fn html_response(html: String) -> Response {
         .into_response()
 }
 
-/// 蜘蛛判断（Go `library.GetSpider` 的宽松版：含 spider/bot 即视为蜘蛛）。
+/// 蜘蛛判断（既有约定的宽松版：含 spider/bot 即视为蜘蛛）。
 fn is_spider(ua_lower: &str) -> bool {
     ua_lower.contains("spider") || ua_lower.contains("bot")
 }
@@ -1306,7 +1374,7 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-/// 路由解析结果（对齐 Go ParseRoute 的 matchMap["match"]）。
+/// 路由解析结果（遵循既有约定 ParseRoute 的 matchMap["match"]）。
 #[derive(Debug, Clone, PartialEq)]
 enum RouteMatch {
     Index,
@@ -1327,6 +1395,10 @@ enum RouteMatch {
     Page {
         token: String,
     },
+    /// 账户页（登录 / 注册 / 找回密码），固定模板名。
+    Account {
+        template: &'static str,
+    },
     Search {
         module: Option<String>,
     },
@@ -1338,7 +1410,7 @@ enum RouteMatch {
         token: Option<String>,
         page: u32,
     },
-    /// 规则能匹配但功能未移植（会员主页等），明确提示而不是静默 404
+    /// 规则能匹配但功能未实现（会员主页等），明确提示而不是静默 404
     NotImplemented(&'static str),
     NotFound,
 }
@@ -1358,8 +1430,7 @@ mod tests {
     }
 
     fn test_state(pool: Option<MySqlPool>) -> AppState {
-        let template_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../template/default")
+        let template_dir = crate::models::test_template_dir()
             .to_string_lossy()
             .to_string();
         let public_dir = std::env::temp_dir()

@@ -1,14 +1,12 @@
 //! 登录与 JWT 令牌。
 //!
-//! 对齐 Go 版：
+//! 令牌约定：
 //! - 管理员令牌 claims 为 `{"adminId":"<id>","t":"<过期时间戳>"}`，
-//!   签名密钥是 `TokenSecret + "-admin-token"`（`provider/admin.go:GetAdminAuthToken`）；
-//! - 会员令牌 claims 为 `{"userId":"<id>","t":"..."}`，密钥 `TokenSecret + "-user-token"`
-//!   （`provider/user.go:GetUserAuthToken`）；
-//! - `TokenSecret` 存在 `settings.system.token_secret`，缺省时生成 32 位随机串并写回
-//!   （`provider/website.go:393`）。
+//! 签名密钥是 `TokenSecret + "-admin-token"`；
+//! - 会员令牌 claims 为 `{"userId":"<id>","t":"..."}`，密钥 `TokenSecret + "-user-token"`；
+//! - `TokenSecret` 存在 `settings.system.token_secret`，缺省时生成 32 位随机串并写回。
 //!
-//! 注意 claims 里的 `t` 是「过期时间戳」且以字符串存放，和 Go 一致；
+//! 注意 claims 里的 `t` 是「过期时间戳」且以字符串存放；
 //! `jsonwebtoken` 只认 `exp`，所以过期校验在 [`verify`] 里手工做。
 
 use anyhow::{bail, Context, Result};
@@ -40,7 +38,7 @@ impl TokenKind {
     }
 }
 
-/// JWT claims（键名与 Go 版一致）。
+/// JWT claims（键名与既有接口契约一致）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     #[serde(rename = "adminId", skip_serializing_if = "Option::is_none", default)]
@@ -106,7 +104,7 @@ pub async fn token_secret(pool: &MySqlPool) -> Result<String> {
 
 /// 签发令牌，返回 `(token, 过期时间戳)`。
 ///
-/// `remember` 时 30 天，否则 24 小时（与 Go 版一致）。
+/// `remember` 时 30 天，否则 24 小时（与既有接口契约一致）。
 pub fn issue(kind: TokenKind, secret: &str, id: u32, remember: bool) -> Result<(String, i64)> {
     let now = chrono::Utc::now().timestamp();
     let expire = if remember {
@@ -138,7 +136,7 @@ pub fn issue(kind: TokenKind, secret: &str, id: u32, remember: bool) -> Result<(
 /// 校验令牌：签名 + 过期时间。
 pub fn verify(kind: TokenKind, secret: &str, token: &str) -> Result<Claims> {
     let key = format!("{secret}{}", kind.suffix());
-    // 关掉内置 exp 校验（Go 用的是 `t`），其余仍然校验算法
+    // 关掉内置 exp 校验（既有实现用的是 `t`），其余仍然校验算法
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = false;
     validation.required_spec_claims.clear();
@@ -165,7 +163,7 @@ pub fn verify(kind: TokenKind, secret: &str, token: &str) -> Result<Claims> {
     Ok(claims)
 }
 
-/// bcrypt 校验（Go 库存的也是 bcrypt 哈希）。
+/// bcrypt 校验（既有实现库存的也是 bcrypt 哈希）。
 pub fn check_password(plain: &str, hash: &str) -> bool {
     if plain.is_empty() || hash.is_empty() {
         return false;

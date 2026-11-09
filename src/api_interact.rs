@@ -1,18 +1,17 @@
 //! 互动与第三方 API（批次 D）。
 //!
-//! 对应 Go 版 `controller/comment.go`、`guestbook.go`、`apiTag.go`（评论 / 留言部分）、
-//! `apiArchive.go`（收藏部分）、`apiWechat.go`、`apiWeapp.go`、`apiGoogle.go`、
-//! `apiNotify.go`（微信 / 小程序通知）与 `api.go` 的 `ApiLogStatistic`。
+//! 覆盖评论 / 留言、收藏、微信与小程序通知、Google 登录、
+//! 访问日志统计这一组接口的既有契约。
 //!
 //! 路径按主线要求**不带 `/api` 前缀**（如 `/comment/list`），
-//! 同时注册 `/api/...` 别名，保证 Go 版原始地址同样可用；
-//! 微信 / 小程序通知另外保留 Go 的 `/notify/...` 地址。
+//! 同时注册 `/api/...` 别名，保证既有调用地址同样可用；
+//! 微信 / 小程序通知另外保留 `/notify/...` 地址。
 //!
-//! 响应信封与 Go 版一致：成功 `{"code":0,"msg":"","data":...}`，
+//! 响应信封：成功 `{"code":0,"msg":"","data":...}`，
 //! 列表接口额外带顶层 `total`，失败 `{"code":1,"msg":"..."}`；
-//! 需要登录时用 Go 的 `config.StatusNoLogin`（1001）；
-//! 依赖外部服务、当前项目未实现的接口用 `{"code":-1,"msg":"..."}`
-//! （与 `src/routes.rs` 里的 `fail_ai` 同款）。
+//! 需要登录时用 `config.StatusNoLogin`（1001）；
+//! 微信 / 小程序回调这类「不是 JSON 契约」的地址在参数不完整时也用
+//! `{"code":-1,"msg":"..."}`（与 `src/routes.rs` 里的 `fail_ai` 同款）。
 
 use std::collections::HashMap;
 
@@ -25,7 +24,8 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use crate::auth;
-use crate::models::{comment, interact, site_setting, user};
+use crate::models::wechat::{self, crypto, wxa};
+use crate::models::{comment, front_content, interact, site_setting, trade, user};
 use crate::routes::{bearer_token, fail, failed, ok, NO_DB};
 use crate::state::AppState;
 
@@ -73,7 +73,7 @@ pub fn router() -> Router<AppState> {
     router = api_route!(router, "/log", get, access_log);
     router = api_route!(router, "/log", post, access_log);
 
-    // Go 版把微信 / 小程序通知挂在 `/notify` 分组下，这里保留同样的地址
+    // 既有实现把微信 / 小程序通知挂在 `/notify` 分组下，这里保留同样的地址
     router = router
         .route("/notify/wechat/pay", post(wechat_pay_notify))
         .route("/notify/weapp/msg", get(weapp_msg_get))
@@ -86,17 +86,20 @@ pub fn router() -> Router<AppState> {
 // 响应工具
 // ---------------------------------------------------------------------------
 
-/// 列表响应：顶层额外带 `total`（对齐 Go 的列表接口）。
+/// 列表响应：顶层额外带 `total`（按既有列表接口）。
 fn ok_total(total: i64, data: Value) -> Response {
     Json(json!({ "code": 0, "msg": "", "total": total, "data": data })).into_response()
 }
 
-/// 需要登录（Go 的 `config.StatusNoLogin` = 1001）。
+/// 需要登录（既有的 `config.StatusNoLogin` = 1001）。
 fn fail_no_login() -> Response {
     Json(json!({ "code": 1001, "msg": "请登录" })).into_response()
 }
 
-/// 未实现（与 `src/routes.rs` 里的 `fail_ai` 同款）。
+/// 参数不完整等前置错误（`code:-1`，与 `src/routes.rs` 里的 `fail_ai` 同款）。
+///
+/// 微信 / 小程序回调的调用方不是前端页面，保持这个信封比 `code:1` 更能区分
+/// 「请求本身不合法」与「业务失败」。
 fn fail_unsupported(msg: impl Into<String>) -> Response {
     Json(json!({ "code": -1, "msg": msg.into() })).into_response()
 }
@@ -105,7 +108,7 @@ fn fail_unsupported(msg: impl Into<String>) -> Response {
 // 参数解析
 // ---------------------------------------------------------------------------
 
-/// 查询串取值（对齐 Go 的 `URLParam*`：取不到就当零值，不报错）。
+/// 查询串取值（按 `URLParam*` 的语义：取不到就当零值，不报错）。
 fn q_str(q: &HashMap<String, String>, key: &str) -> String {
     q.get(key)
         .map(|value| value.trim().to_string())
@@ -118,7 +121,7 @@ fn q_i64(q: &HashMap<String, String>, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// `limit` 参数：支持 `offset,limit` 与 `limit` 两种写法（对齐 Go）。
+/// `limit` 参数：支持 `offset,limit` 与 `limit` 两种写法（按既有约定）。
 fn q_limit(q: &HashMap<String, String>, default_limit: i64, max_limit: i64) -> (i64, i64) {
     let raw = q_str(q, "limit");
     if raw.is_empty() {
@@ -144,7 +147,7 @@ fn q_limit(q: &HashMap<String, String>, default_limit: i64, max_limit: i64) -> (
 
 /// 解析请求体：JSON 对象或 urlencoded 表单。
 ///
-/// 值统一成字符串（数组用逗号连接，对齐 Go 的 checkbox 处理）。
+/// 值统一成字符串（数组用逗号连接，按既有 checkbox 处理）。
 fn parse_body(headers: &HeaderMap, body: &Bytes) -> HashMap<String, String> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -202,7 +205,7 @@ fn percent_decode(raw: &str) -> String {
         .to_string()
 }
 
-/// JSON 值转字符串（数组用逗号连接，对齐 Go 的 checkbox 处理）。
+/// JSON 值转字符串（数组用逗号连接，按既有 checkbox 处理）。
 fn value_to_string(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
@@ -260,7 +263,7 @@ fn site_base_url(headers: &HeaderMap) -> String {
 
 /// 取当前登录会员（未登录返回 `None`）。
 ///
-/// 令牌来源与 Go 的 `ParseUserToken` 一致：`token` 头 / `Authorization: Bearer` / `token` Cookie。
+/// 令牌来源与既有的 `ParseUserToken` 一致：`token` 头 / `Authorization: Bearer` / `token` Cookie。
 async fn member_of(pool: &sqlx::MySqlPool, headers: &HeaderMap) -> Option<u32> {
     let token = headers
         .get("token")
@@ -294,7 +297,7 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 // 评论
 // ---------------------------------------------------------------------------
 
-/// `GET /comment/list` —— 评论列表（Go 的 `ApiCommentList`）。
+/// `GET /comment/list` —— 评论列表（按 `ApiCommentList` 的语义）。
 ///
 /// 参数：`id`（文档 ID）、`user_id`、`order`（默认 `id desc`）、`page`、`limit`
 /// （支持 `offset,limit` 与 `limit` 两种写法）。
@@ -327,7 +330,7 @@ async fn comment_list(
         Err(err) => return failed(err),
     };
 
-    // 文档标题 + 父评论（Go 的 `item_title` / `parent`）
+    // 文档标题 + 父评论（既有的 `item_title` / `parent`）
     let archive_ids: Vec<i64> = rows.iter().map(|item| item.archive_id).collect();
     let titles = comment::archive_titles(pool, &archive_ids)
         .await
@@ -352,7 +355,7 @@ async fn comment_list(
     ok_total(total, Value::Array(data))
 }
 
-/// `POST /comment/publish` —— 发布评论（Go 的 `CommentPublish` / `ApiCommentPublish`）。
+/// `POST /comment/publish` —— 发布评论（既有的 `CommentPublish` / `ApiCommentPublish`）。
 ///
 /// 请求字段（JSON 或表单都支持）：`archive_id`、`content`、`user_name`、`email`、
 /// `ip`、`parent_id`、`to_uid`、`captcha_id`、`captcha`。
@@ -400,7 +403,7 @@ async fn comment_publish(
         }
     }
 
-    // 登录会员：用户名取会员资料（Go 同款）
+    // 登录会员：用户名取会员资料（按既有约定）
     let member = member_of(pool, &headers).await;
     let member_row = match member {
         Some(id) => user::get(pool, id).await.ok().flatten(),
@@ -435,7 +438,7 @@ async fn comment_publish(
         }
     }
 
-    // 审核：用户组开启「免审核」时直接正常（Go 的 ContentNoVerify）
+    // 审核：用户组开启「免审核」时直接正常（既有的 ContentNoVerify）
     let status = match member_row.as_ref() {
         Some(item)
             if interact::group_no_verify(pool, item.group_id)
@@ -470,7 +473,7 @@ async fn comment_publish(
     .into_response()
 }
 
-/// `POST /comment/praise` —— 评论点赞（Go 的 `CommentPraise` / `ApiCommentPraise`）。
+/// `POST /comment/praise` —— 评论点赞（既有的 `CommentPraise` / `ApiCommentPraise`）。
 ///
 /// 请求字段：`id`（评论 ID）。需要登录。
 async fn comment_praise(
@@ -503,7 +506,7 @@ async fn comment_praise(
     let Some(mut updated) = comment::get(pool, id).await.ok().flatten() else {
         return fail("record not found");
     };
-    // Go 的返回体：点赞数 +1 并标记 active
+    // 既有的返回体：点赞数 +1 并标记 active
     updated.vote_count += 1;
     let mut payload = interact::comment_payload(&updated, "", None);
     if let Some(map) = payload.as_object_mut() {
@@ -516,7 +519,7 @@ async fn comment_praise(
 // 收藏
 // ---------------------------------------------------------------------------
 
-/// `GET /favorite/list` —— 我的收藏（Go 的 `ApiGetFavorites`）。
+/// `GET /favorite/list` —— 我的收藏（按 `ApiGetFavorites` 的语义）。
 ///
 /// 参数：`current`（页码）、`pageSize`（每页）。需要登录。
 async fn favorite_list(
@@ -550,7 +553,7 @@ async fn favorite_list(
     }
 }
 
-/// `POST /favorite/check` —— 批量查收藏状态（Go 的 `ApiCheckFavorites`）。
+/// `POST /favorite/check` —— 批量查收藏状态（按 `ApiCheckFavorites` 的语义）。
 ///
 /// 请求字段：`archive_id`、`archive_ids`（数组或逗号分隔）。
 async fn favorite_check(
@@ -587,7 +590,7 @@ async fn favorite_check(
     }
 }
 
-/// `POST /favorite/add` —— 收藏 / 取消收藏（Go 的 `ApiAddFavorite`，开关语义）。
+/// `POST /favorite/add` —— 收藏 / 取消收藏（既有的 `ApiAddFavorite`，开关语义）。
 ///
 /// 请求字段：`archive_id`、`sku_id`。需要登录。
 async fn favorite_add(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -626,7 +629,7 @@ async fn favorite_add(State(state): State<AppState>, headers: HeaderMap, body: B
     }
 }
 
-/// `POST /favorite/delete` —— 取消收藏（Go 的 `ApiDeleteFavorite`）。
+/// `POST /favorite/delete` —— 取消收藏（按 `ApiDeleteFavorite` 的语义）。
 ///
 /// 请求字段：`archive_id`。需要登录。
 async fn favorite_delete(
@@ -658,14 +661,14 @@ async fn favorite_delete(
 // 留言
 // ---------------------------------------------------------------------------
 
-/// `GET /guestbook.html` —— 留言页（Go 的 `GuestbookPage`）。
+/// `GET /guestbook.html` —— 留言页（按 `GuestbookPage` 的语义）。
 ///
 /// 当前项目还没有前台模板，这里直接返回留言字段（等价 `/guestbook/fields`）。
 async fn guestbook_page(State(state): State<AppState>) -> Response {
     guestbook_fields(State(state)).await
 }
 
-/// `GET /guestbook/fields` —— 留言字段（Go 的 `ApiGuestbook`）。
+/// `GET /guestbook/fields` —— 留言字段（按 `ApiGuestbook` 的语义）。
 async fn guestbook_fields(State(state): State<AppState>) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -682,10 +685,10 @@ async fn guestbook_fields(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `POST /guestbook.html` —— 提交留言（Go 的 `GuestbookForm` / `ApiGuestbookForm`）。
+/// `POST /guestbook.html` —— 提交留言（既有的 `GuestbookForm` / `ApiGuestbookForm`）。
 ///
 /// 请求体按 `settings.guestbook.fields` 里的字段名提交；
-/// 必填项为空时返回「xx必填」（Go 的 `%sIsRequired`）。
+/// 必填项为空时返回「xx必填」（按 `%sIsRequired` 的语义）。
 async fn guestbook_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -787,9 +790,11 @@ async fn guestbook_form(
 // 微信
 // ---------------------------------------------------------------------------
 
-/// `GET /wechat` —— 微信服务器校验（Go 的 `WechatApi` 的 GET 分支）。
+/// `GET /wechat` —— 微信服务器校验（既有的 `WechatApi` 的 GET 分支）。
 ///
-/// 校验方式与微信一致：`sha1(sort(token, timestamp, nonce)) == signature`。
+/// 校验方式与微信一致：`sha1(sort(token, timestamp, nonce)) == signature`，
+/// 通过后必须**原样回显 `echostr`**，否则公众号后台的「服务器配置」保存不了
+/// （既有的 `wechatServer.VerifyURL` 就是这么做的）。
 async fn wechat_verify(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
@@ -809,31 +814,100 @@ async fn wechat_verify(
     let signature = q_str(&q, "signature");
     let timestamp = q_str(&q, "timestamp");
     let nonce = q_str(&q, "nonce");
+    let echostr = q_str(&q, "echostr");
     if signature.is_empty() || timestamp.is_empty() || nonce.is_empty() {
         return fail_unsupported("微信服务器校验失败：缺少 signature / timestamp / nonce");
     }
     if interact::wechat_signature(&token, &timestamp, &nonce) != signature {
         return (StatusCode::FORBIDDEN, "invalid signature").into_response();
     }
-    (StatusCode::OK, "success").into_response()
+    if echostr.is_empty() {
+        // 没有 echostr（例如浏览器直接访问）时给一句可读结果
+        return (StatusCode::OK, "success").into_response();
+    }
+    (StatusCode::OK, echostr).into_response()
 }
 
-/// `POST /wechat` —— 公众号消息回调（Go 的 `WechatApi` 的 POST 分支）。
+/// `POST /wechat` —— 公众号消息回调（既有的 `WechatApi` 的 POST 分支）。
 ///
-/// 消息会落到 `wechat_messages`，并按「自动回复规则」生成回复内容；
-/// **推送给微信本身需要 access_token，当前项目未实现**（回复内容已入库）。
+/// 公众号开启「安全模式」（配置了 EncodingAESKey）时 body 是加密信封，
+/// 先按微信文档验签 + AES-128-CBC 解密，再走同一套分发。
+/// 回复用**被动回复**：微信要求 5 秒内回包，
+/// 客服消息接口（[`wechat::push_text`]）留给后台手动回复与验证码下发。
 async fn wechat_message(
     State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    let xml = String::from_utf8_lossy(&body).to_string();
-    let fields = xml_fields(&xml);
+    let config = interact::wechat_config(pool)
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let text_of = |key: &str| {
+        config
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let token = text_of("token");
+    let aes_key = text_of("encoding_aes_key");
+    let app_id = text_of("app_id");
+
+    let raw = String::from_utf8_lossy(&body).to_string();
+    // 明文模式：普通 signature 也要校验（安全模式走下面的 msg_signature）
+    if wxa::envelope_encrypt(&raw).is_none() && !token.is_empty() {
+        let signature = q_str(&q, "signature");
+        if !signature.is_empty() {
+            let timestamp = q_str(&q, "timestamp");
+            let nonce = q_str(&q, "nonce");
+            if interact::wechat_signature(&token, &timestamp, &nonce) != signature {
+                return (StatusCode::FORBIDDEN, "invalid signature").into_response();
+            }
+        }
+    }
+
+    let mut fields = xml_fields(&raw);
+    // 安全模式：信封里带 <Encrypt>，先验签解密再当普通报文处理
+    let mut encrypted = false;
+    if let Some(envelope) = wxa::envelope_encrypt(&raw) {
+        if aes_key.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "公众号回调是加密报文，但未配置 EncodingAESKey",
+            )
+                .into_response();
+        }
+        let signature = q_str(&q, "msg_signature");
+        let timestamp = q_str(&q, "timestamp");
+        let nonce = q_str(&q, "nonce");
+        match crypto::decrypt_message(
+            &token,
+            &aes_key,
+            &app_id,
+            &signature,
+            &timestamp,
+            &nonce,
+            &envelope,
+        ) {
+            Ok(xml) => {
+                fields = xml_fields(&xml);
+                encrypted = true;
+            }
+            Err(err) => {
+                tracing::warn!("公众号消息解密失败：{err}");
+                return (StatusCode::FORBIDDEN, format!("消息解密失败：{err}")).into_response();
+            }
+        }
+    }
+
     let msg_type = fields.get("MsgType").cloned().unwrap_or_default();
     let from = fields.get("FromUserName").cloned().unwrap_or_default();
+    let to_user = fields.get("ToUserName").cloned().unwrap_or_default();
     let mut content = fields.get("Content").cloned().unwrap_or_default();
 
     if msg_type == "event" {
@@ -845,9 +919,6 @@ async fn wechat_message(
         }
     }
 
-    let config = interact::wechat_config(pool)
-        .await
-        .unwrap_or_else(|_| json!({}));
     let verify_key = config
         .get("verify_key")
         .and_then(Value::as_str)
@@ -892,19 +963,36 @@ async fn wechat_message(
     }
 
     let _ = interact::save_wechat_message(pool, &from, &content, &reply, reply_time).await;
-    // 自动回复推送到微信（Go `ReplyWechatMessage`）：未配置 AppID/Secret 时静默跳过
-    if !reply.trim().is_empty() {
-        if let Err(err) = crate::models::wechat::push_text(pool, &from, &reply).await {
-            tracing::warn!("推送微信客服消息失败：{err}");
-        }
+
+    if reply.trim().is_empty() {
+        // 没有可回复的内容：回 success 表示已收到，微信不会重试
+        return (StatusCode::OK, "success").into_response();
     }
-    (StatusCode::OK, "success").into_response()
+
+    let xml = wechat::text_reply_xml(
+        &from,
+        &to_user,
+        &reply,
+        chrono::Utc::now().timestamp(),
+    );
+    if encrypted {
+        return match crypto::encrypt_message(&token, &aes_key, &app_id, &xml) {
+            Ok(envelope) => xml_response(envelope),
+            Err(err) => {
+                // 加密失败时退化成 success（至少不让微信重推）
+                tracing::warn!("公众号被动回复加密失败：{err}");
+                (StatusCode::OK, "success").into_response()
+            }
+        };
+    }
+    xml_response(xml)
 }
 
-/// `GET /wechat/auth` —— 公众号网页授权（Go 的 `WechatAuthApi`）。
+/// `GET /wechat/auth` —— 公众号网页授权（按 `WechatAuthApi` 的语义）。
 ///
-/// 没有 `code` 时 302 跳转到微信授权页；带 `code` 时需要调微信接口换用户信息，
-/// 当前项目未实现（返回明确提示）。
+/// 没有 `code` 时 302 到微信授权页；带 `code` 时换 `sns/oauth2/access_token`
+/// → 拉 `sns/userinfo` → upsert `user_wechats` 并绑定会员（`union_id` 相同的视为同一人）。
+/// 这是浏览器里打开的页面，所以结果用提示页返回（按 `ShowMessage` 的语义），不是 JSON。
 async fn wechat_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -919,307 +1007,110 @@ async fn wechat_auth(
         .unwrap_or("")
         .to_ascii_lowercase();
     if !ua.contains("micromessenger") {
-        return fail("请在微信内打开");
+        return wechat_page("请在微信内打开");
     }
     let config = interact::wechat_config(pool)
         .await
         .unwrap_or_else(|_| json!({}));
-    let app_id = config
-        .get("app_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if app_id.is_empty() {
-        return fail("未配置微信公众号 AppID");
-    }
-    if !q_str(&q, "code").is_empty() {
-        let code = q_str(&q, "code");
-        let app_secret = config
-            .get("app_secret")
+    let text_of = |key: &str| {
+        config
+            .get(key)
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim()
-            .to_string();
-        if app_secret.is_empty() {
-            return fail("未配置微信公众号 AppSecret");
-        }
-        let (access_token, openid) = match crate::models::wechat::oauth_access_token(
-            &app_id,
-            &app_secret,
-            &code,
-        )
-        .await
-        {
-            Ok(pair) => pair,
-            Err(err) => return fail(err.to_string()),
-        };
-        let info = match crate::models::wechat::oauth_user_info(&access_token, &openid).await {
-            Ok(value) => value,
-            Err(err) => return fail(err.to_string()),
-        };
-        let nickname = info.get("nickname").and_then(Value::as_str).unwrap_or("");
-        let avatar = info
-            .get("headimgurl")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let union_id = info.get("unionid").and_then(Value::as_str).unwrap_or("");
-        let gender = info.get("sex").and_then(Value::as_i64).unwrap_or(0) as i32;
-        let user_id =
-            match interact::save_wechat_user(pool, &openid, union_id, nickname, avatar, gender).await
-            {
-                Ok(id) => id,
-                Err(err) => return failed(err),
-            };
-
-        let state_value = q_str(&q, "state");
-        if state_value == "code" {
-            // Go `WechatAuthApi`：state=code 时下发验证码并推送到微信
-            let verify_code = generate_verify_code(&openid);
-            let message = format!("验证码：{verify_code}，30分钟内有效");
-            if let Err(err) = crate::models::wechat::push_text(pool, &openid, &message).await {
-                tracing::warn!("推送微信验证码失败：{err}");
-            }
-            return ok(json!({
-                "openid": openid,
-                "user_id": user_id,
-                "verify_code": verify_code,
-            }));
-        }
-        return ok(json!({
-            "openid": openid,
-            "user_id": user_id,
-            "user": info,
-        }));
-    }
+            .to_string()
+    };
+    let app_id = text_of("app_id");
+    let app_secret = text_of("app_secret");
+    let verify_msg = text_of("verify_msg");
     let state_value = q_str(&q, "state");
-    let redirect_uri = format!("{}/api/wechat/auth", site_base_url(&headers));
-    let encoded =
-        percent_encoding::utf8_percent_encode(&redirect_uri, percent_encoding::NON_ALPHANUMERIC)
-            .to_string();
-    let location = format!(
-        "https://open.weixin.qq.com/connect/oauth2/authorize?appid={app_id}\
-         &redirect_uri={encoded}&response_type=code&scope=snsapi_userinfo&state={state_value}\
-         #wechat_redirect"
-    );
-    let mut response = StatusCode::FOUND.into_response();
-    if let Ok(value) = HeaderValue::from_str(&location) {
-        response.headers_mut().insert(header::LOCATION, value);
+    let code = q_str(&q, "code");
+
+    if code.is_empty() {
+        if app_id.is_empty() {
+            return wechat_page("未配置微信公众号 AppID");
+        }
+        let redirect_uri = format!("{}/api/wechat/auth", site_base_url(&headers));
+        let encoded =
+            percent_encoding::utf8_percent_encode(&redirect_uri, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        let location = format!(
+            "https://open.weixin.qq.com/connect/oauth2/authorize?appid={app_id}\
+             &redirect_uri={encoded}&response_type=code&scope=snsapi_userinfo&state={state_value}\
+             #wechat_redirect"
+        );
+        let mut response = StatusCode::FOUND.into_response();
+        if let Ok(value) = HeaderValue::from_str(&location) {
+            response.headers_mut().insert(header::LOCATION, value);
+        }
+        return response;
     }
-    response
+
+    if app_id.is_empty() || app_secret.is_empty() {
+        return wechat_page("请先在公众号配置中填写 AppID 和 AppSecret");
+    }
+    let (access_token, openid) =
+        match wechat::oauth_access_token(&app_id, &app_secret, &code).await {
+            Ok(pair) => pair,
+            Err(err) => return wechat_page(&err.to_string()),
+        };
+    let info = match wechat::oauth_user_info(&access_token, &openid).await {
+        Ok(value) => value,
+        Err(err) => return wechat_page(&err.to_string()),
+    };
+    let nickname = info.get("nickname").and_then(Value::as_str).unwrap_or("");
+    let avatar = info.get("headimgurl").and_then(Value::as_str).unwrap_or("");
+    let union_id = info.get("unionid").and_then(Value::as_str).unwrap_or("");
+    let gender = info.get("sex").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let user_id =
+        match interact::save_wechat_user(pool, &openid, union_id, nickname, avatar, gender).await {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!("公众号授权绑定会员失败：{err:#}");
+                return wechat_page(&format!("微信授权失败：{err}"));
+            }
+        };
+
+    if state_value == "code" {
+        // `WechatAuthApi`：state=code 时下发验证码并推送到微信
+        let verify_code = generate_verify_code(&openid);
+        let message = if verify_msg.contains("{code}") {
+            verify_msg.replacen("{code}", &verify_code, 1)
+        } else {
+            format!("验证码：{verify_code}，30分钟内有效{verify_msg}")
+        };
+        if let Err(err) = wechat::push_text(pool, &openid, &message).await {
+            tracing::warn!("推送微信验证码失败：{err}");
+        }
+        return wechat_page(&message);
+    }
+
+    // 既有实现在这个分支不输出内容（浏览器里是白屏），这里给一句提示，便于用户知道能返回了
+    wechat_page(&format!(
+        "微信授权成功（会员 ID：{user_id}），可以返回继续操作。"
+    ))
 }
 
-/// 微信支付回调（Go 的 `NotifyWechatPay`）。
+/// 微信支付回调（按 `NotifyWechatPay` 的语义）。
 ///
-/// 流程：查支付单 → 验签 → 标记支付成功（写 `payments` / `orders` / `finances`）
-/// 或处理退款（`order_refunds`）。
+/// 真正的实现只有一份：`crate::api_trade::wechat_notify`（V2 验签、金额核对、
+/// `settle_gateway_payment` 落库：payments / orders / finances / order_refunds）。
+/// 这里只做**薄转发**，让 `/wechat/pay`、`/notify/wechat/pay` 与
+/// `/api_trade/wechat/notify` 三条入口的落库口径完全一致。
 async fn wechat_pay_notify(State(state): State<AppState>, body: Bytes) -> Response {
-    let Some(pool) = state.db() else {
-        return fail(NO_DB);
-    };
-    let xml = String::from_utf8_lossy(&body).to_string();
-    let fields = xml_fields(&xml);
-
-    let out_trade_no = fields
-        .get("out_trade_no")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if out_trade_no.is_empty() {
-        return wechat_pay_reply(false, "参数不完整");
-    }
-
-    let payment: Option<(u32, String, i64, u32, i64, i64, i32)> = sqlx::query_as(
-        "SELECT id, order_id, paid_time, user_id, amount, payment_account_id, status \
-         FROM payments WHERE payment_id = ? LIMIT 1",
-    )
-    .bind(&out_trade_no)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    let Some((payment_id, order_id, paid_time, user_id, amount, account_id, _status)) = payment
-    else {
-        return wechat_pay_reply(false, "支付单不存在");
-    };
-    if paid_time > 0 {
-        return wechat_pay_reply(true, "OK");
-    }
-
-    // 验签（MD5，参数按键名排序后拼 key）
-    let api_key = match account_api_key(pool, account_id as i64).await {
-        Some(key) => key,
-        None => String::new(),
-    };
-    if !api_key.is_empty() {
-        let sign = fields.get("sign").cloned().unwrap_or_default();
-        let expect = wechat_sign(&fields, &api_key);
-        if !sign.eq_ignore_ascii_case(&expect) {
-            return wechat_pay_reply(false, "签名校验失败");
-        }
-    } else {
-        tracing::warn!("微信支付回调：支付账号没有配置 api_key，跳过验签");
-    }
-
-    let refund_id = fields
-        .get("refund_id")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let now = chrono::Utc::now().timestamp();
-
-    if !refund_id.is_empty() {
-        let refund_status = fields
-            .get("refund_status")
-            .cloned()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let status = if refund_status == "SUCCESS" { 1 } else { -1 };
-        let _ = sqlx::query(
-            "UPDATE order_refunds SET status = ?, remark = ?, refund_time = ?, updated_time = ? \
-             WHERE order_id = ?",
-        )
-        .bind(status)
-        .bind(&refund_status)
-        .bind(now)
-        .bind(now)
-        .bind(&order_id)
-        .execute(pool)
-        .await;
-        return wechat_pay_reply(true, "OK");
-    }
-
-    // 支付成功
-    let transaction_id = fields
-        .get("transaction_id")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let buyer_id = fields
-        .get("openid")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let _ = sqlx::query(
-        "UPDATE payments SET pay_way = 'wechat', terrace_id = ?, paid_time = ?, buyer_id = ?, \
-         updated_time = ? WHERE id = ?",
-    )
-    .bind(&transaction_id)
-    .bind(now)
-    .bind(&buyer_id)
-    .bind(now)
-    .bind(payment_id)
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
-        "UPDATE orders SET payment_id = ?, paid_time = ?, status = 1, updated_time = ? \
-         WHERE order_id = ? AND paid_time = 0",
-    )
-    .bind(&out_trade_no)
-    .bind(now)
-    .bind(now)
-    .bind(&order_id)
-    .execute(pool)
-    .await;
-
-    // 资金流水（与 Go 的 Finance 记录同款）
-    let balance: i64 = sqlx::query_scalar("SELECT balance FROM users WHERE id = ? LIMIT 1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
-    let _ = sqlx::query(
-        "INSERT INTO finances (created_time, updated_time, user_id, direction, amount, \
-            after_amount, action, order_id, status, remark) \
-         VALUES (?, ?, ?, 2, ?, ?, 2, ?, 1, '')",
-    )
-    .bind(now)
-    .bind(now)
-    .bind(user_id)
-    .bind(amount)
-    .bind(balance)
-    .bind(&order_id)
-    .execute(pool)
-    .await;
-
-    wechat_pay_reply(true, "OK")
-}
-
-/// 支付账号的 `api_key`（`payment_accounts.pay_config`）。
-async fn account_api_key(pool: &sqlx::MySqlPool, account_id: i64) -> Option<String> {
-    let raw: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT pay_config FROM payment_accounts WHERE id = ? LIMIT 1",
-    )
-    .bind(account_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(None);
-    let raw = raw?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    Some(
-        value
-            .get("api_key")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-    )
-}
-
-/// 微信支付回调的应答 XML。
-fn wechat_pay_reply(success: bool, message: &str) -> Response {
-    let (code, msg) = if success {
-        ("SUCCESS", "OK")
-    } else {
-        ("FAIL", message)
-    };
-    let xml = format!(
-        "<xml><return_code><![CDATA[{code}]]></return_code>\
-         <return_msg><![CDATA[{msg}]]></return_msg></xml>"
-    );
-    (StatusCode::OK, xml).into_response()
-}
-
-/// 微信签名：参数（去掉 `sign` 与空值）按键名排序 → `k=v&k=v` → 追加 `&key=密钥` → MD5 大写。
-fn wechat_sign(fields: &HashMap<String, String>, api_key: &str) -> String {
-    let mut keys: Vec<&String> = fields.keys().filter(|key| key.as_str() != "sign").collect();
-    keys.sort();
-    let mut parts: Vec<String> = Vec::new();
-    for key in keys {
-        let value = fields.get(key).map(String::as_str).unwrap_or_default();
-        if value.is_empty() {
-            continue;
-        }
-        parts.push(format!("{key}={value}"));
-    }
-    let payload = format!("{}&key={api_key}", parts.join("&"));
-    md5_hex_upper(payload.as_bytes())
-}
-
-/// MD5 大写十六进制（微信签名用）。
-fn md5_hex_upper(data: &[u8]) -> String {
-    use md5::{Digest, Md5};
-    Md5::digest(data)
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect()
+    // 统一到 api_trade 的真实实现（V2 验签、金额核对、settle_gateway_payment 落库）
+    let body = String::from_utf8_lossy(&body).to_string();
+    crate::api_trade::wechat_notify(State(state), body).await
 }
 
 // ---------------------------------------------------------------------------
 // 小程序 / Google
 // ---------------------------------------------------------------------------
 
-/// `GET /weapp/msg` —— 小程序服务器校验（Go 的 `NotifyWeappMsg` 的 GET 分支）。
+/// `GET /weapp/msg` —— 小程序服务器校验（既有的 `NotifyWeappMsg` 的 GET 分支）。
 ///
-/// 小程序回调是加密协议（AES 解密 + XML），当前项目未实现；
-/// GET 的服务器校验（sha1 签名 + 回显 echostr）可以本地完成。
+/// 校验方式与公众号一致：`sha1(sort(token, timestamp, nonce)) == signature`，
+/// 通过后原样回显 `echostr`（小程序后台「服务器配置」点保存时校的就是这一步）。
 async fn weapp_msg_get(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
@@ -1249,19 +1140,133 @@ async fn weapp_msg_get(
     (StatusCode::OK, echostr).into_response()
 }
 
-/// `POST /weapp/msg` —— 小程序消息回调（Go 的 `NotifyWeappMsg`）。
+/// `POST /weapp/msg` —— 小程序消息回调（按 `NotifyWeappMsg` 的语义）。
 ///
-/// 小程序回调是加密协议（AES 解密 + XML），当前项目未实现。
-async fn weapp_msg_post(State(state): State<AppState>) -> Response {
-    let _ = state;
-    fail_unsupported("未实现：小程序回调需要解密消息体，请在公众号设置里配置服务器地址")
+/// 小程序后台默认开启**安全模式**：POST body 是 `<Encrypt>` 信封，
+/// `msg_signature = sha1(sort(token, timestamp, nonce, 密文))`，先用
+/// [`crypto::decrypt_message`] 验签解密，再按事件分发（与公众号同一套协议）。
+///
+/// 目前处理「订阅消息」两类事件（既有的 `OnSubscribeMsgPopup` / `OnSubscribeMsgChange`）：
+/// 同意订阅写 `subscribed_users`，拒绝则删掉，其余事件只回 `success`。
+async fn weapp_msg_post(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    let config = interact::weapp_config(pool)
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let text_of = |key: &str| {
+        config
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let token = text_of("token");
+    let aes_key = text_of("encoding_aes_key");
+    let app_id = text_of("app_id");
+    if token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "未配置小程序 Token，无法校验回调合法性",
+        )
+            .into_response();
+    }
+
+    let timestamp = q_str(&q, "timestamp");
+    let nonce = q_str(&q, "nonce");
+    let raw = String::from_utf8_lossy(&body).to_string();
+
+    let xml = match wxa::envelope_encrypt(&raw) {
+        Some(envelope) => {
+            if aes_key.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "小程序回调是加密报文，但未配置 EncodingAESKey",
+                )
+                    .into_response();
+            }
+            let signature = q_str(&q, "msg_signature");
+            if signature.is_empty() || timestamp.is_empty() || nonce.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "小程序加密回调缺少 msg_signature / timestamp / nonce",
+                )
+                    .into_response();
+            }
+            match crypto::decrypt_message(
+                &token,
+                &aes_key,
+                &app_id,
+                &signature,
+                &timestamp,
+                &nonce,
+                &envelope,
+            ) {
+                Ok(xml) => xml,
+                Err(err) => {
+                    tracing::warn!("小程序回调解密失败：{err}");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        format!("小程序回调解密失败：{err}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => {
+            // 明文模式：仍然校验普通 signature（微信的「兼容模式/明文模式」）
+            let signature = q_str(&q, "signature");
+            if !signature.is_empty()
+                && interact::wechat_signature(&token, &timestamp, &nonce) != signature
+            {
+                return (StatusCode::FORBIDDEN, "invalid signature").into_response();
+            }
+            raw
+        }
+    };
+
+    let fields = wxa::xml_fields(&xml);
+    let openid = fields.get("FromUserName").cloned().unwrap_or_default();
+    let event = fields.get("Event").cloned().unwrap_or_default();
+    match event.as_str() {
+        "subscribe_msg_popup_event" | "subscribe_msg_change_event" => {
+            let events = wxa::subscribe_events(&xml);
+            if events.is_empty() {
+                tracing::warn!("小程序订阅消息事件里没有可识别的模板条目：{xml}");
+            }
+            for item in events {
+                if let Err(err) =
+                    interact::save_subscribed(pool, &openid, &item.template_id, item.accepted())
+                        .await
+                {
+                    tracing::warn!(
+                        "保存小程序订阅消息状态失败（template={}）：{err:#}",
+                        item.template_id
+                    );
+                }
+            }
+        }
+        _ => {
+            tracing::debug!("小程序回调事件 {event}（{openid}）暂不处理");
+        }
+    }
+
+    (StatusCode::OK, "success").into_response()
 }
 
-/// `POST /weapp/qrcode` —— 生成小程序二维码（Go 的 `ApiCreateWeappQrcode`）。
+/// `POST /weapp/qrcode` —— 生成小程序二维码（按 `ApiCreateWeappQrcode` 的语义）。
 ///
 /// 请求字段：`path`、`scene`。需要登录。
 ///
-/// 库里已有二维码时直接返回；没有的话需要调微信接口生成（当前项目未实现）。
+/// 与既有接口契约一致：同一会员 + path 只生成一次，之后直接回库里的地址；
+/// 新生成的码落在 `uploads/qrcode/<md5 前3>/<3..6>/<6..>.png`，同时写 `attachments`
+/// 与 `weapp_qrcodes`（库里存相对路径，返回给前端的是可访问的完整地址）。
 async fn weapp_qrcode(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1274,36 +1279,23 @@ async fn weapp_qrcode(State(state): State<AppState>, headers: HeaderMap, body: B
     if path.is_empty() {
         return fail("参数不完整");
     }
-    match interact::weapp_qrcode(pool, user_id, path).await {
-        Ok(Some(code_url)) => {
-            Json(json!({ "code": 0, "msg": "", "data": code_url })).into_response()
-        }
-        Ok(None) => {
-            let config = interact::weapp_config(pool)
-                .await
-                .unwrap_or_else(|_| json!({}));
-            let app_id = config
-                .get("app_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let app_secret = config
-                .get("app_secret")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if app_id.is_empty() || app_secret.is_empty() {
-                return fail("请先配置小程序 AppID 和 AppSecret");
-            }
-            let bytes =
-                match crate::models::wechat::weapp_qrcode_image(&app_id, &app_secret, path).await {
-                    Ok(bytes) => bytes,
-                    Err(err) => return fail(err.to_string()),
-                };
+    // 库里的 code_url 是相对路径，对外要拼上存储地址（既有的 JoinStorageUrl）
+    let storage = trade::storage_url(pool).await;
 
-            // 与 Go `CreateWeappQrcode` 一致：uploads/qrcode/<md5 前3>/<3..6>/<6..>.png
+    match interact::weapp_qrcode(pool, user_id, path).await {
+        Ok(Some(code_url)) => Json(json!({
+            "code": 0,
+            "msg": "",
+            "data": front_content::join_storage_url(&storage, &code_url),
+        }))
+        .into_response(),
+        Ok(None) => {
+            let bytes = match wechat::weapp_qrcode_image(pool, path).await {
+                Ok(bytes) => bytes,
+                Err(err) => return fail(err.to_string()),
+            };
+
+            // 与 `CreateWeappQrcode` 一致：uploads/qrcode/<md5 前3>/<3..6>/<6..>.png
             let md5 = crate::models::attachment::md5_hex(&bytes);
             let file_name = format!("{md5}.png");
             let relative = format!(
@@ -1320,7 +1312,7 @@ async fn weapp_qrcode(State(state): State<AppState>, headers: HeaderMap, body: B
             if let Err(err) = std::fs::write(&file, &bytes) {
                 return fail(format!("保存小程序二维码失败：{err}"));
             }
-            let _ = crate::models::attachment::insert(
+            if let Err(err) = crate::models::attachment::insert(
                 pool,
                 &file_name,
                 &relative,
@@ -1332,20 +1324,26 @@ async fn weapp_qrcode(State(state): State<AppState>, headers: HeaderMap, body: B
                 0,
                 "",
             )
-            .await;
-            let code_url = format!("/{relative}");
-            if let Err(err) =
-                interact::save_weapp_qrcode(pool, user_id, path, &code_url).await
+            .await
             {
+                // 附件表写失败不影响出码，只记日志
+                tracing::warn!("小程序码写 attachments 失败：{err}");
+            }
+            if let Err(err) = interact::save_weapp_qrcode(pool, user_id, path, &relative).await {
                 return failed(err);
             }
-            Json(json!({ "code": 0, "msg": "", "data": code_url })).into_response()
+            Json(json!({
+                "code": 0,
+                "msg": "",
+                "data": front_content::join_storage_url(&storage, &relative),
+            }))
+            .into_response()
         }
         Err(err) => failed(err),
     }
 }
 
-/// `GET /google/url` —— Google 登录授权地址（Go 的 `GoogleAuthUrl`）。
+/// `GET /google/url` —— Google 登录授权地址（按 `GoogleAuthUrl` 的语义）。
 ///
 /// 参数：`state`（缺省时随机 32 位）。
 async fn google_url(
@@ -1407,10 +1405,10 @@ async fn google_url(
 // 访问日志
 // ---------------------------------------------------------------------------
 
-/// `GET|POST /log` —— 访问日志（Go 的 `ApiLogStatistic`）。
+/// `GET|POST /log` —— 访问日志（按 `ApiLogStatistic` 的语义）。
 ///
 /// 请求字段：`action`（`views` 时才记录）、`type`（`archive` 时顺带加浏览量）、
-/// `id`、`code`、`path`。成功返回 204（与 Go 一致）。
+/// `id`、`code`、`path`。成功返回 204（与既有接口契约一致）。
 async fn access_log(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1471,7 +1469,7 @@ async fn access_log(State(state): State<AppState>, headers: HeaderMap, body: Byt
         tracing::warn!("写访问日志失败：{err:#}");
     }
 
-    // 内容浏览量 +1（Go：type == archive 时才加）
+    // 内容浏览量 +1（既有实现：type == archive 时才加）
     let kind = form.get("type").map(|value| value.trim()).unwrap_or("");
     if kind == "archive" {
         let archive_id = form
@@ -1489,6 +1487,40 @@ async fn access_log(State(state): State<AppState>, headers: HeaderMap, body: Byt
 // ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------
+
+/// XML 响应（微信被动回复）。
+fn xml_response(xml: String) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+        xml,
+    )
+        .into_response()
+}
+
+/// 微信内打开的提示页（按 `controller.ShowMessage` 的语义）。
+///
+/// `GET /wechat/auth` 是浏览器请求，出错时给一个可读页面，比回 JSON 有用；
+/// 标记与既有实现保持一致（浅灰背景 + 白卡片 + 返回按钮）。
+fn wechat_page(message: &str) -> Response {
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=utf-8>\
+<meta name=\"viewport\" content=\"width=device-width,height=device-height,initial-scale=1.0, \
+minimum-scale=1.0, maximum-scale=1.0, user-scalable=no,viewport-fit=cover\">\
+<meta http-equiv=X-UA-Compatible content=\"IE=edge,chrome=1\"><title>Info</title>\
+<style>a{{text-decoration: none;color: #777;}}</style></head>\
+<body style=\"background: #f4f5f7;margin: 0;padding: 20px;\">\
+<div style=\"margin-left: auto;margin-right: auto;margin-top: 50px;padding: 20px;\
+border: 1px solid #eee;background:#fff;max-width: 640px;\"><div>{message}</div>\
+<div style=\"margin-top: 30px;text-align: right;\"><a style=\"display: inline-block;\
+border:1px solid #777;padding: 8px 16px;\" href=\"javascript:history.back();\">Back</a>\
+</div></div></body></html>"
+    );
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
 
 /// 解析 XML 里的简单标签（微信 / 小程序回调都是这种扁平结构）。
 fn xml_fields(xml: &str) -> HashMap<String, String> {
@@ -1579,7 +1611,7 @@ fn generate_verify_code(openid: &str) -> String {
     code
 }
 
-/// 随机字符串（Go 的 `config.GenerateRandString`）。
+/// 随机字符串（按 `config.GenerateRandString` 的语义）。
 fn random_string(len: usize) -> String {
     use rand::Rng;
     const POOL: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -1595,6 +1627,60 @@ fn random_string(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 微信 V2 签名：参数（去掉 `sign` 与空值）按键名排序 → `k=v&k=v` → 追加 `&key=密钥` → MD5 大写。
+    ///
+    /// 线上的验签已经统一到 `api_trade`（支持 MD5 与 HMAC-SHA256），这里保留一份
+    /// 最简实现只为把「字典序拼接 + 大写 MD5」这条规则钉在测试里，因此放在
+    /// `#[cfg(test)]` 内，bin 构建不留死代码。
+    fn wechat_sign(fields: &HashMap<String, String>, api_key: &str) -> String {
+        let mut keys: Vec<&String> = fields.keys().filter(|key| key.as_str() != "sign").collect();
+        keys.sort();
+        let mut parts: Vec<String> = Vec::new();
+        for key in keys {
+            let value = fields.get(key).map(String::as_str).unwrap_or_default();
+            if value.is_empty() {
+                continue;
+            }
+            parts.push(format!("{key}={value}"));
+        }
+        let payload = format!("{}&key={api_key}", parts.join("&"));
+        md5_hex_upper(payload.as_bytes())
+    }
+
+    /// MD5 大写十六进制。
+    fn md5_hex_upper(data: &[u8]) -> String {
+        use md5::{Digest, Md5};
+        Md5::digest(data)
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect()
+    }
+
+    #[test]
+    fn wechat_sign_matches_md5_rule() {
+        let mut fields = HashMap::new();
+        fields.insert("appid".to_string(), "wx1".to_string());
+        fields.insert("out_trade_no".to_string(), "pay1".to_string());
+        fields.insert("sign".to_string(), "ignored".to_string());
+        fields.insert("attach".to_string(), String::new());
+        // md5("appid=wx1&out_trade_no=pay1&key=K")：32 位大写十六进制
+        let sign = wechat_sign(&fields, "K");
+        assert_eq!(sign.len(), 32);
+        assert!(sign
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_lowercase()));
+
+        // 与插入顺序无关；`sign` 自身与空值不参与拼接
+        let mut reordered = HashMap::new();
+        reordered.insert("out_trade_no".to_string(), "pay1".to_string());
+        reordered.insert("sign".to_string(), "another".to_string());
+        reordered.insert("appid".to_string(), "wx1".to_string());
+        assert_eq!(wechat_sign(&reordered, "K"), sign);
+
+        // 换密钥结果必变
+        assert_ne!(wechat_sign(&fields, "K2"), sign);
+    }
 
     #[test]
     fn parses_xml_fields() {
@@ -1617,19 +1703,6 @@ mod tests {
             fields.get("CreateTime").map(String::as_str),
             Some("1700000000")
         );
-    }
-
-    #[test]
-    fn wechat_sign_matches_md5_rule() {
-        let mut fields = HashMap::new();
-        fields.insert("appid".to_string(), "wx1".to_string());
-        fields.insert("out_trade_no".to_string(), "pay1".to_string());
-        fields.insert("sign".to_string(), "ignored".to_string());
-        // md5("appid=wx1&out_trade_no=pay1&key=K") 的标准结果
-        let sign = wechat_sign(&fields, "K");
-        assert_eq!(sign.len(), 32);
-        assert!(sign.chars().all(|ch| ch.is_ascii_hexdigit()));
-        assert!(sign.chars().all(|ch| !ch.is_ascii_lowercase()));
     }
 
     #[test]
@@ -1661,5 +1734,26 @@ mod tests {
         assert_eq!(q_limit(&q, 10, 1000), (0, 5));
         let q = HashMap::new();
         assert_eq!(q_limit(&q, 10, 1000), (0, 10));
+    }
+
+    #[test]
+    fn sets_wechat_response_headers() {
+        // 被动回复必须是 XML，验证码/错误提示页必须是 HTML
+        let response = xml_response("<xml></xml>".to_string());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/xml; charset=utf-8")
+        );
+        let response = wechat_page("请在微信内打开");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
     }
 }

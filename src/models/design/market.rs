@@ -1,7 +1,7 @@
 //!
 //! 模板市场能力：打包下载、上传解压、演示数据备份与恢复。
 //!
-//! 对齐 Go 版 `provider/design.go`：
+//! 约定：
 //! - 打包：`template/<package>/**` + `public/static/<package>/**` → zip；
 //! - 上传：从 `template/config.json` 读取包名，写回模板目录与静态目录；
 //! - 演示数据：`template/<package>/data.db`（zip，内含各表 JSON 与附件文件）。
@@ -18,7 +18,7 @@ use crate::models::{extra, module, setting, site_setting, ModelError};
 
 use super::{valid_package, DesignPackage, DesignStore};
 
-/// 演示数据每类最多备份 200 条（对齐 Go）。
+/// 演示数据每类最多备份 200 条（遵循既有约定）。
 const MAX_ROWS: usize = 200;
 
 fn invalid(msg: impl Into<String>) -> ModelError {
@@ -53,7 +53,7 @@ pub fn package_zip(store: &DesignStore, package: &str) -> Result<Vec<u8>, ModelE
     Ok(writer.finish())
 }
 
-/// 递归写入目录；`.开头的文件/目录`跳过（对齐 Go 的 `compress`）。
+/// 递归写入目录；`.开头的文件/目录`跳过（遵循既有约定）。
 fn add_tree(writer: &mut ZipWriter, root: &Path, prefix: &str) -> Result<(), ModelError> {
     let mut entries = std::fs::read_dir(root)
         .map_err(|err| invalid(format!("读取目录失败：{err}")))?
@@ -583,7 +583,7 @@ fn value_as_i64(value: &Value) -> Option<i64> {
     }
 }
 
-/// 给 archives 补上 `extra`（模块自定义字段），字段形态与 Go 的
+/// 给 archives 补上 `extra`（模块自定义字段），字段形态与既有实现的
 /// `map[string]config.CustomField` 兼容：`{"字段名": {"value": ...}}`。
 async fn attach_extras(
     pool: &MySqlPool,

@@ -1,19 +1,19 @@
 //! 会员与账户数据访问（批次 B）。
 //!
-//! 对齐 Go 版：
-//! - `provider/user.go`：会员资料 / 登录 / 注册 / 改密码 / 找回密码；
-//! - `provider/member_center.go`：评论管理 / 留言管理 / 我的发布；
-//! - `provider/user_auth.go`：实名 / 企业认证；
-//! - `provider/user_api_token.go`：会员开放接口 Key；
-//! - `provider/commerce_point.go`：积分 / 签到；
-//! - `provider/commerce_shop.go`：我的发布 / 资金流水。
+//! 覆盖范围：
+//! - 会员资料 / 登录 / 注册 / 改密码 / 找回密码；
+//! - 评论管理 / 留言管理 / 我的发布；
+//! - 实名 / 企业认证；
+//! - 会员开放接口 Key；
+//! - 积分 / 签到；
+//! - 我的发布 / 资金流水。
 //!
-//! 类型约定（与 Go 版共用同一份库，列类型必须对齐）：
+//! 类型约定（与既有表结构共用同一份库，列类型必须对齐）：
 //! - `users.id` / `group_id` 是 `int(10) unsigned` → `u32`；
 //! - `users.parent_id` 是 `int(10)` 有符号 → `i32`；
 //! - `status` / `is_retailer` 是 `tinyint(1)`，但语义上可以是 `-1`（封禁），
-//!   驱动默认按 BOOLEAN 解析会把它变成 `true`，所以统一
-//!   `CAST(col AS SIGNED)` 取成整数；
+//! 驱动默认按 BOOLEAN 解析会把它变成 `true`，所以统一
+//! `CAST(col AS SIGNED)` 取成整数；
 //! - `bigint(20)` 有符号 → `i64`；`int(10) unsigned` → `u32`。
 
 use rand::Rng;
@@ -24,23 +24,23 @@ use sqlx::FromRow;
 use super::ModelError;
 
 
-/// Go 版 `provider/commerce_point.go`：签到基础积分。
+/// 签到基础积分。
 pub const SIGN_BASE_POINTS: i64 = 5;
-/// Go 版 `provider/commerce_point.go`：连续签到额外积分上限。
+/// 连续签到额外积分上限。
 pub const SIGN_EXTRA_MAX: i64 = 10;
-/// Go 版 `provider/commerce_point.go`：积分 / 资金流水单页上限。
+/// 积分 / 资金流水单页上限。
 pub const POINT_LOG_LIMIT: i64 = 50;
-/// Go 版 `provider/user_api_token.go`：会员开放接口 Key 长度。
+/// 会员开放接口 Key 长度。
 pub const MEMBER_API_TOKEN_LENGTH: usize = 40;
-/// Go 版 `provider/user_api_token.go`：会员开放接口 REST 前缀。
+/// 会员开放接口 REST 前缀。
 pub const MEMBER_OPEN_API_BASE_PATH: &str = "/api";
-/// Go 版 `provider/user_api_token.go`：会员专属 MCP 端点。
+/// 会员专属 MCP 端点。
 pub const MEMBER_MCP_PATH: &str = "/api/open/mcp";
-/// Go 版 `provider/user_auth.go`：认证状态。
+/// 认证状态。
 pub const USER_AUTH_STATUS_PENDING: i32 = 0;
 pub const USER_AUTH_STATUS_PASSED: i32 = 1;
 pub const USER_AUTH_STATUS_REJECTED: i32 = -1;
-/// Go 版 `provider/user_auth.go`：认证类型。
+/// 认证类型。
 pub const USER_AUTH_TYPE_PERSON: i32 = 1;
 pub const USER_AUTH_TYPE_COMPANY: i32 = 2;
 
@@ -91,14 +91,14 @@ pub struct MemberRow {
 }
 
 impl MemberRow {
-    /// Go 版 `model.User` 的 JSON 形态（不含密码、不含 `api_token`）。
+    /// 会员行的 JSON 形态（不含密码、不含 `api_token`）。
     ///
-    /// 字段顺序与 Go 的 struct 声明顺序一致（`serde_json` 开了 `preserve_order`）。
+    /// 字段顺序与结构体声明顺序一致（`serde_json` 开了 `preserve_order`）。
     pub fn to_json(&self) -> Value {
         self.to_json_with_token(None)
     }
 
-    /// 同 [`MemberRow::to_json`]，但带上登录令牌（Go 在 `user.Token` 里放 JWT）。
+    /// 同 [`MemberRow::to_json`]，但带上登录令牌（在 `user.Token` 里放 JWT）。
     pub fn to_json_with_token(&self, token: Option<&str>) -> Value {
         json!({
             "id": self.id,
@@ -174,7 +174,7 @@ pub async fn get_by_phone(pool: &MySqlPool, phone: &str) -> anyhow::Result<Optio
         .await?)
 }
 
-/// 记录登录时间（Go 的 `user.LogLogin`）。
+/// 记录登录时间（`user.LogLogin`）。
 pub async fn touch_login(pool: &MySqlPool, id: u32) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
     sqlx::query("UPDATE users SET last_login = ?, updated_time = ? WHERE id = ?")
@@ -196,7 +196,7 @@ pub async fn set_email_verified(pool: &MySqlPool, id: u32) -> anyhow::Result<()>
     Ok(())
 }
 
-/// 会员资料更新入参（对齐 Go 的 `request.UserRequest`，只覆盖非空字段）。
+/// 会员资料更新入参（对齐 `UserRequest`，只覆盖非空字段）。
 #[derive(Debug, Clone, Default)]
 pub struct ProfileInput {
     pub user_name: Option<String>,
@@ -210,7 +210,7 @@ pub struct ProfileInput {
     pub birthday: Option<i64>,
 }
 
-/// 更新会员资料（Go 的 `provider.UpdateUserInfo`）。
+/// 更新会员资料（`UpdateUserInfo`）。
 ///
 /// 只有非空字段会被覆盖；用户名 / 手机号 / 邮箱要查重。
 pub async fn update_profile(
@@ -315,7 +315,7 @@ pub async fn update_profile(
     Ok(())
 }
 
-/// 更新密码（Go 的 `user.EncryptPassword` + `DB.Save(user)`）。
+/// 更新密码（`user.EncryptPassword` + `DB.Save(user)`）。
 pub async fn update_password(pool: &MySqlPool, id: u32, hash: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE users SET password = ?, reset_password = 0, updated_time = ? WHERE id = ?")
         .bind(hash)
@@ -326,7 +326,7 @@ pub async fn update_password(pool: &MySqlPool, id: u32, hash: &str) -> anyhow::R
     Ok(())
 }
 
-/// 注册入参（对齐 Go 的 `request.ApiRegisterRequest`）。
+/// 注册入参（对齐 `ApiRegisterRequest`）。
 #[derive(Debug, Clone, Default)]
 pub struct RegisterInput {
     pub user_name: String,
@@ -339,13 +339,13 @@ pub struct RegisterInput {
     pub email: String,
     pub phone: String,
     pub birthday: i64,
-    /// 邀请人会员 ID（Go 从 cookie `invite` 读）。
+    /// 邀请人会员 ID（从 cookie `invite` 读）。
     pub parent_id: u32,
 }
 
 /// 注册会员，返回新会员 ID。
 ///
-/// 校验顺序与 Go 的 `provider.RegisterUser` 一致：
+/// 校验顺序与 `RegisterUser` 一致：
 /// 用户名/密码必填 → 密码至少 6 位 → 用户名查重 → 手机号格式与查重 →
 /// 邮箱格式与查重 → 邮箱与手机号至少填一个。
 pub async fn register(pool: &MySqlPool, input: &RegisterInput) -> Result<u32, ModelError> {
@@ -477,7 +477,7 @@ pub async fn clear_api_token(pool: &MySqlPool, id: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 展示用掩码：`abcd****wxyz`（Go 的 `provider.MaskApiToken`）。
+/// 展示用掩码：`abcd****wxyz`（`MaskApiToken`）。
 pub fn mask_api_token(token: &str) -> String {
     let chars: Vec<char> = token.chars().collect();
     if chars.is_empty() {
@@ -508,7 +508,7 @@ pub struct MemberGroup {
 }
 
 impl MemberGroup {
-    /// 解析 `setting` 列（Go 的 `UserGroupSetting`）。
+    /// 解析 `setting` 列（`UserGroupSetting`）。
     pub fn setting_value(&self) -> Value {
         self.setting
             .as_deref()
@@ -525,7 +525,7 @@ impl MemberGroup {
             .unwrap_or(0)
     }
 
-    /// Go 的 `model.UserGroup` JSON 形态（含 `favorable_price`）。
+    /// `UserGroup` JSON 形态（含 `favorable_price`）。
     pub fn to_json(&self, favorable_price: i64) -> Value {
         json!({
             "id": self.id,
@@ -542,7 +542,7 @@ impl MemberGroup {
     }
 }
 
-/// 全部用户组（Go 的 `GetUserGroups`：按 level、id 升序）。
+/// 全部用户组（`GetUserGroups`：按 level、id 升序）。
 pub async fn groups(pool: &MySqlPool) -> anyhow::Result<Vec<MemberGroup>> {
     Ok(sqlx::query_as::<_, MemberGroup>(
         "SELECT id, created_time, updated_time, title, description, level, status, price, setting \
@@ -567,7 +567,7 @@ pub async fn group(pool: &MySqlPool, id: u32) -> anyhow::Result<Option<MemberGro
 // 我的发布 / 资金流水 / 积分流水
 // ============================================================================
 
-/// 「我的发布」条目（Go 的 `provider.UserArchiveItem`）。
+/// 「我的发布」条目（`UserArchiveItem`）。
 #[derive(Debug, Clone, FromRow)]
 pub struct PublishedItem {
     pub id: i64,
@@ -585,9 +585,9 @@ pub struct PublishedItem {
     pub status: i32,
 }
 
-/// 我的发布：正式内容 + 待审核草稿（Go 的 `GetUserPublished`）。
+/// 我的发布：正式内容 + 待审核草稿（`GetUserPublished`）。
 ///
-/// Go 先把草稿与正式内容合并，再按 `created_time` 倒序，最后做内存分页。
+/// 先把草稿与正式内容合并，再按 `created_time` 倒序，最后做内存分页。
 pub async fn published(
     pool: &MySqlPool,
     user_id: u32,
@@ -635,7 +635,7 @@ pub async fn published(
     .await?;
     items.extend(archives);
 
-    // 按创建时间倒序（Go 用的是稳定排序）
+    // 按创建时间倒序（用的是稳定排序）
     items.sort_by(|a, b| {
         b.created_time
             .unwrap_or(0)
@@ -680,7 +680,7 @@ pub async fn published(
     Ok((total, list))
 }
 
-/// 资金流水（Go 的 `GetFinanceLogs`）。
+/// 资金流水（`GetFinanceLogs`）。
 pub async fn finances(
     pool: &MySqlPool,
     user_id: u32,
@@ -738,7 +738,7 @@ pub async fn finances(
     Ok((total, list))
 }
 
-/// 积分流水（Go 的 `GetPointLogs`）。
+/// 积分流水（`GetPointLogs`）。
 pub async fn point_logs(
     pool: &MySqlPool,
     user_id: u32,
@@ -816,7 +816,7 @@ pub struct CommentRow {
 }
 
 impl CommentRow {
-    /// Go 的 `model.Comment` JSON 形态 + `archive_title` / `archive_url` / `parent_content`。
+    /// `Comment` JSON 形态 + `archive_title` / `archive_url` / `parent_content`。
     pub fn to_json(&self, archive_url: &str, parent_content: &str) -> Value {
         json!({
             "id": self.id,
@@ -847,7 +847,7 @@ const COMMENT_COLUMNS: &str = "c.id, c.created_time, c.updated_time, c.archive_i
     c.user_name, c.email, c.ip, c.vote_count, c.content, c.parent_id, c.to_uid, \
     CAST(c.status AS SIGNED) AS status, CAST(c.rating AS SIGNED) AS rating, a.title AS archive_title";
 
-/// 我发布的文档收到的评论（Go 的 `GetUserArchiveComments`）。
+/// 我发布的文档收到的评论（`GetUserArchiveComments`）。
 ///
 /// `status < 0` 表示不过滤状态。
 pub async fn comments(
@@ -911,7 +911,7 @@ pub async fn comments(
     Ok((total, list))
 }
 
-/// 待审核 / 全部评论数（Go 的 `GetUserCommentStat`）。
+/// 待审核 / 全部评论数（`GetUserCommentStat`）。
 pub async fn comment_stat(pool: &MySqlPool, user_id: u32) -> anyhow::Result<(i64, i64)> {
     if user_id == 0 {
         return Ok((0, 0));
@@ -933,7 +933,7 @@ pub async fn comment_stat(pool: &MySqlPool, user_id: u32) -> anyhow::Result<(i64
     Ok((pending, total))
 }
 
-/// 取评论并校验它属于「我发布的文档」（Go 的 `GetUserArchiveComment`）。
+/// 取评论并校验它属于「我发布的文档」（`GetUserArchiveComment`）。
 pub async fn own_comment(
     pool: &MySqlPool,
     user_id: u32,
@@ -976,7 +976,7 @@ pub async fn set_comment_status(pool: &MySqlPool, id: u32, status: i32) -> anyho
     Ok(())
 }
 
-/// 删除评论，并同步文档的评论数（Go 的 `comment.Delete`）。
+/// 删除评论，并同步文档的评论数（`comment.Delete`）。
 pub async fn delete_comment(pool: &MySqlPool, id: u32, archive_id: i64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM comments WHERE id = ?")
         .bind(id)
@@ -994,7 +994,7 @@ pub async fn delete_comment(pool: &MySqlPool, id: u32, archive_id: i64) -> anyho
     Ok(())
 }
 
-/// 回复评论（Go 的 `ApiUserCommentReply`）。
+/// 回复评论（`ApiUserCommentReply`）。
 pub async fn reply_comment(
     pool: &MySqlPool,
     user_id: u32,
@@ -1023,7 +1023,7 @@ pub async fn reply_comment(
     .map_err(|err| ModelError::invalid(format!("保存失败: {err}")))?
     .last_insert_id() as u32;
 
-    // 文档评论数保持准确（Go 的 `reply.UpdateCommentCount`）
+    // 文档评论数保持准确（`reply.UpdateCommentCount`）
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE archive_id = ?")
         .bind(comment.archive_id)
         .fetch_one(pool)
@@ -1066,7 +1066,7 @@ pub struct GuestbookRow {
 }
 
 impl GuestbookRow {
-    /// Go 的 `model.Guestbook` JSON 形态。
+    /// `Guestbook` JSON 形态。
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,
@@ -1089,7 +1089,7 @@ impl GuestbookRow {
     }
 }
 
-/// 我提交的留言（Go 的 `GetUserGuestbooks`）。
+/// 我提交的留言（`GetUserGuestbooks`）。
 pub async fn guestbooks(
     pool: &MySqlPool,
     user_id: u32,
@@ -1126,7 +1126,7 @@ pub async fn guestbooks(
     Ok((total, rows.iter().map(GuestbookRow::to_json).collect()))
 }
 
-/// 删除自己的留言（Go 的 `DeleteUserGuestbook`）。
+/// 删除自己的留言（`DeleteUserGuestbook`）。
 pub async fn delete_guestbook(pool: &MySqlPool, user_id: u32, id: u32) -> Result<(), ModelError> {
     if user_id == 0 || id == 0 {
         return Err(ModelError::invalid("留言不存在"));
@@ -1172,7 +1172,7 @@ pub struct MemberAuth {
     pub audit_admin_id: u32,
 }
 
-/// 认证入参（Go 的 `provider.UserAuthRequest`）。
+/// 认证入参（`UserAuthRequest`）。
 #[derive(Debug, Clone, Default)]
 pub struct AuthInput {
     pub kind: i32,
@@ -1205,7 +1205,7 @@ pub async fn auth_by_user(pool: &MySqlPool, user_id: u32) -> anyhow::Result<Opti
         .await?)
 }
 
-/// 提交（或重新提交）认证申请（Go 的 `ApplyUserAuth`）。
+/// 提交（或重新提交）认证申请（`ApplyUserAuth`）。
 ///
 /// 已通过的记录不允许直接覆盖，必须由管理员先撤销。
 pub async fn apply_auth(
@@ -1322,7 +1322,7 @@ pub async fn apply_auth(
 // 签到与积分
 // ============================================================================
 
-/// 签到概况（Go 的 `SignInfo`）。
+/// 签到概况（`SignInfo`）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SignInfo {
     pub checked_today: bool,
@@ -1379,7 +1379,7 @@ pub async fn sign_info(pool: &MySqlPool, user_id: u32) -> anyhow::Result<SignInf
     Ok(info)
 }
 
-/// 今日签到（Go 的 `SignToday`）。
+/// 今日签到（`SignToday`）。
 ///
 /// 连续签到额外积分：`(连续天数 - 1)`，上限 [`SIGN_EXTRA_MAX`]。
 pub async fn sign_today(pool: &MySqlPool, user_id: u32) -> Result<Value, ModelError> {
@@ -1408,7 +1408,7 @@ pub async fn sign_today(pool: &MySqlPool, user_id: u32) -> Result<Value, ModelEr
         points += extra;
     }
 
-    // 已签到直接拦下（Go 靠唯一索引冲突，这里先查一次，报错文案一致）
+    // 已签到直接拦下（靠唯一索引冲突，这里先查一次，报错文案一致）
     let exists: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM user_signs WHERE user_id = ? AND sign_date = ?",
     )
@@ -1436,7 +1436,7 @@ pub async fn sign_today(pool: &MySqlPool, user_id: u32) -> Result<Value, ModelEr
     .map_err(|err| ModelError::invalid(format!("签到失败: {err}")))?
     .last_insert_id();
 
-    // 发放积分（失败则撤销签到记录，与 Go 一致）
+    // 发放积分（失败则撤销签到记录，与既有行为一致）
     match add_points(pool, user_id, points, &format!("签到第 {days} 天奖励")).await {
         Ok(_) => {}
         Err(err) => {
@@ -1458,7 +1458,7 @@ pub async fn sign_today(pool: &MySqlPool, user_id: u32) -> Result<Value, ModelEr
     }))
 }
 
-/// 增减积分（Go 的 `AddPoints`），返回变更后的积分。
+/// 增减积分（`AddPoints`），返回变更后的积分。
 pub async fn add_points(
     pool: &MySqlPool,
     user_id: u32,
@@ -1530,7 +1530,7 @@ pub async fn add_points(
 // 内容详情（会员中心「我的一条内容」）
 // ============================================================================
 
-/// 内容归属人（Go 的 `GetArchiveOwner`）。
+/// 内容归属人（`GetArchiveOwner`）。
 pub async fn archive_owner(pool: &MySqlPool, id: i64) -> anyhow::Result<Option<u32>> {
     let owner: Option<u32> = sqlx::query_scalar("SELECT user_id FROM archives WHERE id = ?")
         .bind(id)
@@ -1547,7 +1547,7 @@ pub async fn archive_owner(pool: &MySqlPool, id: i64) -> anyhow::Result<Option<u
 
 /// 会员自己发布的内容详情（正式内容优先，其次草稿）。
 ///
-/// 返回 Go 的 `ApiUserArchiveDetail` 那份 JSON。
+/// 返回 `ApiUserArchiveDetail` 那份 JSON。
 pub async fn archive_detail(pool: &MySqlPool, id: i64) -> anyhow::Result<Option<Value>> {
     let mut out = json!({ "id": id, "draft": false });
 
@@ -1618,7 +1618,7 @@ pub async fn archive_detail(pool: &MySqlPool, id: i64) -> anyhow::Result<Option<
     Ok(Some(out))
 }
 
-/// 内容关联的标签名（Go 的 `GetTagsByItemId`）。
+/// 内容关联的标签名（`GetTagsByItemId`）。
 pub async fn archive_tags(pool: &MySqlPool, id: i64) -> Vec<String> {
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT t.title FROM tag_data d INNER JOIN tags t ON t.id = d.tag_id \
@@ -1663,7 +1663,7 @@ pub async fn archive_link(pool: &MySqlPool, mode: i32, id: i64) -> String {
 // 工具
 // ============================================================================
 
-/// 邮箱格式校验（Go 的 `VerifyEmailFormat`）。
+/// 邮箱格式校验（`VerifyEmailFormat`）。
 pub fn valid_email(email: &str) -> bool {
     let email = email.trim();
     let Some((local, domain)) = email.split_once('@') else {
@@ -1686,7 +1686,7 @@ pub fn valid_email(email: &str) -> bool {
             .all(|ch| ch.is_alphanumeric() || ch == '.' || ch == '-')
 }
 
-/// 手机号格式校验（Go 的 `VerifyCellphoneFormat`）。
+/// 手机号格式校验（`VerifyCellphoneFormat`）。
 pub fn valid_phone(phone: &str) -> bool {
     let phone = phone.trim();
     if phone.len() != 11 || !phone.starts_with('1') {
@@ -1695,7 +1695,7 @@ pub fn valid_phone(phone: &str) -> bool {
     phone.chars().all(|ch| ch.is_ascii_digit())
 }
 
-/// URL 别名清洗（Go 的 `library.GetPinyin` 的简化版：保留字母数字）。
+/// URL 别名清洗（`GetPinyin` 的简化版：保留字母数字）。
 pub fn sanitize_token(raw: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -1717,7 +1717,7 @@ pub fn sanitize_token(raw: &str) -> String {
     }
 }
 
-/// 随机字母数字串（Go 的 `config.GenerateRandString`）。
+/// 随机字母数字串（`GenerateRandString`）。
 pub fn random_code(len: usize) -> String {
     const POOL: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
@@ -1726,19 +1726,19 @@ pub fn random_code(len: usize) -> String {
         .collect()
 }
 
-/// 密码重置令牌（Go 的 `library.Md5(user.Email + user.Password)`）。
+/// 密码重置令牌（`Md5(user.Email + user.Password)`）。
 ///
 /// 密码一改令牌就失效，所以天然是一次性的。
 pub fn md5_reset_token(email: &str, password_hash: &str) -> String {
     super::attachment::md5_hex(format!("{email}{password_hash}").as_bytes())
 }
 
-/// `images` 列里的第一张图（Go 的 `GetThumb`）。
+/// `images` 列里的第一张图（`GetThumb`）。
 pub fn first_image(images: Option<&str>) -> String {
     super::json_string_list(images).into_iter().next().unwrap_or_default()
 }
 
-/// 默认用户组 ID（Go 的 `provider/setting.go`：缺省 1）。
+/// 默认用户组 ID（缺省 1）。
 pub async fn default_group_id(pool: &MySqlPool) -> u32 {
     let value = super::site_setting::get_section(pool, "user").await.unwrap_or_default();
     value
@@ -1748,7 +1748,7 @@ pub async fn default_group_id(pool: &MySqlPool) -> u32 {
         .unwrap_or(1) as u32
 }
 
-/// 默认会员状态（Go 的 `provider/setting.go`：缺省 `normal` = 1）。
+/// 默认会员状态（缺省 `normal` = 1）。
 pub async fn default_status(pool: &MySqlPool) -> i32 {
     let value = super::site_setting::get_section(pool, "user").await.unwrap_or_default();
     match value.get("default_status").and_then(Value::as_str) {

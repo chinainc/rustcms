@@ -1,16 +1,15 @@
 //! 内容写入（新增 / 编辑 / 删除）。
 //!
-//! 对照 Go 版：
-//! - 校验顺序与文案：`provider.SaveArchive` + `controller.ApiImportArchive`
-//!   （分类必须存在且是内容列表类型、标题必填、正文必填、同标题不重复）；
-//! - url_token：小写化 + 去非法字符，与分类/内容表查重，冲突加 `-N` 后缀
-//!   （`provider.VerifyArchiveUrlToken`）；中文标题且在 ASCII 化后为空时留空，
-//!   前台按 id 出链接（Go 用拼音生成，Rust 侧暂不引入拼音库）；
+//! 行为约定：
+//! - 校验顺序与文案（分类必须存在且是内容列表类型、标题必填、正文必填、
+//! 同标题不重复）；
+//! - url_token：小写化 + 去非法字符，与分类/内容表查重，冲突加 `-N` 后缀；
+//! 中文标题在 ASCII 化后为空时留空，前台按 id 出链接（不引入拼音库，
+//! 因此不生成拼音别名）；
 //! - 分类计数：重算「自身 + 全部下级」的内容数写回 `categories.archive_count`
-//!   （`provider.UpdateCategoryArchiveCount`，注意是重算而不是 ±1）；
-//! - 删除：Go 把行搬到 `archive_drafts` 并置 status=99；这里先做硬删除
-//!   （`archives` / `archive_data` / `archive_categories` 三处一起清），
-//!   软删除等后台回收站做出来再对齐。
+//! （注意是重算而不是 ±1）；
+//! - 删除：先做硬删除（`archives` / `archive_data` / `archive_categories`
+//! 三处一起清）；搬进 `archive_drafts` 并置 status=99 的软删除留给后台回收站。
 
 use serde::Deserialize;
 use sqlx::mysql::{MySql, MySqlConnection, MySqlPool};
@@ -23,9 +22,9 @@ use super::{archive, extra, module, ModelError};
 const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 /// 标题长度上限（表结构 varchar(190)）。
 const MAX_TITLE_CHARS: usize = 190;
-/// 摘要长度（Go 的 ParseDescription(250)）。
+/// 摘要长度（250 字符）。
 const MAX_DESCRIPTION_CHARS: usize = 250;
-/// url_token 长度上限（Go 侧 100）。
+/// url_token 长度上限（既有实现 100）。
 const MAX_TOKEN_CHARS: usize = 100;
 
 /// 写入用的内容参数。
@@ -541,7 +540,7 @@ pub async fn delete(pool: &MySqlPool, id: i64) -> Result<bool, ModelError> {
         .execute(&mut *tx)
         .await?;
 
-    // 模块扩展表里的那一行（Go: provider.DeleteArchive 里的 DELETE FROM {module.TableName}）
+    // 模块扩展表里的那一行（既有实现: provider.DeleteArchive 里的 DELETE FROM {module.TableName}）
     if let Ok(Some(model)) = module::get(pool, existing.module_id).await {
         if let Ok(table) = model.safe_table() {
             let sql = format!("DELETE FROM `{table}` WHERE id = ?");
@@ -891,7 +890,7 @@ mod tests {
         let loaded = extra::load(&pool, &model, saved.id).await.unwrap();
         assert_eq!(loaded["author"], json!("张三"));
         assert_eq!(loaded["pages"], json!(12));
-        // checkbox 落库为逗号串，读回仍是字符串（与 Go 一致）
+        // checkbox 落库为逗号串，读回仍是字符串（与既有接口契约一致）
         assert_eq!(loaded["tags"], json!("a,b"));
 
         let row = archive::get(&pool, saved.id).await.unwrap().unwrap();

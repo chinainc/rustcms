@@ -1,12 +1,12 @@
 //! 配置文件（config.json）读写。
 //!
-//! 结构与 Go 版 `config/config.go` 的 `ServerJson` 保持一致，
-//! 因此同一个 config.json 可以被两个实现共用：
+//! 结构固定为 `mysql` / `server` 两段，
+//! 同一个 config.json 可以直接复用：
 //!
 //! ```json
 //! {
-//!   "mysql":  { "database": "cms", "user": "root", "password": "", "host": "127.0.0.1", "port": 3306 },
-//!   "server": { "env": "production", "port": 8001, "log_level": "error" }
+//! "mysql": { "database": "rustcms", "user": "root", "password": "", "host": "127.0.0.1", "port": 3306 },
+//! "server": { "env": "production", "port": 9001, "log_level": "error" }
 //! }
 //! ```
 
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// 默认配置文件名。
 pub const CONFIG_FILE: &str = "config.json";
@@ -34,7 +35,7 @@ fn default_env() -> String {
 }
 
 fn default_port() -> u16 {
-    8001
+    9001
 }
 
 fn default_log_level() -> String {
@@ -42,11 +43,11 @@ fn default_log_level() -> String {
 }
 
 fn default_template_dir() -> String {
-    "../template/default".to_string()
+    "./template/default".to_string()
 }
 
 fn default_public_dir() -> String {
-    "../public".to_string()
+    "./public".to_string()
 }
 
 /// MySQL 连接信息。
@@ -93,9 +94,11 @@ pub struct ServerConfig {
     /// production / development
     #[serde(default = "default_env")]
     pub env: String,
+    /// 监听端口：优先读 `config.json` 的 `server.port`；
+    /// 文件里没写时自动补 9001 并写回（真正以配置文件为准）。
     #[serde(default = "default_port")]
     pub port: u16,
-    /// error / warn / info / debug / trace（Go 版的 release 视作 info）
+    /// error / warn / info / debug / trace（`release` 视作 info）
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -110,7 +113,7 @@ impl Default for ServerConfig {
     }
 }
 
-/// 根配置。未知字段会被忽略，便于直接复用 Go 版配置文件。
+/// 根配置。未知字段会被忽略，便于直接复用既有配置文件。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerJson {
     #[serde(default)]
@@ -123,12 +126,32 @@ pub struct ServerJson {
     /// 模板目录（相对工作目录或绝对路径）
     #[serde(default = "default_template_dir")]
     pub template_dir: String,
-    /// 静态文件目录（uploads 落盘在这里，默认 `../public`）
+    /// 静态文件目录（uploads 落盘在这里，默认 `./public`）
     #[serde(default = "default_public_dir")]
     pub public_dir: String,
     /// 配置来源路径，不参与序列化。
     #[serde(skip)]
     pub path: Option<PathBuf>,
+}
+
+/// 启动时的配置加载结果。
+pub enum LoadOutcome {
+    /// 数据库已配置，按正常模式运行。
+    Ready(ServerJson),
+    /// 没有 `config.json` 或没配数据库：进入安装模式。
+    NeedsInstall(ServerJson),
+}
+
+/// 默认要写入的 `config.json` 路径：优先可执行文件同目录，其次当前目录。
+pub fn default_config_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join(CONFIG_FILE);
+        }
+    }
+    std::env::current_dir()
+        .map(|dir| dir.join(CONFIG_FILE))
+        .unwrap_or_else(|_| PathBuf::from(CONFIG_FILE))
 }
 
 impl ServerJson {
@@ -152,26 +175,58 @@ impl ServerJson {
         candidates.into_iter().find(|p| p.is_file())
     }
 
-    /// 读取配置；文件不存在时使用默认值（与 Go 版行为一致）。
+    /// 启动用配置加载：端口以 `config.json` 为准，缺省自动补 9001 并写回。
     ///
-    /// 文件存在但无法解析时直接报错退出，避免带着错误配置启动。
-    pub fn load() -> Result<Self> {
+    /// - 没有配置文件：返回 `NeedsInstall`（端口先用默认 9001），不写文件；
+    /// - 有文件但 `server` 段没写 `port`（或写成 0）：补成 9001 并写回文件；
+    /// - 数据库未配置（`mysql.database` 为空）：返回 `NeedsInstall`，进入安装模式。
+    pub fn load_for_start() -> Result<LoadOutcome> {
         let Some(path) = Self::locate() else {
-            eprintln!(
-                "未找到 {CONFIG_FILE}，使用默认配置（port={}）",
-                default_port()
-            );
-            return Ok(Self::default());
+            let mut cfg = Self::default();
+            cfg.server.port = default_port();
+            cfg.template_dir = "./template/default".to_string();
+            cfg.public_dir = "./public".to_string();
+            cfg.path = Some(default_config_path());
+            return Ok(LoadOutcome::NeedsInstall(cfg));
         };
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
         let mut cfg: ServerJson = serde_json::from_str(&raw)
             .with_context(|| format!("配置文件格式错误：{}", path.display()))?;
+        // 写回时直接改原始 JSON，保留用户配置里的其他字段
+        let mut value: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("配置文件格式错误：{}", path.display()))?;
+        let has_port = value
+            .get("server")
+            .and_then(|server| server.get("port"))
+            .is_some();
+        if !has_port || cfg.server.port == 0 {
+            cfg.server.port = default_port();
+            if !value.get("server").map(Value::is_object).unwrap_or(false) {
+                value["server"] = json!({});
+            }
+            value["server"]["port"] = json!(cfg.server.port);
+            match serde_json::to_string_pretty(&value) {
+                Ok(text) => match fs::write(&path, text) {
+                    Ok(()) => eprintln!(
+                        "[!] {} 未配置 server.port，已自动写入 {}（可在文件中修改）",
+                        path.display(),
+                        cfg.server.port
+                    ),
+                    Err(err) => eprintln!("[!] 自动补 server.port 写回失败：{err}"),
+                },
+                Err(err) => eprintln!("[!] 自动补 server.port 失败：{err}"),
+            }
+        }
         cfg.path = Some(path);
-        Ok(cfg)
+        if cfg.mysql.is_configured() {
+            Ok(LoadOutcome::Ready(cfg))
+        } else {
+            Ok(LoadOutcome::NeedsInstall(cfg))
+        }
     }
 
-    /// 写回配置文件（保留 Go 版的两空格缩进风格）。
+    /// 写回配置文件（保留两空格缩进风格）。
     #[allow(dead_code)] // 供后台「保存配置」使用
     pub fn save(&self) -> Result<()> {
         let path = self
@@ -202,11 +257,11 @@ impl ServerJson {
         self.server.port
     }
 
-    /// 静态文件目录；配置为空时退回 `../public`。
+    /// 静态文件目录；配置为空时退回 `./public`。
     pub fn public_dir(&self) -> PathBuf {
         let dir = self.public_dir.trim();
         if dir.is_empty() {
-            PathBuf::from("../public")
+            PathBuf::from("./public")
         } else {
             PathBuf::from(dir)
         }
@@ -247,7 +302,7 @@ mod tests {
     #[test]
     fn ignores_unknown_fields_of_go_config() {
         let cfg: ServerJson = serde_json::from_str(
-            r#"{"mysql":{"database":"cms","user":"root"},"server":{"env":"dev"},
+            r#"{"mysql":{"database":"cms","user":"root"},"server":{"env":"dev","port":9000},
                 "sparks":[{"name":"any"}],"unknown":{"a":1}}"#,
         )
         .unwrap();
@@ -256,9 +311,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_is_usable() {
-        let cfg: ServerJson = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.port(), 8001);
+    fn missing_port_falls_back_to_9001() {
+        // 端口以 config.json 为准：server 段没写 port 时用默认 9001
+        let cfg: ServerJson =
+            serde_json::from_str(r#"{"server":{"env":"production","log_level":"error"}}"#).unwrap();
+        assert_eq!(cfg.port(), 9001);
+    }
+
+    #[test]
+    fn default_uses_port_9001() {
+        let cfg = ServerJson::default();
+        assert_eq!(cfg.port(), 9001);
         assert!(cfg.path().is_none());
     }
 

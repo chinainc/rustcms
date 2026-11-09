@@ -1,7 +1,7 @@
-//! 数据模型层（对应 Go 版 `model/`）。
+//! 数据模型层。
 //!
-//! 表名与 Go 版一致（`categories` / `archives` / `archive_data` / `modules` …），
-//! 因此 Rust 与 Go 两个实现可以直接共用同一个数据库。
+//! 表名固定为 `categories` / `archives` / `archive_data` / `modules` …，
+//! 既有数据库可以直接复用。
 //!
 //! 数据层先于调用方落地，部分能力（封面/看图/浏览量自增/按 token 查分类等）
 //! 目前只被测试覆盖，先关闭 `dead_code` 告警，等前台与后台接上后自然消除。
@@ -9,7 +9,7 @@
 
 pub mod admin;
 pub mod anchor;
-pub mod anqi;
+pub mod cloud;
 pub mod archive;
 pub mod archive_admin;
 pub mod attachment;
@@ -72,7 +72,7 @@ use serde::{Serialize, Serializer};
 
 /// 数据层错误：业务校验失败 vs 数据库/系统错误。
 ///
-/// 业务错误的中文文案直接回给前端（对应 Go 版的 `ctx.Tr("...")`）。
+/// 业务错误的中文文案直接回给前端（对应既有约定的 `ctx.Tr("...")`）。
 #[derive(Debug)]
 pub enum ModelError {
     Invalid(String),
@@ -119,7 +119,7 @@ impl From<serde_json::Error> for ModelError {
     }
 }
 
-/// 分页结果，字段命名与 Go 版 API 保持一致。
+/// 分页结果，字段命名与既有实现 API 保持一致。
 #[derive(Debug, Clone, Serialize)]
 pub struct Page<T> {
     pub list: Vec<T>,
@@ -181,7 +181,7 @@ pub fn json_string_list(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// `images` 列序列化成字符串数组（库里是文本，Go 版 API 输出数组）。
+/// `images` 列序列化成字符串数组（库里是文本，既有实现 API 输出数组）。
 pub(crate) fn serialize_images<S: Serializer>(
     images: &Option<String>,
     serializer: S,
@@ -205,18 +205,33 @@ pub(crate) async fn db_lock() -> tokio::sync::MutexGuard<'static, ()> {
     LOCK.lock().await
 }
 
-/// 测试辅助：连接仓库根目录 `config.json` 里配置的数据库。
+/// 测试辅助：真实模板目录（仓库根的 `template/default`）。
 ///
-/// 可用 `RUSTCMS_TEST_CONFIG` 指定其它配置文件（CI/受限环境不便在仓库外写文件）；
-/// 连不上（或没有配置文件）时返回 `None`，调用方直接跳过用例，
-/// 这样在没有数据库的机器上 `cargo test` 也不会红。
+/// 仓库根就是 crate 根；同样兼容 crate 曾经位于下级目录的历史布局。
+#[cfg(test)]
+pub(crate) fn test_template_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let local = manifest.join("template/default");
+    if local.is_dir() {
+        local
+    } else {
+        manifest.join("../template/default")
+    }
+}
+
+/// 测试辅助：连接测试配置文件里配置的数据库。
+///
+/// **必须显式用 `RUSTCMS_TEST_CONFIG` 指定配置文件才会连库**（例如
+/// `RUSTCMS_TEST_CONFIG=tmp/test-config.json cargo test`）：连库用例会真的写库
+/// （建/删测试归档、改设置项），默认不自动读仓库根的 `config.json`，免得
+/// `cargo test` 动到开发库里的真实数据（那批用例又依赖线上配置，例如公众号
+/// AppID、插件密钥，缺了会红）。
+///
+/// 没指定 / 连不上 / 没配 mysql 时返回 `None`，调用方直接跳过用例，
+/// 这样在没有数据库的机器上 `cargo test` 也不会红（约定见 `docs/coverage-plan.md`）。
 #[cfg(test)]
 pub(crate) async fn test_pool() -> Option<sqlx::MySqlPool> {
-    let path = std::env::var_os("RUSTCMS_TEST_CONFIG")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.json")
-        });
+    let path = std::env::var_os("RUSTCMS_TEST_CONFIG").map(std::path::PathBuf::from)?;
     let raw = std::fs::read_to_string(&path).ok()?;
     let cfg: crate::config::ServerJson = serde_json::from_str(&raw).ok()?;
     if !cfg.mysql.is_configured() {

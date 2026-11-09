@@ -1,6 +1,6 @@
 //! 文档标签（`tags` + `tag_contents` + `tag_data`）。
 //!
-//! 对齐 Go 版 `controller/manageController/pluginTag.go`：
+//! 行为约定：
 //! - 列表支持标题模糊搜索与分类筛选；
 //! - `partial = true` 走 PATCH 语义（只覆盖显式传入的字段），否则全量覆盖；
 //! - 正文与自定义字段存在 `tag_contents`（`id` 就是 tag id，一对一）；
@@ -34,7 +34,7 @@ pub struct Tag {
     pub status: u8,
 }
 
-/// 保存入参（对应 Go 的 `request.PluginTag`）。
+/// 保存入参（对应既有约定）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TagInput {
     #[serde(default)]

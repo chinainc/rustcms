@@ -1,7 +1,5 @@
 //! 后台内容的批量操作（状态 / 标记 / 排序 / 分类 / 父级 / 时间 / 回收站恢复）。
 //!
-//! 对齐 Go 版 `provider/archive.go` 的 `UpdateArchive*` 系列。
-//!
 //! 内容在两张表之间流转：
 //! - `archives`：已发布内容；
 //! - `archive_drafts`：草稿 / 回收站（`status = 0` 草稿，`99` 回收站）。
@@ -25,6 +23,9 @@ const DRAFT_COLUMNS: &str = "id, parent_id, created_time, updated_time, title, s
     favorite_count, images, template, canonical_url, fixed_link, user_id, price, stock, \
     read_level, password, sort, has_pseudo, keyword_id, origin_url, origin_title, origin_id, \
     status";
+
+/// `archive_drafts.status`：定时发布计划态。
+const CONTENT_STATUS_PLAN: u8 = 2;
 
 fn require_ids(ids: &[i64]) -> Result<(), ModelError> {
     if ids.is_empty() {
@@ -134,6 +135,60 @@ pub async fn set_status(pool: &MySqlPool, ids: &[i64], status: u32) -> Result<us
     }
     drop(conn);
     recount(pool, &affected_categories).await?;
+    Ok(count)
+}
+
+/// 发布到期的定时发布计划（每分钟调用）。
+///
+/// 遵循既有约定：取 `status = 2` 且 `created_time < now` 的草稿，
+/// 转入正式表并删除草稿；保留计划时间作为发布时间。
+pub async fn publish_planned(pool: &MySqlPool) -> Result<usize, ModelError> {
+    let now = chrono::Utc::now().timestamp();
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM archive_drafts WHERE status = ? AND created_time < ? \
+         ORDER BY created_time ASC LIMIT 100",
+    )
+    .bind(CONTENT_STATUS_PLAN)
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut count = 0usize;
+    let mut categories = Vec::new();
+    let mut conn = pool.acquire().await?;
+    for id in ids {
+        if let Some(cid) = category_of(pool, id, true).await {
+            categories.push(cid);
+        }
+        if publish_draft(&mut conn, id, false).await? {
+            count += 1;
+        }
+    }
+    drop(conn);
+    recount(pool, &categories).await?;
+    Ok(count)
+}
+
+/// 清理 30 天前移入回收站的内容（每天调用）。
+pub async fn clean_recycle_bin(pool: &MySqlPool) -> Result<usize, ModelError> {
+    let deadline = chrono::Utc::now().timestamp() - 30 * 24 * 3600;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM archive_drafts WHERE status = 99 AND updated_time < ? LIMIT 200",
+    )
+    .bind(deadline)
+    .fetch_all(pool)
+    .await?;
+
+    let mut count = 0usize;
+    for id in ids {
+        if delete_draft(pool, id).await? {
+            count += 1;
+        }
+    }
     Ok(count)
 }
 
@@ -316,7 +371,7 @@ pub async fn set_category(
 /// 批量改时间。
 ///
 /// `time`：1 = 选中内容的 `created_time`，2 = 选中内容的 `updated_time`，
-/// 3 = 全部内容的 `created_time`，4 = 全部内容的 `updated_time`（与 Go 一致）。
+/// 3 = 全部内容的 `created_time`，4 = 全部内容的 `updated_time`（与既有接口契约一致）。
 pub async fn set_time(pool: &MySqlPool, ids: &[i64], time_mode: u32) -> Result<usize, ModelError> {
     if ids.is_empty() && time_mode < 3 {
         return Err(ModelError::invalid("没有要操作的文档"));

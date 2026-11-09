@@ -37,7 +37,7 @@ src/
 ├── api_interact.rs      评论 / 互动类接口
 └── api_admin_gap.rs     后台补充接口
 docs/
-└── coverage-plan.md     后台端点覆盖盘点与并行任务划分
+└── coverage-plan.md     能力清单、实测证据与验证方法
 ```
 
 ---
@@ -60,7 +60,7 @@ cp config.sample.json config.json
 ```json
 {
   "mysql": {
-    "database": "cms",
+    "database": "rustcms",
     "user": "root",
     "password": "",
     "host": "127.0.0.1",
@@ -69,19 +69,19 @@ cp config.sample.json config.json
   },
   "server": {
     "env": "production",
-    "port": 8001,
+    "port": 9001,
     "log_level": "error"
   },
   "api_token": "",
-  "template_dir": "../template/default",
-  "public_dir": "../public"
+  "template_dir": "./template/default",
+  "public_dir": "./public"
 }
 ```
 
 | 字段 | 说明 |
 |---|---|
 | `mysql.*` | 数据库连接信息；`use_default: true` 表示复用默认站点（ID=1）的账号密码 |
-| `server.port` | 监听端口，默认 `8001` |
+| `server.port` | 监听端口，默认 `9001`；`config.json` 里没写时自动补 9001 并写回 |
 | `server.log_level` | `error` / `warn` / `info` / `debug` / `trace`；也可用环境变量 `RUST_LOG` 覆盖 |
 | `api_token` | 写入接口令牌；未配置时 `/api/archives` 的 POST/PUT/DELETE 一律拒绝 |
 | `template_dir` | 模板目录（相对工作目录或绝对路径） |
@@ -134,14 +134,14 @@ cargo test --offline
 ```
 
 数据库相关的用例连不上库时会自动跳过（返回 `None`），不会让 `cargo test` 变红。
-用例串行执行（`db_lock()`），避免并发写同一个库互相干扰。
+用例串行执行（`db_lock`），避免并发写同一个库互相干扰。
 
 ---
 
 ## 开发文档
 
-[`docs/coverage-plan.md`](./docs/coverage-plan.md) 记录了后台端点的覆盖盘点、分批实现方式，
-以及端点覆盖度的机器化核对方法（路径级 + 方法级）。
+[`docs/coverage-plan.md`](./docs/coverage-plan.md) 记录了各模块的能力清单与实现要点、
+实测证据与已知边界，以及端点覆盖度的机器核对方法与构建环境约束。
 
 ---
 

@@ -1,6 +1,6 @@
 //! 友情链接（表 `links`）。
 //!
-//! 对齐 Go 版 `controller/manageController/pluginLink.go`：
+//! 行为约定：
 //! - 列表不分页，按 `sort ASC, id DESC`；
 //! - 保存时 `status` **强制归零**（待回链检查），真正置为 1 要等 `PluginLinkCheck` 通过；
 //! - 回链检查抓取对方页面，解析其中 `<a>` 标签，比对本站链接与标题。
@@ -45,7 +45,7 @@ pub struct Link {
     pub logo: String,
 }
 
-/// 保存入参（对应 Go 的 `request.PluginLink`）。
+/// 保存入参（对应既有约定）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LinkInput {
     #[serde(default)]
@@ -247,7 +247,7 @@ fn href_matches(href: &str, my_link: &str) -> bool {
     !mine.is_empty() && href == mine
 }
 
-/// 根据页面内容判定回链状态（对齐 Go `PluginLinkCheck`）。
+/// 根据页面内容判定回链状态（遵循既有约定）。
 fn evaluate(html: &str, my_link: &str, my_title: &str) -> u8 {
     for (href, rel, text) in anchors(html) {
         if !href_matches(&href, my_link) {
@@ -299,7 +299,7 @@ pub async fn check(pool: &MySqlPool, id: u32) -> Result<Link, ModelError> {
         .await?
         .ok_or_else(|| ModelError::invalid("链接不存在"))?;
 
-    // 优先抓回链地址，未填时退回链接本身（Go `PluginLinkCheck`）
+    // 优先抓回链地址，未填时退回链接本身
     let remote = if link.back_link.trim().is_empty() {
         link.link.trim()
     } else {

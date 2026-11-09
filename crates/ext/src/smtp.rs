@@ -1,6 +1,6 @@
 //! SMTP 发信客户端。
 //!
-//! 对齐 Go 版 `internal/mail` 的对外语义：
+//! 对外语义：
 //!
 //! * `smtplist` 多账号容灾 —— 前一个账号失败自动换下一个；
 //! * 按服务器广告选择认证机制（`AUTH PLAIN` / `AUTH LOGIN`）；
@@ -88,7 +88,7 @@ pub fn encode_header_word(text: &str) -> String {
 /// Quoted-Printable 编码（`Content-Transfer-Encoding: quoted-printable`）。
 ///
 /// 规则：`=` 转义成 `=3D`；单行超过 75 字节用软换行 `=\r\n` 折行；
-/// 非 ASCII 字节保持原样（依赖 `8BITMIME`，与 Go 版一致）。
+/// 非 ASCII 字节保持原样（依赖 `8BITMIME`）。
 pub fn quoted_printable_encode(text: &str) -> String {
     let mut buf: Vec<u8> = Vec::with_capacity(text.len() + text.len() / 8);
     let mut line_len = 0usize;
@@ -973,7 +973,7 @@ fn domain_of(email: &str) -> String {
 
 /// 发信（多账号容灾 + 临时错误重试）。
 ///
-/// 行为与 Go 版一致：账号列表逐个尝试，前一个失败自动换下一个；
+/// 账号列表逐个尝试，前一个失败自动换下一个；
 /// 网络错误与 4xx 临时错误在同账号内重试 `retries` 次。
 pub fn send(config: &SmtpConfig, mail: &Mail) -> Result<SendOutcome> {
     if config.accounts.is_empty() {
@@ -1034,9 +1034,7 @@ pub fn send(config: &SmtpConfig, mail: &Mail) -> Result<SendOutcome> {
     }
 }
 
-/// 连接测试（握手 + 认证 + QUIT，不发信）。
-///
-/// 对齐 Go 版 `mail.Probe()`。
+/// 连接测试：握手 + 认证 + QUIT，不发信、不投递。
 pub fn probe(account: &SmtpAccount) -> Result<()> {
     if account.tls != TlsMode::None {
         if !crate::http::curl_available() {

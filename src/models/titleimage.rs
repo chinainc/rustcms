@@ -1,16 +1,26 @@
-//! 标题生成图片（`pluginTitleImage.go`）。
+//! 标题生成图片。
 //!
 //! 配置存 `settings.title_image`。
-//! 由于项目未引入图片处理依赖，渲染采用 **SVG**（见 `image_ops` 的模块说明）：
-//! - 预览返回 `data:image/svg+xml;base64,...`，浏览器可直接查看；
-//! - 批量生成把 SVG 写到 `uploads/titleimage/generated/<md5>.svg`，并补进文档 `images`。
-//! 背景图按配置等比裁剪嵌入，字体以 `@font-face` 内嵌上传的 ttf，因此中文标题也可正常显示。
+//!
+//! 渲染分工（两条路都保留，互不冲突）：
+//! - **位图管线**（[`background`] + [`draw`]）：生成背景位图——有背景图则等比裁剪，
+//! 否则按标题摘要生成深色细带 + 噪声再放大；配色算法
+//! （`sumTitle` / `RandColor` / `RandDeepColor`）逐项照搬既有实现。再用自带的 TrueType
+//! 光栅化（[`super::watermark::font`]）按同样的口径把标题画上去（自动字号、
+//! 居中折行、可选文字底色带）。图片解码/编码/缩放见 [`image_ops`]（PNG / JPEG / GIF / BMP）。
+//! - **SVG 管线**（路由层）：作为**兜底**保留 —— 一个可用字体都找不到时，预览与批量生成
+//! 仍能出图（内嵌 `@font-face`，由浏览器负责光栅化）。
 //!
 //! 资源上传：
 //! - 字体只收 `.ttf`，固定落到 `uploads/titleimage/title_font.ttf`；
 //! - 背景图按 `md5(原文件名)` 命名，落到 `uploads/titleimage/`。
 
+pub mod background;
+pub mod draw;
+pub mod gif;
 pub mod image_ops;
+pub mod jpeg;
+pub mod jpeg_encode;
 
 use std::path::Path;
 
@@ -18,6 +28,10 @@ use serde_json::{json, Value};
 use sqlx::mysql::MySqlPool;
 
 use super::{site_setting, ModelError};
+
+// 供路由层/后台直接调用（当前只有测试在用，故屏蔽未使用告警）
+#[allow(unused_imports)]
+pub use background::{background_image, deep_color, random_color, title_sum};
 
 /// 标题图片配置键。
 pub const SETTING_KEY: &str = "title_image";
@@ -117,7 +131,8 @@ pub fn upload(
         std::fs::create_dir_all(parent)
             .map_err(|err| ModelError::invalid(format!("创建目录失败: {err}")))?;
     }
-    std::fs::write(&full, bytes).map_err(|err| ModelError::invalid(format!("保存文件失败: {err}")))?;
+    std::fs::write(&full, bytes)
+        .map_err(|err| ModelError::invalid(format!("保存文件失败: {err}")))?;
     Ok(relative)
 }
 

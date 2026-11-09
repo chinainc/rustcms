@@ -1,4 +1,4 @@
-//! 邮件订阅（`subscribers` + `subscriber_categories`，`pluginSubscriber.go`）。
+//! 邮件订阅（`subscribers` + `subscriber_categories`）。
 //!
 //! 注意两张表的 `id` / 时间列都是**有符号** `int(11)`，所以用 `i32` 映射，
 //! 取成 `u32`/`i64` 会解码失败。

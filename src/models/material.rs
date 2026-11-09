@@ -1,4 +1,4 @@
-//! 素材库（`materials` + `material_categories`，`pluginMaterial.go`）。
+//! 素材库（`materials` + `material_categories`）。
 //!
 //! 素材是可复用的富文本片段；`content` 存 `materials.content`，
 //! 同时算一份 `md5` 便于去重/校验。

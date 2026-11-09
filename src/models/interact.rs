@@ -1,18 +1,17 @@
 //! 互动与第三方数据访问（批次 D）。
 //!
-//! 对应 Go 版 `provider/comment.go`、`provider/favorite.go`、`provider/guestbook.go`、
-//! `provider/weapp.go`、`provider/wechat.go`、`provider/statisticLog.go`。
+//! 覆盖评论 / 收藏 / 留言 / 小程序 / 公众号 / 访问统计。
 //!
 //! 涉及的表：`comments` / `comment_praises` / `archive_favorites` / `guestbooks` /
 //! `weapp_qrcodes` / `wechat_messages` / `wechat_reply_rules` / `user_groups`。
 //!
-//! 口径（与 Go 版一致）：
+//! 口径（与既有接口契约一致）：
 //! - 评论 `status`：`0` = 待审核，`1` = 正常（另见 [`super::comment`]）；
 //! - 留言 `status`：`0` = 待审核，`1` = 正常，`2` = 垃圾（另见 [`super::guestbook`]）；
 //! - 点赞落在 `comment_praises`，同时把 `comments.vote_count` 同步成点赞条数；
 //! - 收藏落在 `archive_favorites`，同时把 `archives.favorite_count` 同步成收藏条数；
 //! - 评论落库后同步 `archives.comment_count`；
-//! - 排序参数走白名单（对应 Go 的 `provider.ParseOrderBy`），杜绝 SQL 注入。
+//! - 排序参数走白名单（对应 `ParseOrderBy`），杜绝 SQL 注入。
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -32,10 +31,10 @@ use super::site_setting;
 // 排序白名单
 // ---------------------------------------------------------------------------
 
-/// 排序白名单（对应 Go 的 `provider.ParseOrderBy`）。
+/// 排序白名单（对应 `ParseOrderBy`）。
 ///
 /// 只放行「列名 + 可选方向」：列名只允许字母/数字/下划线（可带 `表.列`），
-/// 方向只允许 `asc` / `desc`；`rand()` 单独放行。
+/// 方向只允许 `asc` / `desc`；`rand` 单独放行。
 pub fn parse_order_by(order: &str) -> String {
     let order = order.trim();
     if order.is_empty() {
@@ -92,11 +91,11 @@ fn is_order_column(column: &str) -> bool {
 // 评论
 // ---------------------------------------------------------------------------
 
-/// 评论列表（对应 Go 的 `Website.GetCommentList`）。
+/// 评论列表（对应 `Website.GetCommentList`）。
 ///
 /// - `archive_id > 0` 时按文档过滤；
 /// - `user_id > 0` 时按会员过滤；
-/// - `page > 1` 时用 `(page - 1) * page_size` 覆盖 `offset`（Go 同款）；
+/// - `page > 1` 时用 `(page - 1) * page_size` 覆盖 `offset`（同款）；
 /// - `order` 为空时按 `id DESC` 排序。
 pub async fn comment_list(
     pool: &MySqlPool,
@@ -173,7 +172,7 @@ pub async fn parents(
     Ok(rows.into_iter().map(|row| (row.id, row)).collect())
 }
 
-/// 新增评论（对应 Go 的 `Website.SaveComment` 新建分支）。
+/// 新增评论（对应 `Website.SaveComment` 新建分支）。
 ///
 /// 正文走 HTML 转义（防 XSS），落库后同步 `archives.comment_count`。
 #[allow(clippy::too_many_arguments)]
@@ -218,7 +217,7 @@ pub async fn insert_comment(
         .ok_or_else(|| anyhow::anyhow!("评论保存失败"))
 }
 
-/// 同步文档的评论数（对应 Go 的 `Comment.UpdateCommentCount`）。
+/// 同步文档的评论数（对应 `Comment.UpdateCommentCount`）。
 pub async fn refresh_comment_count(pool: &MySqlPool, archive_id: i64) -> anyhow::Result<()> {
     let _ = sqlx::query(
         "UPDATE archives SET comment_count = \
@@ -231,7 +230,7 @@ pub async fn refresh_comment_count(pool: &MySqlPool, archive_id: i64) -> anyhow:
     Ok(())
 }
 
-/// 评论点赞（对应 Go 的 `Website.AddCommentPraise`）。
+/// 评论点赞（对应 `Website.AddCommentPraise`）。
 ///
 /// 返回 `true` 表示这次是新增的点赞记录（重复点赞返回 `false`，但计数会重新同步）。
 pub async fn add_comment_praise(
@@ -275,9 +274,9 @@ pub async fn add_comment_praise(
     Ok(created)
 }
 
-/// 评论的 JSON 载荷（字段与 Go 的 `model.Comment` 完全一致）。
+/// 评论的 JSON 载荷（字段与 `Comment` 完全一致）。
 ///
-/// Go 侧 `item_title` / `parent` / `active` 是 `gorm:"-"` 的计算字段，
+/// `item_title` / `parent` / `active` 是仅用于输出的计算字段，
 /// 这里由调用方补齐。
 pub fn comment_payload(comment: &Comment, item_title: &str, parent: Option<&Comment>) -> Value {
     let mut map = Map::new();
@@ -324,9 +323,9 @@ pub struct ArchiveFavorite {
     pub created_time: Option<i64>,
 }
 
-/// 收藏列表（对应 Go 的 `Website.GetFavoriteList`）。
+/// 收藏列表（对应 `Website.GetFavoriteList`）。
 ///
-/// 先按收藏记录倒序取本页，再回捞内容；内容已删除的直接跳过（Go 同款）。
+/// 先按收藏记录倒序取本页，再回捞内容；内容已删除的直接跳过（同款）。
 pub async fn favorite_list(
     pool: &MySqlPool,
     user_id: i64,
@@ -375,7 +374,7 @@ pub async fn favorite_list(
     Ok((total, list))
 }
 
-/// 批量查收藏状态（对应 Go 的 `Website.CheckFavorites`）。
+/// 批量查收藏状态（对应 `Website.CheckFavorites`）。
 pub async fn check_favorites(
     pool: &MySqlPool,
     user_id: i64,
@@ -397,7 +396,7 @@ pub async fn check_favorites(
     Ok(builder.build_query_as().fetch_all(pool).await?)
 }
 
-/// 添加 / 取消收藏（对应 Go 的 `Website.AddFavorite`，**是开关语义**）。
+/// 添加 / 取消收藏（对应 `Website.AddFavorite`，**是开关语义**）。
 ///
 /// 返回 `true` = 已收藏，`false` = 刚刚取消了收藏。
 pub async fn add_favorite(
@@ -446,7 +445,7 @@ pub async fn add_favorite(
     Ok(true)
 }
 
-/// 取消收藏（对应 Go 的 `Website.DeleteFavorite`）。
+/// 取消收藏（对应 `Website.DeleteFavorite`）。
 pub async fn delete_favorite(
     pool: &MySqlPool,
     user_id: i64,
@@ -463,7 +462,7 @@ pub async fn delete_favorite(
     Ok(affected)
 }
 
-/// 同步内容的收藏数（对应 Go 的 `ArchiveFavorite.AfterCreate`）。
+/// 同步内容的收藏数（对应 `ArchiveFavorite.AfterCreate`）。
 pub async fn refresh_favorite_count(pool: &MySqlPool, archive_id: i64) -> anyhow::Result<()> {
     let _ = sqlx::query(
         "UPDATE archives SET favorite_count = \
@@ -480,7 +479,7 @@ pub async fn refresh_favorite_count(pool: &MySqlPool, archive_id: i64) -> anyhow
 // 留言
 // ---------------------------------------------------------------------------
 
-/// 留言字段的默认项（对应 Go 的 `Website.GetGuestbookFields` 默认字段）。
+/// 留言字段的默认项（对应 `Website.GetGuestbookFields` 默认字段）。
 fn default_guestbook_fields() -> Vec<Value> {
     vec![
         json!({"name": "用户名", "field_name": "user_name", "type": "text",
@@ -533,9 +532,9 @@ fn field_required(field: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// 把字段归一成 Go 的 `config.CustomField` 形状。
+/// 把字段归一成 `CustomField` 形状。
 ///
-/// Go 的 JSON tag：`name` / `field_name` / `group` / `type` / `value` / `default` /
+/// JSON tag：`name` / `field_name` / `group` / `type` / `value` / `default` /
 /// `remark` / `required` / `is_system` / `is_filter` / `follow_level` / `content`，
 /// 其中带 `omitempty` 的为空时不出现在 JSON 里。
 fn normalize_field(field: &Value) -> Value {
@@ -625,7 +624,7 @@ fn normalize_field(field: &Value) -> Value {
     Value::Object(map)
 }
 
-/// 留言字段（对应 Go 的 `Website.GetGuestbookFields`）。
+/// 留言字段（对应 `Website.GetGuestbookFields`）。
 ///
 /// 配置里只要有一个系统字段（或 `user_name`），就直接用配置；否则「默认字段 + 配置字段」。
 pub async fn guestbook_fields(pool: &MySqlPool) -> anyhow::Result<Vec<Value>> {
@@ -651,7 +650,7 @@ pub async fn guestbook_fields(pool: &MySqlPool) -> anyhow::Result<Vec<Value>> {
     Ok(fields.iter().map(normalize_field).collect())
 }
 
-/// 保存留言（对应 Go 的 `Website` 里 `model.Guestbook` 的落库）。
+/// 保存留言（对应 `Website` 里 `Guestbook` 的落库）。
 pub async fn save_guestbook(
     pool: &MySqlPool,
     user_id: u32,
@@ -688,7 +687,7 @@ pub async fn save_guestbook(
     Ok(id)
 }
 
-/// 留言的提示语（对应 Go 的 `PluginGuestbook.ReturnMessage`，空则用默认文案）。
+/// 留言的提示语（对应 `PluginGuestbook.ReturnMessage`，空则用默认文案）。
 pub async fn guestbook_return_message(pool: &MySqlPool) -> anyhow::Result<String> {
     let config = guestbook::setting_get(pool).await?;
     Ok(config
@@ -721,7 +720,108 @@ pub async fn weapp_qrcode(
     Ok(row)
 }
 
-/// 写入 / 更新公众号用户资料（`user_wechats`），返回绑定的 `user_id`（未绑定为 0）。
+/// 按 `union_id` 找已绑定的会员（`GetUserByUnionId`）。
+///
+/// 注意 `users` 表**没有** `union_id` 列，关系全在 `user_wechats` 上：
+/// `union_id = ? AND user_id > 0` 取到的 `user_id` 就是同一个人在别的端绑定过的会员。
+async fn user_by_union_id(pool: &MySqlPool, union_id: &str) -> anyhow::Result<Option<u32>> {
+    let union_id = union_id.trim();
+    if union_id.is_empty() {
+        return Ok(None);
+    }
+    let row: Option<u32> = sqlx::query_scalar(
+        "SELECT user_id FROM user_wechats WHERE union_id = ? AND user_id > 0 ORDER BY id LIMIT 1",
+    )
+    .bind(union_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.filter(|id| *id > 0))
+}
+
+/// 微信授权时自动注册会员（`tmpUser = &model.User{...}; DB.Save(tmpUser)`）。
+///
+/// 微信用户没有密码、邮箱、手机号，用户名取昵称；重名（或 `url_token` 冲突）时
+/// 追加随机后缀重试，避免因为昵称重复导致授权直接失败。
+async fn create_wechat_member(
+    pool: &MySqlPool,
+    nickname: &str,
+    avatar_url: &str,
+) -> anyhow::Result<u32> {
+    let group_id = super::member::default_group_id(pool).await;
+    let status = super::member::default_status(pool).await;
+    let nickname = nickname.trim();
+    let base = if nickname.is_empty() {
+        "微信用户".to_string()
+    } else {
+        nickname.chars().take(30).collect::<String>()
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    let mut last_error: Option<sqlx::Error> = None;
+    for attempt in 0..5 {
+        let user_name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}{}", super::member::random_code(4))
+        };
+        if super::member::get_by_name(pool, &user_name)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        let mut url_token = super::member::sanitize_token(&user_name);
+        if url_token.is_empty() {
+            url_token = format!("wx-{}", super::member::random_code(8));
+        } else if attempt > 0 {
+            url_token = format!("{url_token}-{}", super::member::random_code(4));
+        }
+        let invite_code = super::member::random_code(8);
+
+        let result = sqlx::query(
+            "INSERT INTO users (created_time, updated_time, parent_id, user_name, url_token, \
+                real_name, first_name, last_name, birthday, avatar_url, introduce, email, \
+                email_verified, phone, group_id, google_id, password, reset_password, status, \
+                is_retailer, balance, points, total_reward, invite_code, last_login, expire_time, \
+                subscribed, order_count, api_token) \
+             VALUES (?, ?, 0, ?, ?, '', '', '', 0, ?, '', '', 0, '', ?, '', '', 0, ?, 0, \
+                0, 0, 0, ?, 0, 0, 0, 0, '')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&user_name)
+        .bind(&url_token)
+        .bind(avatar_url.trim())
+        .bind(group_id)
+        .bind(status)
+        .bind(&invite_code)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(done) => return Ok(done.last_insert_id() as u32),
+            Err(err) => {
+                // 用户名 / url_token 撞唯一键时换后缀重试，其余错误直接上抛
+                if !err.to_string().contains("Duplicate entry") {
+                    return Err(err.into());
+                }
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(match last_error {
+        Some(err) => err.into(),
+        None => anyhow::anyhow!("创建微信会员失败：用户名冲突"),
+    })
+}
+
+/// 写入 / 更新公众号用户资料（`user_wechats`），返回绑定的 `user_id`。
+///
+/// 与 `WechatAuthApi` 一致：
+/// 1. `openid` 已有记录 → 复用（保留原 `user_id`），只刷新昵称/头像；
+/// 2. 没有记录 → 先按 `union_id` 找同一个人已绑定的会员，找不到才新建会员；
+/// 3. 最后把会员挂到 `user_wechats.user_id` 上，保证下次进来还是同一个会员。
 pub async fn save_wechat_user(
     pool: &MySqlPool,
     openid: &str,
@@ -730,34 +830,56 @@ pub async fn save_wechat_user(
     avatar_url: &str,
     gender: i32,
 ) -> anyhow::Result<u32> {
+    let openid = openid.trim();
+    if openid.is_empty() {
+        anyhow::bail!("微信用户缺少 openid");
+    }
+    let union_id = union_id.trim();
     let now = chrono::Utc::now().timestamp();
-    let existing: Option<u32> =
-        sqlx::query_scalar("SELECT user_id FROM user_wechats WHERE openid = ? LIMIT 1")
+
+    let existing: Option<(u32, u32)> =
+        sqlx::query_as("SELECT id, user_id FROM user_wechats WHERE openid = ? ORDER BY id LIMIT 1")
             .bind(openid)
             .fetch_optional(pool)
             .await?;
-    if let Some(user_id) = existing {
+
+    if let Some((row_id, current_user_id)) = existing {
+        let mut user_id = current_user_id;
+        if user_id == 0 {
+            if let Some(linked) = user_by_union_id(pool, union_id).await? {
+                user_id = linked;
+            }
+        }
         sqlx::query(
-            "UPDATE user_wechats SET updated_time = ?, nickname = ?, avatar_url = ?, gender = ?, \
-             union_id = ?, platform = 'wechat', status = 1 WHERE openid = ?",
+            "UPDATE user_wechats SET updated_time = ?, user_id = ?, nickname = ?, avatar_url = ?, \
+                gender = ?, union_id = IF(? = '', union_id, ?), platform = 'wechat', status = 1 \
+             WHERE id = ?",
         )
         .bind(now)
+        .bind(user_id)
         .bind(nickname)
         .bind(avatar_url)
         .bind(gender)
         .bind(union_id)
-        .bind(openid)
+        .bind(union_id)
+        .bind(row_id)
         .execute(pool)
         .await?;
         return Ok(user_id);
     }
+
+    let mut user_id = user_by_union_id(pool, union_id).await?.unwrap_or(0);
+    if user_id == 0 {
+        user_id = create_wechat_member(pool, nickname, avatar_url).await?;
+    }
     sqlx::query(
         "INSERT INTO user_wechats (created_time, updated_time, user_id, nickname, avatar_url, \
-         gender, openid, union_id, platform, status) \
-         VALUES (?, ?, 0, ?, ?, ?, ?, ?, 'wechat', 1)",
+            gender, openid, union_id, platform, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wechat', 1)",
     )
     .bind(now)
     .bind(now)
+    .bind(user_id)
     .bind(nickname)
     .bind(avatar_url)
     .bind(gender)
@@ -765,7 +887,76 @@ pub async fn save_wechat_user(
     .bind(union_id)
     .execute(pool)
     .await?;
-    Ok(0)
+    Ok(user_id)
+}
+
+/// 小程序订阅消息状态落库（`SubscribeMsgPopup` / `SubscribeMsgChange`）。
+///
+/// 同意订阅写一行，拒绝则删掉对应行；表不存在（老库没建）时按调用方日志处理。
+pub async fn save_subscribed(
+    pool: &MySqlPool,
+    openid: &str,
+    template_id: &str,
+    accept: bool,
+) -> anyhow::Result<()> {
+    let openid = openid.trim();
+    let template_id = template_id.trim();
+    if openid.is_empty() || template_id.is_empty() {
+        return Ok(());
+    }
+    let result: anyhow::Result<()> = if !accept {
+        sqlx::query("DELETE FROM subscribed_users WHERE openid = ? AND template_id = ?")
+            .bind(openid)
+            .bind(template_id)
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    } else {
+        save_subscribed_one(pool, openid, template_id).await
+    };
+    match result {
+        Ok(()) => Ok(()),
+        // 老库可能没建这张表（结构由建站时同步），缺表时静默跳过，别让回调失败
+        Err(err) if is_missing_table(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// 同意订阅时写一行（已存在则不动）。
+async fn save_subscribed_one(
+    pool: &MySqlPool,
+    openid: &str,
+    template_id: &str,
+) -> anyhow::Result<()> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM subscribed_users WHERE openid = ? AND template_id = ? LIMIT 1",
+    )
+    .bind(openid)
+    .bind(template_id)
+    .fetch_optional(pool)
+    .await?;
+    if exists.is_some() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO subscribed_users (created_time, updated_time, user_id, openid, template_id) \
+         VALUES (?, ?, 0, ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(openid)
+    .bind(template_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 数据库/表不存在（MySQL 1146）。
+fn is_missing_table(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("doesn't exist") || text.contains("does not exist")
 }
 
 /// 保存小程序二维码（`weapp_qrcodes`）：同一用户 + path 只保留一条。
@@ -802,7 +993,7 @@ pub async fn save_weapp_qrcode(
     Ok(())
 }
 
-/// 公众号消息落库（对应 Go 的 `model.WechatMessage`）。
+/// 公众号消息落库（对应 `WechatMessage`）。
 pub async fn save_wechat_message(
     pool: &MySqlPool,
     openid: &str,
@@ -826,7 +1017,7 @@ pub async fn save_wechat_message(
     Ok(())
 }
 
-/// 按关键词取自动回复（对应 Go 的 `GetWechatReplyRuleByKeyword`）。
+/// 按关键词取自动回复（对应 `GetWechatReplyRuleByKeyword`）。
 pub async fn wechat_reply_by_keyword(
     pool: &MySqlPool,
     keyword: &str,
@@ -915,7 +1106,7 @@ pub async fn safe_captcha_on(pool: &MySqlPool) -> anyhow::Result<bool> {
 // 访问日志
 // ---------------------------------------------------------------------------
 
-/// 蜘蛛识别（对应 Go 的 `library.GetSpider`）。
+/// 蜘蛛识别（对应 `GetSpider`）。
 pub fn spider_of(user_agent: &str) -> &'static str {
     let ua = user_agent.to_ascii_lowercase();
     const NAMES: &[(&str, &str)] = &[
@@ -939,7 +1130,7 @@ pub fn spider_of(user_agent: &str) -> &'static str {
     ""
 }
 
-/// 设备识别（对应 Go 的 `library.GetDevice`）。
+/// 设备识别（对应 `GetDevice`）。
 pub fn device_of(user_agent: &str) -> &'static str {
     let ua = user_agent.to_ascii_lowercase();
     const NAMES: &[(&str, &str)] = &[
@@ -965,7 +1156,7 @@ pub fn device_of(user_agent: &str) -> &'static str {
 
 /// 追加一条访问日志（`data/statistic/<日期>.log`，每行一个 JSON）。
 ///
-/// 字段与 Go 的 `provider.Statistic` 一致，后台「访问明细」页直接读这个文件。
+/// 字段与 `Statistic` 一致，后台「访问明细」页直接读这个文件。
 pub fn append_statistic_log(dir: &Path, record: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let date = chrono::Local::now().format("%Y%m%d").to_string();
@@ -980,7 +1171,7 @@ pub fn append_statistic_log(dir: &Path, record: &Value) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 内容浏览量 +1（对应 Go 的 `archive.AddViews`）。
+/// 内容浏览量 +1（对应 `archive.AddViews`）。
 pub async fn add_archive_views(pool: &MySqlPool, archive_id: i64) -> anyhow::Result<()> {
     let _ = sqlx::query("UPDATE archives SET views = views + 1 WHERE id = ?")
         .bind(archive_id)
@@ -1175,7 +1366,7 @@ mod tests {
             .unwrap();
         assert_eq!(praised.vote_count, 1);
 
-        // 载荷字段与 Go 一致
+        // 载荷字段与既有行为一致
         let payload = comment_payload(&praised, "标题", None);
         assert_eq!(payload["id"], json!(comment.id));
         assert!(payload.get("item_title").is_some());
@@ -1223,7 +1414,7 @@ mod tests {
         assert!(fields
             .iter()
             .any(|item| item.get("field_name").and_then(Value::as_str) == Some("user_name")));
-        // 字段形状与 Go 的 CustomField 对齐
+        // 字段形状与 CustomField 对齐
         assert!(fields[0].get("name").is_some());
         assert!(fields[0].get("group").is_some());
         assert!(fields[0].get("value").is_some());

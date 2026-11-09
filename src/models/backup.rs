@@ -1,11 +1,11 @@
-//! 网站备份（`pluginBackup.go`、Go `provider/backup.go`）。
+//! 网站备份。
 //!
 //! 备份文件落 `<data>/backup/`：
 //! - dump 产出 `.sql`；`.zip` 备份包（`database.sql` + `template/` + `static/`）
-//!   可以导入与恢复；
+//! 可以导入与恢复；
 //! - 备注存 sidecar 文件 `<备份文件名>.remark.json`（`{"remark": "..."}`）；
-//! - 备份/恢复任务的进度是进程内存态（Go 的全局 `backupStatus`），任务结束
-//!   3 秒后自动从状态查询中消失。
+//! - 备份/恢复任务的进度是进程内存态（既有实现的全局 `backupStatus`），任务结束
+//! 3 秒后自动从状态查询中消失。
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -16,11 +16,11 @@ use std::sync::Mutex;
 
 use super::ModelError;
 
-/// 备份/恢复任务的执行状态（Go `BackupStatus`）。
+/// 备份/恢复任务的执行状态。
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupStatus {
     pub finished: bool,
-    /// `backup` | `restore`（Go `BackupTypeBackup` / `BackupTypeRestore`）。
+    /// `backup` | `restore`。
     #[serde(rename = "type")]
     pub kind: String,
     pub percent: i32,
@@ -38,7 +38,7 @@ impl BackupStatus {
     }
 }
 
-/// 全局任务状态（进程内存态，对应 Go 的包级 `backupStatus`）。
+/// 全局任务状态（进程内存态，对应既有实现的包级 `backupStatus`）。
 static BACKUP_STATUS: Mutex<Option<BackupEntry>> = Mutex::new(None);
 
 struct BackupEntry {
@@ -46,7 +46,7 @@ struct BackupEntry {
     finished_at: Option<std::time::Instant>,
 }
 
-/// 读当前任务状态；任务结束后 3 秒内仍可见，之后视为无任务（对齐 Go 的 AfterFunc 清理）。
+/// 读当前任务状态；任务结束后 3 秒内仍可见，之后视为无任务（遵循既有约定 AfterFunc 清理）。
 pub fn get_status() -> Option<BackupStatus> {
     let mut guard = BACKUP_STATUS.lock().unwrap_or_else(|err| err.into_inner());
     match guard.as_ref() {
@@ -67,7 +67,7 @@ pub fn get_status() -> Option<BackupStatus> {
     }
 }
 
-/// 占用一个新任务槽；已有未完成任务时报错（Go `NewBackup`）。
+/// 占用一个新任务槽；已有未完成任务时报错。
 pub fn new_task(kind: &str) -> Result<(), ModelError> {
     let mut guard = BACKUP_STATUS.lock().unwrap_or_else(|err| err.into_inner());
     if guard
@@ -108,7 +108,7 @@ pub fn finish_status(kind: &str, message: impl Into<String>) {
     }
 }
 
-/// 备份文件信息（Go `response.BackupInfo`）。
+/// 备份文件信息。
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
     pub name: String,
@@ -117,7 +117,7 @@ pub struct BackupInfo {
     pub remark: String,
 }
 
-/// 列出 `<data>/backup/` 下的 `.sql`/`.zip` 备份（按修改时间倒序，Go `GetBackupList`）。
+/// 列出 `<data>/backup/` 下的 `.sql`/`.zip` 备份（按修改时间倒序，既有约定）。
 pub fn list(backup_dir: &Path) -> Vec<BackupInfo> {
     let Ok(files) = std::fs::read_dir(backup_dir) else {
         return Vec::new();
@@ -148,7 +148,7 @@ pub fn list(backup_dir: &Path) -> Vec<BackupInfo> {
     result
 }
 
-/// 校验备份文件名并返回绝对路径（Go `sanitizeBackupPath`：防路径穿越）。
+/// 校验备份文件名并返回绝对路径（既有约定：防路径穿越）。
 pub fn sanitize_path(backup_dir: &Path, name: &str) -> Result<PathBuf, ModelError> {
     if name.is_empty() {
         return Err(ModelError::invalid("备份文件不存在"));
@@ -181,7 +181,7 @@ pub fn get_remark(backup_dir: &Path, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 写备份备注（sidecar JSON，Go `SetBackupRemark`）。
+/// 写备份备注（sidecar JSON，既有约定）。
 pub fn set_remark(backup_dir: &Path, name: &str, remark: &str) -> Result<(), ModelError> {
     let path = sanitize_path(backup_dir, name)?;
     if !path.is_file() {
@@ -192,7 +192,7 @@ pub fn set_remark(backup_dir: &Path, name: &str, remark: &str) -> Result<(), Mod
         .map_err(|err| ModelError::invalid(format!("保存失败: {err}")))
 }
 
-/// 删除备份文件及备注 sidecar（Go `DeleteBackupData`）。
+/// 删除备份文件及备注 sidecar。
 pub fn delete(backup_dir: &Path, name: &str) -> Result<(), ModelError> {
     let path = sanitize_path(backup_dir, name)?;
     if !path.is_file() {
@@ -203,9 +203,9 @@ pub fn delete(backup_dir: &Path, name: &str) -> Result<(), ModelError> {
     Ok(())
 }
 
-/// 导入备份文件（写 `<data>/backup/<name>`，Go `ImportBackupFile`）。
+/// 导入备份文件（写 `<data>/backup/<name>`，既有约定）。
 pub fn import(backup_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), ModelError> {
-    // 与 Go 一致：导入文件必须是 .sql / .zip
+    // 与既有接口契约一致：导入文件必须是 .sql / .zip
     if !name.ends_with(".sql") && !name.ends_with(".zip") {
         return Err(ModelError::invalid("导入的备份文件格式不正确"));
     }
@@ -216,7 +216,7 @@ pub fn import(backup_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), ModelEr
         .map_err(|err| ModelError::invalid(format!("保存失败: {err}")))
 }
 
-/// 把 SQL 值转义（Go `library.EscapeString`：\0 \n \r \Z ' " \）。
+/// 把 SQL 值转义（既有约定：\0 \n \r \Z ' " \）。
 fn escape_sql(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -275,13 +275,13 @@ fn row_values(row: &MySqlRow, casts: &[bool], quoted: &[bool]) -> Result<Vec<Str
     Ok(values)
 }
 
-/// 备份整站到 `<backup_dir>/<时间戳>.zip`（Go `BackupData`）。
+/// 备份整站到 `<backup_dir>/<时间戳>.zip`。
 ///
 /// 包内含 `database.sql`、`template/`、`static/`；跳过表名含 `_logs` 的表。
 /// 进度按表数推进（0→99）。返回备份文件名。
 ///
-/// zip 条目使用 stored（ext 只实现了解压，没有 deflate 压缩），功能等价，
-/// 但体积会大于 Go 的 Deflate 包。
+/// zip 条目由 `rustcms_ext::packer::ZipWriter` 写入：可压缩内容用 deflate
+/// （与既有接口契约一致），不可压缩内容与目录条目回退 stored。
 pub async fn dump(
     pool: &MySqlPool,
     backup_dir: &Path,
@@ -427,7 +427,7 @@ fn add_dir_to_zip(
     Ok(())
 }
 
-/// 把 SQL 文本切成单条语句（Go 恢复逻辑的纯函数版）：
+/// 把 SQL 文本切成单条语句（既有实现恢复逻辑的纯函数版）：
 /// 逐行累积直到 `;\n` 或 EOF；含 `_logs\`` 的语句跳过。
 /// 返回 `(待执行语句, 跳过条数)`。
 pub fn split_sql_statements(content: &str) -> (Vec<String>, usize) {
@@ -458,7 +458,7 @@ pub fn split_sql_statements(content: &str) -> (Vec<String>, usize) {
     (statements, skipped)
 }
 
-/// 从备份恢复（Go `RestoreData`）。
+/// 从备份恢复。
 ///
 /// `.sql` 逐语句执行；`.zip` 先还原包内 `template/` 与 `static/`，
 /// 再执行 `database.sql`（含 `_logs` 的语句跳过），进度按语句数推进。
@@ -589,7 +589,7 @@ async fn restore_from_zip(
     Ok(())
 }
 
-/// 清空整站数据（Go `CleanupWebsiteData`）。
+/// 清空整站数据。
 ///
 /// TRUNCATE 除 `admins` / `admin_groups` / `admin_login_logs` / `admin_logs` /
 /// `settings` / `websites` 外的所有表；`clean_uploads` 时同时删除

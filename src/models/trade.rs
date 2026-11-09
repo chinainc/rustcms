@@ -1,23 +1,23 @@
 //! 交易数据访问（批次 C）：购物车 / 订单 / 店铺 / 支付 / 分销 / 积分。
 //!
-//! 对应 Go 版：
-//! - `provider/commerce_cart.go`（购物车）
-//! - `provider/commerce_shop.go`（店铺 / 保证金 / 已售订单 / 收到的评价）
-//! - `provider/commerce_point.go`（积分）
-//! - `provider/order.go`（下单 / 订单列表 / 取消 / 退款申请 / 完成 / 支付单）
-//! - `provider/commission.go`、`provider/withdraw.go`（分销佣金 / 提现）
-//! - `provider/member_center.go`（余额提现 / 充值申请）
+//! 覆盖范围：
+//! - 购物车（加购 / 改数量 / 勾选 / 结算前校验）
+//! - 店铺 / 保证金 / 已售订单 / 收到的评价
+//! - 积分
+//! - 订单（下单 / 订单列表 / 取消 / 退款申请 / 完成 / 支付单）
+//! - 分销佣金 / 提现
+//! - 余额提现 / 充值申请
 //!
-//! 口径（与 Go 版一致）：
+//! 口径（对外契约）：
 //! - 金额一律 `i64`（分），禁止浮点。
 //! - 订单 `status`：-1 已取消 / 0 待支付 / 1 已支付 / 2 配送中 / 3 已完成 / 8 退款中 / 9 已退款。
 //! - 佣金 `status`：0 未提现 / 1 已提现 / -1 已失效。
 //! - 资金流水 `direction`：1 收入 / 2 支出；`action`：1 销售 2 购买 3 退款 4 充值
-//!   5 提现 6 分销 7 返现 8 佣金 9 保证金。
+//! 5 提现 6 分销 7 返现 8 佣金 9 保证金。
 //! - 动钱路径（下单 / 支付 / 保证金 / 提现 / 完成结算）一律走事务 + `FOR UPDATE` 行锁。
 //!
-//! ⚠️ 与 Go 版保持一致的「已知缺陷」（不擅自修正，见完工报告）：
-//! - 下单不扣库存（Go 版只在取消 / 退款成功时把库存加回去）。
+//! ⚠️ 沿用既有约定的「已知缺陷」（不擅自修正，见完工报告）：
+//! - 下单不扣库存（既有实现只在取消 / 退款成功时把库存加回去）。
 //! - `archives` 没有 `status` 列，内容是否上架由栏目 / 草稿表判断。
 
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ use super::{front_content, order as order_config, retailer as retailer_config};
 use super::ModelError;
 
 // ---------------------------------------------------------------------------
-// 常量（对齐 Go `config/constant.go`）
+// 常量
 // ---------------------------------------------------------------------------
 
 /// 订单状态：已取消。
@@ -159,12 +159,12 @@ pub struct Cart {
     pub quantity: i32,
 }
 
-/// 购物车列表条目（Go 的 `model.Cart` + 计算字段）。
+/// 购物车列表条目（`Cart` + 计算字段）。
 #[derive(Debug, Clone, Serialize)]
 pub struct CartItem {
     #[serde(flatten)]
     pub cart: Cart,
-    /// 商品快照（Go 内嵌 `*model.Archive`）。
+    /// 商品快照（内嵌 `*model.Archive`）。
     pub archive: Option<Value>,
     /// 小计（分）。
     pub amount: i64,
@@ -211,7 +211,7 @@ pub struct TradeOrder {
     pub tracking_number: String,
 }
 
-/// 订单输出结构（Go 的 `model.Order` + `details` / `order_address` / `user`）。
+/// 订单输出结构（`Order` + `details` / `order_address` / `user`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderView {
     #[serde(flatten)]
@@ -245,7 +245,7 @@ pub struct OrderDetail {
     pub status: i8,
 }
 
-/// 订单明细输出（Go 的 `model.OrderDetail` + `goods` / `group`）。
+/// 订单明细输出（`OrderDetail` + `goods` / `group`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderDetailView {
     #[serde(flatten)]
@@ -277,7 +277,7 @@ pub struct OrderAddress {
     pub status: i8,
 }
 
-/// 收货地址入参（Go 的 `request.OrderAddressRequest`）。
+/// 收货地址入参（`OrderAddressRequest`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OrderAddressInput {
     #[serde(default)]
@@ -378,7 +378,7 @@ pub struct Shop {
     pub banner_url: String,
 }
 
-/// 店铺装修配置（Go 的 `provider.ShopDecoration`）。
+/// 店铺装修配置（`ShopDecoration`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShopDecoration {
     /// 布局：wide / compact。
@@ -552,7 +552,7 @@ pub struct UserBrief {
     pub is_retailer: i8,
 }
 
-/// 会员（交易相关字段，Go 的 `model.User` 子集）。
+/// 会员（交易相关字段，`User` 子集）。
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct TradeUser {
     pub id: u32,
@@ -595,7 +595,7 @@ pub struct ReceivedComment {
     pub item_title: String,
 }
 
-/// 下单明细入参（Go 的 `request.OrderDetail`）。
+/// 下单明细入参（`OrderDetail`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OrderDetailInput {
     #[serde(default)]
@@ -622,7 +622,7 @@ pub struct OrderDetailInput {
     pub status: i8,
 }
 
-/// 下单入参（Go 的 `request.OrderRequest` 里用得到的字段）。
+/// 下单入参（`OrderRequest` 里用得到的字段）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CreateOrderInput {
     #[serde(default)]
@@ -678,7 +678,7 @@ pub struct CreateOrderInput {
     pub quantity: i32,
 }
 
-/// 支付入参（Go 的 `request.PaymentRequest`）。
+/// 支付入参（`PaymentRequest`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PaymentInput {
     #[serde(default)]
@@ -689,7 +689,7 @@ pub struct PaymentInput {
     pub pay_way: String,
 }
 
-/// 店铺资料入参（Go 的 `request.ShopRequest`）。
+/// 店铺资料入参（`ShopRequest`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopInput {
     #[serde(default)]
@@ -737,7 +737,7 @@ pub struct RechargeInput {
     pub remark: String,
 }
 
-/// 保证金操作入参（Go 的 `request.DepositRequest`）。
+/// 保证金操作入参（`DepositRequest`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DepositInput {
     /// 单位：分。
@@ -780,7 +780,7 @@ pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// 生成业务单号（Go 的 `AfterCreate`：`20060102150405` + 自增 ID 后 4 位）。
+/// 生成业务单号（`AfterCreate`：`20060102150405` + 自增 ID 后 4 位）。
 pub fn make_biz_no(ts: i64, id: u32) -> String {
     let stamp = chrono::DateTime::from_timestamp(ts, 0)
         .map(|time| time.format("%Y%m%d%H%M%S").to_string())
@@ -874,7 +874,7 @@ pub async fn storage_url(pool: &MySqlPool) -> String {
         .unwrap_or_default()
 }
 
-/// 订单状态串转数值（Go `GetOrderList` 的 status 映射）。
+/// 订单状态串转数值（`GetOrderList` 的 status 映射）。
 pub fn status_value(status: &str) -> Option<i8> {
     match status.trim() {
         "waiting" => Some(ORDER_STATUS_WAITING),
@@ -918,12 +918,12 @@ pub async fn insert_finance(
 }
 
 // ---------------------------------------------------------------------------
-// 购物车（Go `provider/commerce_cart.go`）
+// 购物车
 // ---------------------------------------------------------------------------
 
 /// 购物车列表，同时算出每条小计与合计（单位：分）。
 ///
-/// 与 Go 一致：商品已被删除的购物车记录会被顺手清掉。
+/// 与既有行为一致：商品已被删除的购物车记录会被顺手清掉。
 pub async fn cart_list(pool: &MySqlPool, user_id: u32) -> anyhow::Result<(Vec<CartItem>, i64)> {
     if user_id == 0 {
         return Ok((Vec::new(), 0));
@@ -1182,7 +1182,7 @@ pub async fn checkout_cart(
 }
 
 // ---------------------------------------------------------------------------
-// 订单（Go `provider/order.go`）
+// 订单
 // ---------------------------------------------------------------------------
 
 /// 读 `settings.order` 里的开关（数字 / 布尔都认）。
@@ -1204,7 +1204,7 @@ fn order_number(config: &Value, key: &str) -> i64 {
     }
 }
 
-/// 用户组折扣（Go `GetUserDiscount` 的第一个返回值）。
+/// 用户组折扣（`GetUserDiscount` 的第一个返回值）。
 async fn user_discount(pool: &MySqlPool, user: Option<&TradeUser>) -> i64 {
     let Some(user) = user else {
         return 0;
@@ -1221,7 +1221,7 @@ async fn user_discount(pool: &MySqlPool, user: Option<&TradeUser>) -> i64 {
     discount
 }
 
-/// 在事务里保存收货地址（Go `SaveOrderAddress`）。
+/// 在事务里保存收货地址（`SaveOrderAddress`）。
 async fn save_order_address_tx(
     tx: &mut MySqlConnection,
     user_id: u32,
@@ -1398,10 +1398,10 @@ pub async fn order_address_by_id(
     .await?)
 }
 
-/// 下单（Go `provider.CreateOrder`）。
+/// 下单（`CreateOrder`）。
 ///
-/// 事务边界与 Go 一致：地址、明细、订单在同一个事务里写；
-/// 库存**不**扣（Go 版也没有在下单时扣库存）。
+/// 事务边界与既有行为一致：地址、明细、订单在同一个事务里写；
+/// 库存**不**扣（既有实现也没有在下单时扣库存）。
 pub async fn create_order(
     pool: &MySqlPool,
     user_id: u32,
@@ -1436,7 +1436,7 @@ pub async fn create_order(
 
     let mut tx = pool.begin().await?;
 
-    // 收货地址：Go 版只在「不需要自动处理」时才把地址写库。
+    // 收货地址：既有实现只在「不需要自动处理」时才把地址写库。
     let mut address_id = input.address_id;
     if !no_process {
         if let Some(address) = input.address.as_ref() {
@@ -1487,7 +1487,7 @@ pub async fn create_order(
         }
     }
 
-    // 订单主记录（单号在拿到自增 ID 后回填，与 Go 的 AfterCreate 一致）。
+    // 订单主记录（单号在拿到自增 ID 后回填，与 AfterCreate 一致）。
     let ts = now();
     let temp_no = format!("tmp{ts}{}", rand::random::<u32>() % 10000);
     let result = sqlx::query(
@@ -1553,7 +1553,7 @@ pub async fn create_order(
         .await?;
     }
 
-    // 分销奖励（Go `CreateOrder` 的 share 计算）。
+    // 分销奖励（`CreateOrder` 的 share 计算）。
     let retailer = retailer_config::config_get(pool).await.unwrap_or_else(|_| json!({}));
     let become_retailer = order_flag(&retailer, "become_retailer");
     let allow_self = order_flag(&retailer, "allow_self");
@@ -1657,7 +1657,7 @@ pub async fn order_details(
     .await?)
 }
 
-/// 订单列表（Go `GetOrderList`）。
+/// 订单列表（`GetOrderList`）。
 pub async fn order_list(
     pool: &MySqlPool,
     user_id: u32,
@@ -1717,7 +1717,7 @@ pub async fn order_list(
     Ok((total, views))
 }
 
-/// 订单详情（Go `GetOrderInfoByOrderId`）。
+/// 订单详情（`GetOrderInfoByOrderId`）。
 pub async fn order_detail(
     pool: &MySqlPool,
     order_id: &str,
@@ -1729,7 +1729,7 @@ pub async fn order_detail(
     Ok(views.into_iter().next())
 }
 
-/// 给订单补上明细 / 地址 / 用户（Go 的 `GetOrderList` 尾段）。
+/// 给订单补上明细 / 地址 / 用户（`GetOrderList` 尾段）。
 async fn attach_order_views(
     pool: &MySqlPool,
     orders: Vec<TradeOrder>,
@@ -1824,7 +1824,7 @@ async fn attach_order_views(
     Ok(views)
 }
 
-/// 取消订单（Go `SetOrderCanceled`）：退库存 + 支付单置为已取消。
+/// 取消订单（`SetOrderCanceled`）：退库存 + 支付单置为已取消。
 pub async fn cancel_order(
     pool: &MySqlPool,
     user_id: u32,
@@ -1893,7 +1893,7 @@ async fn lock_order_tx(
     .await?)
 }
 
-/// 申请退款（Go `ApplyOrderRefund`）。
+/// 申请退款（`ApplyOrderRefund`）。
 pub async fn apply_order_refund(
     pool: &MySqlPool,
     user_id: u32,
@@ -1908,7 +1908,7 @@ pub async fn apply_order_refund(
         
         return Err(ModelError::invalid("该订单不可操作"));
     }
-    // 已经申请过就直接返回（Go 版是「有记录就当成功」）。
+    // 已经申请过就直接返回（既有实现是「有记录就当成功」）。
     let existing: Option<i64> =
         sqlx::query_scalar("SELECT id FROM order_refunds WHERE order_id = ? LIMIT 1")
             .bind(&order.order_id)
@@ -2015,7 +2015,7 @@ async fn grant_commission(
     Ok(())
 }
 
-/// 完成订单（Go `SetOrderFinished`）：结算卖家 / 分销佣金。
+/// 完成订单（`SetOrderFinished`）：结算卖家 / 分销佣金。
 pub async fn finish_order(
     pool: &MySqlPool,
     user_id: u32,
@@ -2073,7 +2073,7 @@ pub async fn finish_order(
         .await?;
     }
 
-    // 会员组订单：顺延会员有效期（Go `SetOrderFinished` 的 VIP 分支）。
+    // 会员组订单：顺延会员有效期（`SetOrderFinished` 的 VIP 分支）。
     if order.kind == ORDER_TYPE_VIP {
         let details = sqlx::query_as::<_, OrderDetail>(
             "SELECT id, created_time, updated_time, order_id, user_id, goods_id, goods_sku_id, \
@@ -2097,7 +2097,7 @@ pub async fn finish_order(
             start = ts;
         }
         let end = if expire_day == 365 {
-            // Go 用 AddDate(years) 加整年，这里按 365 天/年折算（差异只在闰年）。
+            // 既有实现用 AddDate(years) 加整年，这里按 365 天/年折算（差异只在闰年）。
             start + quantity * 365 * 86400
         } else if expire_day == 30 {
             start + quantity * 30 * 86400
@@ -2132,7 +2132,7 @@ async fn group_setting_tx(
 }
 
 // ---------------------------------------------------------------------------
-// 支付（Go `provider/pay.go` + `controller/apiOrder.go`）
+// 支付
 // ---------------------------------------------------------------------------
 
 /// 按订单号取支付单。
@@ -2165,6 +2165,24 @@ pub async fn payment_by_id(
     .await?)
 }
 
+/// 按网关交易号取支付单（`GetPaymentInfoByTerraceId`）。
+///
+/// 支付宝 / 微信回调里带的是支付单号，PayPal 返回页带的是 PayPal 订单号
+/// （= `payments.terrace_id`），所以两种都要能查。
+pub async fn payment_by_terrace_id(
+    pool: &MySqlPool,
+    terrace_id: &str,
+) -> anyhow::Result<Option<Payment>> {
+    Ok(sqlx::query_as::<_, Payment>(
+        "SELECT id, created_time, updated_time, payment_id, terrace_id, user_id, order_id, \
+         amount, status, payment_account_id, pay_way, paid_time, remark, buyer_id, buyer_info \
+         FROM payments WHERE terrace_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(terrace_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// 可用支付方式（`payment_accounts` 里启用状态的 pay_way 去重）。
 pub async fn payment_ways(pool: &MySqlPool) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar::<_, String>(
@@ -2174,7 +2192,7 @@ pub async fn payment_ways(pool: &MySqlPool) -> anyhow::Result<Vec<String>> {
     .await?)
 }
 
-/// 生成支付单（Go `GeneratePayment`）：已存在则复用。
+/// 生成支付单（`GeneratePayment`）：已存在则复用。
 pub async fn generate_payment(
     pool: &MySqlPool,
     order: &TradeOrder,
@@ -2216,7 +2234,7 @@ pub async fn generate_payment(
     Ok(payment)
 }
 
-/// 余额支付（Go `createBalancePayment`）：余额 → 订单，同事务内扣款 + 记流水。
+/// 余额支付（`createBalancePayment`）：余额 → 订单，同事务内扣款 + 记流水。
 pub async fn balance_pay(
     pool: &MySqlPool,
     order: &TradeOrder,
@@ -2278,7 +2296,7 @@ pub async fn balance_pay(
     Ok(())
 }
 
-/// 支付成功后的收尾（Go `SuccessPaidOrder`）。
+/// 支付成功后的收尾（`SuccessPaidOrder`）。
 pub async fn success_paid_order(
     pool: &MySqlPool,
     order: &TradeOrder,
@@ -2307,7 +2325,7 @@ pub async fn success_paid_order(
 }
 
 // ---------------------------------------------------------------------------
-// 店铺 / 保证金（Go `provider/commerce_shop.go`）
+// 店铺 / 保证金
 // ---------------------------------------------------------------------------
 
 /// 读店铺（不存在返回 `None`）。
@@ -2334,7 +2352,7 @@ async fn shop_with_urls(pool: &MySqlPool, user_id: u32) -> anyhow::Result<Option
     Ok(Some(shop))
 }
 
-/// 取店铺，没有则创建默认店铺（Go `EnsureShop`）。
+/// 取店铺，没有则创建默认店铺（`EnsureShop`）。
 pub async fn ensure_shop(pool: &MySqlPool, user_id: u32) -> Result<Shop, ModelError> {
     if user_id == 0 {
         return Err(ModelError::invalid("请先登录"));
@@ -2372,7 +2390,7 @@ pub async fn ensure_shop(pool: &MySqlPool, user_id: u32) -> Result<Shop, ModelEr
     Ok(shop)
 }
 
-/// 保存店铺资料（Go `SaveShop`）。
+/// 保存店铺资料（`SaveShop`）。
 pub async fn save_shop(
     pool: &MySqlPool,
     user_id: u32,
@@ -2416,7 +2434,7 @@ pub async fn save_shop(
     Ok(shop)
 }
 
-/// 解析店铺装修配置（Go `GetShopDecoration`）。
+/// 解析店铺装修配置（`GetShopDecoration`）。
 pub fn shop_decoration(shop: &Shop) -> ShopDecoration {
     let mut decoration = ShopDecoration::default();
     if let Some(raw) = shop.decoration.as_deref() {
@@ -2433,7 +2451,7 @@ pub fn shop_decoration(shop: &Shop) -> ShopDecoration {
     decoration
 }
 
-/// 缴纳保证金：余额 → 保证金（Go `PayDeposit`）。
+/// 缴纳保证金：余额 → 保证金（`PayDeposit`）。
 pub async fn pay_deposit(
     pool: &MySqlPool,
     user_id: u32,
@@ -2508,7 +2526,7 @@ pub async fn pay_deposit(
         .ok_or_else(|| ModelError::invalid("店铺不存在"))
 }
 
-/// 退还保证金：保证金 → 余额（Go `RefundDeposit`）。
+/// 退还保证金：保证金 → 余额（`RefundDeposit`）。
 pub async fn refund_deposit(
     pool: &MySqlPool,
     user_id: u32,
@@ -2687,7 +2705,7 @@ pub async fn seller_stats(pool: &MySqlPool, seller_id: u32) -> anyhow::Result<Se
             .fetch_one(pool)
             .await?;
     stats.pending = pending;
-    // 今日成交：Go 版这里恒为 0（未赋值），Rust 版按当日已支付订单的卖家分成求和。
+    // 今日成交：既有实现这里恒为 0（未赋值），Rust 版按当日已支付订单的卖家分成求和。
     let today_start = chrono::Local::now()
         .date_naive()
         .and_hms_opt(0, 0, 0)
@@ -2779,10 +2797,10 @@ pub async fn point_logs(
 }
 
 // ---------------------------------------------------------------------------
-// 分销（Go `provider/commission.go` + `controller/apiAgency.go`）
+// 分销
 // ---------------------------------------------------------------------------
 
-/// 分销员资料（Go `ApiGetRetailerInfo` 返回的会员对象）。
+/// 分销员资料（`ApiGetRetailerInfo` 返回的会员对象）。
 pub async fn retailer_info(
     pool: &MySqlPool,
     retailer_id: u32,
@@ -2790,7 +2808,7 @@ pub async fn retailer_info(
     user_row(pool, retailer_id).await
 }
 
-/// 分销统计（Go `ApiGetRetailerStatistics`）。
+/// 分销统计（`ApiGetRetailerStatistics`）。
 pub async fn retailer_statistics(
     pool: &MySqlPool,
     user_id: u32,
@@ -2817,7 +2835,7 @@ pub async fn retailer_statistics(
     .fetch_one(pool)
     .await?;
     stats.paid_withdraw_amount = paid;
-    // 未结算：Go 版统计的是这些订单的订单总额（不是佣金额），这里保持一致。
+    // 未结算：既有实现统计的是这些订单的订单总额（不是佣金额），这里保持一致。
     let unfinished: i64 = sqlx::query_scalar(
         "SELECT CAST(COALESCE(SUM(amount), 0) AS SIGNED) FROM orders \
          WHERE (share_user_id = ? OR share_parent_user_id = ?) AND status IN (?, ?)",
@@ -2967,7 +2985,7 @@ pub async fn retailer_members(
     Ok((total, rows))
 }
 
-/// 申请提现佣金（Go `RetailerApplyWithdraw`）：把未提现佣金打包成一笔提现。
+/// 申请提现佣金（`RetailerApplyWithdraw`）：把未提现佣金打包成一笔提现。
 pub async fn retailer_apply_withdraw(
     pool: &MySqlPool,
     user_id: u32,
@@ -3033,7 +3051,7 @@ pub async fn retailer_apply_withdraw(
     .map_err(ModelError::from)
 }
 
-/// 更新分销员真实姓名（Go `UpdateUserRealName`）。
+/// 更新分销员真实姓名（`UpdateUserRealName`）。
 pub async fn update_real_name(
     pool: &MySqlPool,
     user_id: u32,
@@ -3049,7 +3067,7 @@ pub async fn update_real_name(
 }
 
 // ---------------------------------------------------------------------------
-// 余额提现 / 充值（Go `provider/member_center.go`）
+// 余额提现 / 充值
 // ---------------------------------------------------------------------------
 
 /// 提现备注：`方式|姓名|账号|用户备注`（后台能直接看到收款信息）。
@@ -3068,7 +3086,7 @@ pub fn build_withdraw_remark(way: i8, real_name: &str, account: &str, remark: &s
     text
 }
 
-/// 余额提现申请（Go `ApplyBalanceWithdraw`）：余额 → 提现申请。
+/// 余额提现申请（`ApplyBalanceWithdraw`）：余额 → 提现申请。
 pub async fn apply_balance_withdraw(
     pool: &MySqlPool,
     user_id: u32,
@@ -3158,7 +3176,7 @@ pub async fn apply_balance_withdraw(
     .map_err(ModelError::from)
 }
 
-/// 充值申请（Go `ApplyRecharge`）：只落单，实际到账由后台确认。
+/// 充值申请（`ApplyRecharge`）：只落单，实际到账由后台确认。
 pub async fn apply_recharge(
     pool: &MySqlPool,
     user_id: u32,

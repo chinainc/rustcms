@@ -1,6 +1,6 @@
 //! 导航与导航分组（表 `navs` / `nav_types`）。
 //!
-//! 对齐 Go 版 `provider` 的 `GetNavList` / `SaveNav` / `SaveNavType`。
+//! 导航与导航分组的增删改查都集中在这里。
 
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::MySqlPool;
@@ -37,7 +37,7 @@ pub struct NavType {
     pub title: String,
 }
 
-/// 带下级的导航节点（下级放在 `nav_list`，与 Go 的 json tag 一致）。
+/// 带下级的导航节点（下级放在 `nav_list`，与既有实现的 json tag 一致）。
 #[derive(Debug, Clone, Serialize)]
 pub struct NavNode {
     #[serde(flatten)]

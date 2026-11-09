@@ -1,11 +1,11 @@
-//! 全站内容替换（`pluginReplace.go`）。
+//! 全站内容替换。
 //!
-//! Go 版按「位置（places）」逐表批量替换，支持两组语义：
+//! 按「位置（places）」逐表批量替换，支持两组语义：
 //! - `replace_tag = true`：连 HTML 标签内的属性一起替换（纯文本替换）；
 //! - `replace_tag = false`：只替换**可见文本**，跳过 `<...>` 里的内容。
 //!
 //! 这里对正文字段用 Rust 侧的扫描器实现（尊重 `replace_tag`），
-//! 其余简单字段直接走 SQL `REPLACE()`。
+//! 其余简单字段直接走 SQL `REPLACE`。
 
 use sqlx::mysql::MySqlPool;
 

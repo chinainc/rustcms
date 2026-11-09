@@ -1,26 +1,24 @@
 //! 会员与账户 API（批次 B）。
 //!
-//! 对应 Go 版 `controller/account.go`、`member.go`、`member_auth.go`、
-//! `member_center.go`、`member_openapi.go`、`user.go`、`apiUser.go`、
-//! `apiCommerce.go`（会员侧那部分）、`api.go`（订阅）。
+//! 覆盖账户、会员中心、会员认证、开放接口与订阅这一组接口的既有契约。
 //!
 //! ## 路由约定
 //!
 //! 路由使用**绝对路径**（不带 `/api` 前缀），由主线在 `routes.rs` 里
 //! `merge` 进来；本文件不改动 `routes.rs`。
 //!
-//! Go 版这些接口挂在 `/api` 派对下（`/api/login`、`/api/user/...`），
-//! 本批按主线要求去掉 `/api` 前缀，取的是 Go 的**派对内原始路径**。
+//! 既有接口把这些端点挂在 `/api` 分组下（`/api/login`、`/api/user/...`），
+//! 本批按主线要求去掉 `/api` 前缀，取的是**分组内的原始路径**。
 //!
 //! ## 鉴权口径
 //!
-//! - Go 的 `middleware.ParseUserToken`：token 来源优先级是
-//!   `token` 头 → `Authorization: Bearer` → `token` cookie；
+//! - 令牌来源优先级（见 `ParseUserToken` 的语义）：
+//! `token` 头 → `Authorization: Bearer` → `token` cookie；
 //! - 会员 JWT 用 `TokenSecret + "-user-token"` 签名，claims 是
-//!   `{"userId":"<id>","t":"<过期时间戳>"}`（对齐 `src/auth.rs`）；
+//! `{"userId":"<id>","t":"<过期时间戳>"}`（对齐 `src/auth.rs`）；
 //! - JWT 不可用时回退到会员开放接口 Key（`users.api_token`）；
-//! - 未登录一律回 `code: 1` +「请先登录」（Go 用 `code: 1001` +
-//!   「该操作需要登录，请登录后重试」，本项目统一用 `code: 1`）。
+//! - 未登录一律回 `code: 1` +「请先登录」（既有契约用 `code: 1001` +
+//! 「该操作需要登录，请登录后重试」，本项目统一用 `code: 1`）。
 
 use std::collections::HashMap;
 
@@ -52,7 +50,7 @@ pub fn router() -> Router<AppState> {
         .route("/verify/email", get(verify_email).post(send_verify_email))
         .route("/captcha", get(captcha))
         // ------------------------------------------------------------------
-        // 账户页数据（Go 的 `account.go` 注册的是页面，这里给 API 客户端用）
+        // 账户页数据（既有接口注册的是页面，这里给 API 客户端用）
         // ------------------------------------------------------------------
         .route("/account/info", get(account_info))
         .route("/account/password/reset", get(account_password_reset))
@@ -75,7 +73,7 @@ pub fn router() -> Router<AppState> {
         .route("/member/avatar", post(user_avatar))
         .route("/member/upload", post(user_upload))
         // ------------------------------------------------------------------
-        // 会员接口（Go 的 `/api/user/*`）
+        // 会员接口（按 `/api/user/*` 的语义）
         // ------------------------------------------------------------------
         .route("/user/detail", get(user_detail).post(user_detail_save))
         .route("/user/archives", get(user_archives))
@@ -111,7 +109,7 @@ pub fn router() -> Router<AppState> {
 
 /// 请求体（同时兼容 JSON 与表单提交）。
 ///
-/// Go 版是「先 `ReadJSON`，失败再读表单」（`controller/member_center.go`），
+/// 既有实现是「先 `ReadJSON`，失败再读表单」，
 /// 这里用同样的顺序解析：JSON 解析失败就当表单处理。
 struct Body(Value);
 
@@ -190,7 +188,7 @@ fn query_int(query: &HashMap<String, String>, key: &str) -> i64 {
     query_value(query, key).trim().parse::<i64>().unwrap_or(0)
 }
 
-/// 分页参数（对齐 Go 的默认分页口径）。
+/// 分页参数（按既有默认分页口径）。
 struct Paging {
     page: i64,
     page_size: i64,
@@ -250,7 +248,7 @@ fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-/// 取当前登录会员 ID（对齐 Go 的 `middleware.ParseUserToken`）。
+/// 取当前登录会员 ID（按 `ParseUserToken` 的语义）。
 ///
 /// JWT 校验失败时回退到会员开放接口 Key（`users.api_token`）。
 async fn current_user_id(pool: &sqlx::MySqlPool, headers: &HeaderMap) -> Option<u32> {
@@ -283,7 +281,7 @@ fn need_relogin() -> Response {
     fail("登录已失效，请重新登录")
 }
 
-/// 会员登录 Cookie（Go 的 `ctx.SetCookieKV("token", user.Token, ...)`）。
+/// 会员登录 Cookie（写 `token` 键，值为会员令牌）。
 fn token_cookie(token: &str, remember: bool) -> String {
     let max_age = if remember {
         30 * 24 * 3600
@@ -301,7 +299,7 @@ fn with_cookie(mut res: Response, token: &str, remember: bool) -> Response {
     res
 }
 
-/// 交给前台管线渲染（Go 版这些路径同时有 GET 页面）。
+/// 交给前台管线渲染（既有实现这些路径同时有 GET 页面）。
 async fn front_page(State(state): State<AppState>, req: Request) -> Response {
     crate::front::reroute(State(state), req).await
 }
@@ -313,7 +311,7 @@ async fn setting_section(pool: &sqlx::MySqlPool, key: &str) -> Value {
         .unwrap_or_else(|_| json!({}))
 }
 
-/// 会员的优惠比例（Go 的 `provider.GetUserDiscount`）。
+/// 会员的优惠比例（按 `provider.GetUserDiscount` 的语义）。
 ///
 /// 优先级：会员所在分组的 `setting.discount` > 上级分组的 `setting.share_discount`。
 async fn user_discount(pool: &sqlx::MySqlPool, user_id: u32) -> i64 {
@@ -362,7 +360,7 @@ async fn member_group_json(pool: &sqlx::MySqlPool, group_id: u32, discount: i64)
     }
 }
 
-/// 站点主地址（Go 的 `currentSite.System.BaseUrl`）。
+/// 站点主地址（取站点配置里的主域名）。
 async fn site_base_url(pool: &sqlx::MySqlPool) -> String {
     let system = setting_section(pool, "system").await;
     system
@@ -390,7 +388,7 @@ fn client_ip(headers: &HeaderMap) -> String {
 // 登录 / 注册 / 找回密码
 // ============================================================================
 
-/// `POST /login`（Go 的 `ApiLogin`）。
+/// `POST /login`（按 `ApiLogin` 的语义）。
 ///
 /// 请求字段：`user_name` / `email` / `phone` / `password` / `remember` /
 /// `captcha_id` / `captcha` / `platform`。
@@ -406,7 +404,7 @@ async fn login(State(state): State<AppState>, body: Bytes) -> Response {
         return fail("该登录方式尚未接入");
     }
 
-    // 验证码（Go：safe.captcha == 1 时必校）
+    // 验证码（既有实现：safe.captcha == 1 时必校）
     let safe = setting_section(pool, "safe").await;
     if safe.get("captcha").and_then(Value::as_i64) == Some(1) {
         let captcha_id = body.str("captcha_id");
@@ -416,7 +414,7 @@ async fn login(State(state): State<AppState>, body: Bytes) -> Response {
         }
     }
 
-    // 用户名：邮箱 / 手机号 优先（Go 的 `ApiLogin`）
+    // 用户名：邮箱 / 手机号优先（按 `ApiLogin` 的语义）
     let mut user_name = body.str("user_name").trim().to_string();
     let email = body.str("email").trim().to_string();
     let phone = body.str("phone").trim().to_string();
@@ -433,7 +431,7 @@ async fn login(State(state): State<AppState>, body: Bytes) -> Response {
         return fail("请输入6位及以上长度的密码");
     }
 
-    // 邮箱 / 手机号 / 用户名 三种登录方式（Go 的 `LoginViaPassword`）
+    // 邮箱 / 手机号 / 用户名三种登录方式（按 `LoginViaPassword` 的语义）
     let found = if member::valid_email(&user_name) {
         member::get_by_email(pool, &user_name).await
     } else if member::valid_phone(&user_name) {
@@ -450,7 +448,7 @@ async fn login(State(state): State<AppState>, body: Bytes) -> Response {
         return fail("登录失败");
     }
     if found.status != 1 {
-        // Go 的 `UserStatusActive` 之外一律是这个提示（词条缺失时原样返回键名）
+        // 既有的 `UserStatusActive` 之外一律是这个提示（词条缺失时原样返回键名）
         return fail("UserNotActive");
     }
 
@@ -477,9 +475,9 @@ async fn login(State(state): State<AppState>, body: Bytes) -> Response {
     with_cookie(ok(data), &token, remember)
 }
 
-/// `POST /logout`（Go 的 `AccountLogout`，`return=json` 分支）。
+/// `POST /logout`（既有的 `AccountLogout`，`return=json` 分支）。
 ///
-/// Go 回 `code: 1001`（已退出），本项目成功一律 `code: 0`。
+/// 既有实现回 `code: 1001`（已退出），本项目成功一律 `code: 0`。
 async fn logout() -> Response {
     let mut res = ok_msg("已退出登录");
     if let Ok(value) = header::HeaderValue::from_str("token=; Path=/; Max-Age=0") {
@@ -488,7 +486,7 @@ async fn logout() -> Response {
     res
 }
 
-/// `POST /register`（Go 的 `ApiRegister`）。
+/// `POST /register`（按 `ApiRegister` 的语义）。
 ///
 /// 请求字段：`user_name` / `password` / `email` / `phone` / `real_name` /
 /// `first_name` / `last_name` / `avatar_url` / `introduce` / `birthday`。
@@ -504,7 +502,7 @@ async fn register(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     let email = body.str("email").trim().to_string();
     let phone = body.str("phone").trim().to_string();
 
-    // Go 的用户名兜底：first/last → 邮箱前缀
+    // 既有的用户名兜底：first/last → 邮箱前缀
     if user_name.is_empty() && !first_name.is_empty() {
         user_name = first_name.clone();
         if !last_name.is_empty() {
@@ -516,7 +514,7 @@ async fn register(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         user_name = email.split('@').next().unwrap_or("").to_string();
     }
 
-    // 邀请人：cookie `invite`（Go 的 `ctx.GetCookie("invite")`）
+    // 邀请人：读同名 cookie `invite`
     let mut parent_id = body.int("invite_id").max(0) as u32;
     if parent_id == 0 {
         if let Some(raw) = read_cookie(&headers, "invite") {
@@ -573,7 +571,7 @@ async fn register(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 
 /// `POST /forget`（找回密码：生成重置凭据）。
 ///
-/// Go 版是 `GET /forget` 页面 + `POST /api/verify/email`（`state=reset`）发信；
+/// 既有实现是 `GET /forget` 页面 + `POST /api/verify/email`（`state=reset`）发信；
 /// Rust 版没有邮件通道，重置凭据只在进程内存里保存（不回传给调用方）。
 async fn forget(State(state): State<AppState>, body: Bytes) -> Response {
     let Some(pool) = state.db() else {
@@ -590,7 +588,7 @@ async fn forget(State(state): State<AppState>, body: Bytes) -> Response {
         Err(err) => return failed(err),
     };
 
-    // Go 的重置令牌：`Md5(email + password)`（改完密码即失效）
+    // 既有的重置令牌：`Md5(email + password)`（改完密码即失效）
     let token = member::md5_reset_token(&email, &row.password);
     let code = captcha::new_code(6);
     verify::put_reset(&email, &token, &code);
@@ -599,7 +597,7 @@ async fn forget(State(state): State<AppState>, body: Bytes) -> Response {
     ok_msg("请验证您的邮箱")
 }
 
-/// `POST /password/reset`（Go 的 `ApiResetUserPassword`）。
+/// `POST /password/reset`（按 `ApiResetUserPassword` 的语义）。
 ///
 /// 请求字段：`email` / `token` / `code` / `password`。
 async fn password_reset(State(state): State<AppState>, body: Bytes) -> Response {
@@ -636,7 +634,7 @@ async fn password_reset(State(state): State<AppState>, body: Bytes) -> Response 
     ok_msg("密码修改成功")
 }
 
-/// `GET /account/password/reset`（Go 的 `AccountPasswordResetPage` 的数据部分）。
+/// `GET /account/password/reset`（既有的 `AccountPasswordResetPage` 的数据部分）。
 ///
 /// 查询参数：`token` / `code` / `email`。
 async fn account_password_reset(
@@ -679,7 +677,7 @@ async fn account_info(State(state): State<AppState>, headers: HeaderMap) -> Resp
 // 邮箱验证 / 验证码
 // ============================================================================
 
-/// `POST /verify/email`（Go 的 `ApiSendVerifyEmail`）。
+/// `POST /verify/email`（按 `ApiSendVerifyEmail` 的语义）。
 ///
 /// 请求字段：`email` / `state`（`verify` / `reset` / `exist` / `login`）。
 async fn send_verify_email(State(state): State<AppState>, body: Bytes) -> Response {
@@ -728,7 +726,7 @@ async fn send_verify_email(State(state): State<AppState>, body: Bytes) -> Respon
     ok_msg("请验证您的邮箱")
 }
 
-/// `GET /verify/email`（Go 的 `ApiVerifyEmail`）。
+/// `GET /verify/email`（按 `ApiVerifyEmail` 的语义）。
 ///
 /// 查询参数：`token` / `code` / `email` / `state`（`verify` / `reset` /
 /// `exist` / `login`）。
@@ -802,9 +800,9 @@ async fn verify_email(
     res
 }
 
-/// `GET /captcha`（Go 的 `GenerateCaptcha`）。
+/// `GET /captcha`（按 `GenerateCaptcha` 的语义）。
 ///
-/// `safe.captcha != 1` 时回 `{ "captcha_off": true }`（与 Go 一致）；
+/// `safe.captcha != 1` 时回 `{ "captcha_off": true }`（与既有接口契约一致）；
 /// 开启时返回 `{captcha_id, captcha}`，`captcha` 是 base64 PNG（无 data: 前缀）。
 async fn captcha(State(state): State<AppState>) -> Response {
     let Some(pool) = state.db() else {
@@ -886,7 +884,7 @@ async fn member_info(State(state): State<AppState>, headers: HeaderMap) -> Respo
     member_overview(pool, user_id).await
 }
 
-/// `GET /member/nav`（会员中心侧栏菜单，顺序与 Go 的 `memberNavEntries` 一致）。
+/// `GET /member/nav`（会员中心侧栏菜单，顺序与既有的 `memberNavEntries` 一致）。
 async fn member_nav(State(state): State<AppState>) -> Response {
     if state.db().is_none() {
         return fail(NO_DB);
@@ -954,7 +952,7 @@ async fn member_points(
 // 会员接口
 // ============================================================================
 
-/// `GET /user/detail`（Go 的 `ApiGetUserDetail`）。
+/// `GET /user/detail`（按 `ApiGetUserDetail` 的语义）。
 async fn user_detail(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -978,7 +976,7 @@ async fn user_detail(State(state): State<AppState>, headers: HeaderMap) -> Respo
     ok(data)
 }
 
-/// `POST /user/detail`（Go 的 `ApiUpdateUserDetail`）。
+/// `POST /user/detail`（按 `ApiUpdateUserDetail` 的语义）。
 ///
 /// 请求字段：`user_name` / `real_name` / `first_name` / `last_name` /
 /// `avatar_url` / `introduce` / `phone` / `email` / `birthday`。
@@ -1016,7 +1014,7 @@ async fn user_detail_save(
     }
 }
 
-/// `GET /user/archives`（Go 的 `ApiUserArchives`：我的发布）。
+/// `GET /user/archives`（既有的 `ApiUserArchives`：我的发布）。
 async fn user_archives(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1035,7 +1033,7 @@ async fn user_archives(
     }
 }
 
-/// `GET /user/archive`（Go 的 `ApiUserArchiveDetail`：我的一条内容）。
+/// `GET /user/archive`（既有的 `ApiUserArchiveDetail`：我的一条内容）。
 async fn user_archive(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1066,7 +1064,7 @@ async fn user_archive(
     }
 }
 
-/// `GET /user/comments`（Go 的 `ApiUserComments`）。
+/// `GET /user/comments`（按 `ApiUserComments` 的语义）。
 async fn user_comments(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1096,7 +1094,7 @@ async fn user_comments(
     }
 }
 
-/// `POST /user/comment/delete`（Go 的 `ApiUserCommentDelete`）。
+/// `POST /user/comment/delete`（按 `ApiUserCommentDelete` 的语义）。
 async fn user_comment_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1123,7 +1121,7 @@ async fn user_comment_delete(
     ok(json!({ "id": comment.id }))
 }
 
-/// `POST /user/comment/reply`（Go 的 `ApiUserCommentReply`）。
+/// `POST /user/comment/reply`（按 `ApiUserCommentReply` 的语义）。
 async fn user_comment_reply(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1156,7 +1154,7 @@ async fn user_comment_reply(
     }
 }
 
-/// `POST /user/comment/status`（Go 的 `ApiUserCommentStatus`）。
+/// `POST /user/comment/status`（按 `ApiUserCommentStatus` 的语义）。
 async fn user_comment_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1170,7 +1168,7 @@ async fn user_comment_status(
     };
     let body = Body::parse(&body);
     let id = body.int("id").max(0) as u32;
-    // Go：只允许 0 / 1 / 3，其它值按 1 处理
+    // 既有实现：只允许 0 / 1 / 3，其它值按 1 处理
     let status = match body.int("status") {
         0 => 0,
         3 => 3,
@@ -1186,7 +1184,7 @@ async fn user_comment_status(
     ok(json!({ "id": comment.id, "status": status }))
 }
 
-/// `GET /user/guestbooks`（Go 的 `ApiUserGuestbooks`）。
+/// `GET /user/guestbooks`（按 `ApiUserGuestbooks` 的语义）。
 async fn user_guestbooks(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1210,7 +1208,7 @@ async fn user_guestbooks(
     }
 }
 
-/// `POST /user/guestbook/delete`（Go 的 `ApiUserGuestbookDelete`）。
+/// `POST /user/guestbook/delete`（按 `ApiUserGuestbookDelete` 的语义）。
 async fn user_guestbook_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1230,7 +1228,7 @@ async fn user_guestbook_delete(
     }
 }
 
-/// `GET /user/finances`（Go 的 `ApiUserFinances`：资金流水）。
+/// `GET /user/finances`（既有的 `ApiUserFinances`：资金流水）。
 async fn user_finances(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1249,7 +1247,7 @@ async fn user_finances(
     }
 }
 
-/// `GET /user/groups`（Go 的 `ApiGetUserGroups`）。
+/// `GET /user/groups`（按 `ApiGetUserGroups` 的语义）。
 async fn user_groups(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1266,7 +1264,7 @@ async fn user_groups(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// `GET /user/group/detail`（Go 的 `ApiGetUserGroupDetail`）。
+/// `GET /user/group/detail`（按 `ApiGetUserGroupDetail` 的语义）。
 async fn user_group_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1286,7 +1284,7 @@ async fn user_group_detail(
     ok(group_json(&group, discount))
 }
 
-/// `POST /user/password`（Go 的 `ApiUpdateUserPassword`）。
+/// `POST /user/password`（按 `ApiUpdateUserPassword` 的语义）。
 ///
 /// 请求字段：`old_password` / `password`。
 async fn user_password(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1307,7 +1305,7 @@ async fn user_password(State(state): State<AppState>, headers: HeaderMap, body: 
         Ok(None) => return fail("请登录"),
         Err(err) => return failed(err),
     };
-    // 初次设置密码时不需要旧密码（Go 的 `user.Password != ""` 判断）
+    // 初次设置密码时不需要旧密码（既有的 `user.Password != ""` 判断）
     if !row.password.is_empty() && !auth::check_password(&old_password, &row.password) {
         return fail("旧密码错误");
     }
@@ -1321,7 +1319,7 @@ async fn user_password(State(state): State<AppState>, headers: HeaderMap, body: 
     ok_msg("密码修改成功")
 }
 
-/// `POST /user/avatar`（Go 的 `ApiUpdateUserAvatar`，multipart：`file`）。
+/// `POST /user/avatar`（既有的 `ApiUpdateUserAvatar`，multipart：`file`）。
 async fn user_avatar(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1381,7 +1379,7 @@ async fn user_avatar(
     ok(json!({ "avatar_url": saved.file_location }))
 }
 
-/// `POST /user/upload`（Go 的 `ApiUserUploadImage`，multipart：`file`）。
+/// `POST /user/upload`（既有的 `ApiUserUploadImage`，multipart：`file`）。
 ///
 /// 只允许图片，单文件不超过 20MB。
 async fn user_upload(
@@ -1453,7 +1451,7 @@ async fn user_upload(
     }))
 }
 
-/// `GET /user/auth/info`（Go 的 `ApiUserAuthInfo`）。
+/// `GET /user/auth/info`（按 `ApiUserAuthInfo` 的语义）。
 async fn user_auth_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1466,7 +1464,7 @@ async fn user_auth_info(State(state): State<AppState>, headers: HeaderMap) -> Re
         Err(err) => return failed(err),
     };
     let Some(auth) = auth else {
-        // Go：没有记录时回 status = -2
+        // 既有实现：没有记录时回 status = -2
         return ok(json!({ "status": -2 }));
     };
     ok(json!({
@@ -1481,7 +1479,7 @@ async fn user_auth_info(State(state): State<AppState>, headers: HeaderMap) -> Re
     }))
 }
 
-/// `POST /user/auth/apply`（Go 的 `ApiUserAuthApply`）。
+/// `POST /user/auth/apply`（按 `ApiUserAuthApply` 的语义）。
 ///
 /// 请求字段：`type` / `real_name` / `id_card` / `id_card_front` /
 /// `id_card_back` / `id_card_hand` / `company_name` / `company_no` /
@@ -1527,7 +1525,7 @@ async fn user_auth_apply(
     }
 }
 
-/// 认证状态文案（Go 的 `memberAuthStatusText`）。
+/// 认证状态文案（按 `memberAuthStatusText` 的语义）。
 fn auth_status_text(status: i32) -> &'static str {
     match status {
         member::USER_AUTH_STATUS_PASSED => "已认证",
@@ -1536,7 +1534,7 @@ fn auth_status_text(status: i32) -> &'static str {
     }
 }
 
-/// `GET /user/openapi/info`（Go 的 `ApiMemberOpenApiInfo`）。
+/// `GET /user/openapi/info`（按 `ApiMemberOpenApiInfo` 的语义）。
 async fn user_openapi_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1559,7 +1557,7 @@ async fn user_openapi_info(State(state): State<AppState>, headers: HeaderMap) ->
     }))
 }
 
-/// `POST /user/openapi/token`（Go 的 `ApiMemberOpenApiToken`）。
+/// `POST /user/openapi/token`（按 `ApiMemberOpenApiToken` 的语义）。
 ///
 /// 请求字段：`action`（`reset` / `generate` / `clear` / `disable`）。
 async fn user_openapi_token(
@@ -1598,7 +1596,7 @@ async fn user_openapi_token(
 // 签到
 // ============================================================================
 
-/// `GET /sign/info`（Go 的 `ApiSignInfo`）。
+/// `GET /sign/info`（按 `ApiSignInfo` 的语义）。
 async fn sign_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1618,7 +1616,7 @@ async fn sign_info(State(state): State<AppState>, headers: HeaderMap) -> Respons
     }
 }
 
-/// `POST /sign/do`（Go 的 `ApiSignDo`）。
+/// `POST /sign/do`（按 `ApiSignDo` 的语义）。
 async fn sign_do(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1646,7 +1644,7 @@ async fn sign_do(State(state): State<AppState>, headers: HeaderMap) -> Response 
 // 订阅 / 附件上传
 // ============================================================================
 
-/// `POST /subscription`（Go 的 `ApiAddSubscriber`）。
+/// `POST /subscription`（按 `ApiAddSubscriber` 的语义）。
 ///
 /// 请求字段：`email`。
 async fn subscription(State(state): State<AppState>, body: Bytes) -> Response {
@@ -1658,17 +1656,17 @@ async fn subscription(State(state): State<AppState>, body: Bytes) -> Response {
     if email.is_empty() || !member::valid_email(&email) {
         return fail("请填写邮箱");
     }
-    // 已订阅：Go 直接回成功（不重复登记）
+    // 已订阅：既有实现直接回成功（不重复登记）
     match crate::models::subscriber::save(pool, 0, &email).await {
         Ok(_) => ok_msg("操作成功"),
         Err(err) => crate::routes::model_error(err),
     }
 }
 
-/// `POST /attachment/upload`（Go 的 `AttachmentUpload`，需要导入接口令牌）。
+/// `POST /attachment/upload`（既有的 `AttachmentUpload`，需要导入接口令牌）。
 ///
 /// multipart：`file` / `file1` + `category_id`；令牌在表单字段 `token`
-/// （与 Go 的 `VerifyApiToken` 一致）。
+/// （与既有的 `VerifyApiToken` 一致）。
 async fn attachment_upload(State(state): State<AppState>, mut multipart: Multipart) -> Response {
     let Some(pool) = state.db() else {
         return fail(NO_DB);
@@ -1719,7 +1717,7 @@ async fn attachment_upload(State(state): State<AppState>, mut multipart: Multipa
         }
     }
 
-    // 导入接口令牌校验（Go 的 `VerifyApiToken`）
+    // 导入接口令牌校验（按 `VerifyApiToken` 的语义）
     let import_cfg = setting_section(pool, "import_api").await;
     let expect = import_cfg
         .get("token")
@@ -1731,7 +1729,7 @@ async fn attachment_upload(State(state): State<AppState>, mut multipart: Multipa
         return fail("Token错误");
     }
     if replace_id > 0 {
-        // 前台用户不允许替换已有附件（Go 的 `UnableToModifyTheImage`）
+        // 前台用户不允许替换已有附件（按 `UnableToModifyTheImage` 的语义）
         return fail("无法修改图片");
     }
     let Some((file_name, bytes)) = file else {
@@ -1766,7 +1764,7 @@ async fn attachment_upload(State(state): State<AppState>, mut multipart: Multipa
     }))
 }
 
-/// 上传结果（对齐 Go 的 `model.Attachment`）。
+/// 上传结果（按 `model.Attachment` 的语义）。
 struct SavedUpload {
     id: u32,
     created_time: i64,
@@ -2228,7 +2226,9 @@ mod tests {
 
     fn test_state(pool: Option<sqlx::MySqlPool>) -> AppState {
         let config = crate::config::ServerJson {
-            template_dir: "../template/default".into(),
+            template_dir: crate::models::test_template_dir()
+                .to_string_lossy()
+                .to_string(),
             public_dir: std::env::temp_dir()
                 .join(format!("rustcms-member-public-{}", std::process::id()))
                 .to_string_lossy()

@@ -1,0 +1,17 @@
+[Unit]
+Description=RustCMS content management system
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www
+Group=www
+WorkingDirectory=/opt/rustcms
+ExecStart=/opt/rustcms/rustcms
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=error
+
+[Install]
+WantedBy=multi-user.target

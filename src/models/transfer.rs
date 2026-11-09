@@ -1,10 +1,10 @@
-//! 数据迁移（`pluginTransfer.go`）。
+//! 数据迁移。
 //!
-//! Go 版的迁移任务是**纯内存对象** + 对远端站点 `*2rustcms.php` 发起 HTTP 请求拉数据，
+//! 迁移任务是**纯内存对象** + 对远端站点 `*2rustcms.php` 发起 HTTP 请求拉数据，
 //! 本包实现：
 //! - `create`：校验参数并请求远端 `a=config` 做连通性确认，返回任务对象；
 //! - **`download` 是真实可用的**：把内置的 `clientFiles/<provider>2rustcms.php` 发给用户，
-//!   用户在自己旧站上放好这个文件后，才能配迁移；
+//! 用户在自己旧站上放好这个文件后，才能配迁移；
 //! - `task` / `modules` / `start` 仍保持原有占位行为（不在本包范围）。
 
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ use super::ModelError;
 /// 支持的建站系统标识（与 `clientFiles/` 下的文件名一一对应）。
 pub const PROVIDERS: &[&str] = &["dedecms", "empire", "pbootcms", "wordpress", "xunruicms", "train"];
 
-/// 迁移任务（Go 里是内存结构，这里只用于回包）。
+/// 迁移任务（既有实现里是内存结构，这里只用于回包）。
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct TransferTask {
@@ -68,8 +68,8 @@ pub fn client_file(root: &Path, provider: &str) -> Option<PathBuf> {
 
 /// 创建迁移任务：校验参数后请求远端站点 `a=config` 确认客户端文件可用。
 ///
-/// 对齐 Go `CreateTransferTask`：参数非法 / 远端返回 `code != 0` / 响应无法解析时
-/// 都直接报错，不会把任务保存到任何地方（Go 版同样只存在内存里）。
+/// 遵循既有约定：参数非法 / 远端返回 `code != 0` / 响应无法解析时
+/// 都直接报错，不会把任务保存到任何地方（既有实现同样只存在内存里）。
 pub async fn create(input: TransferTask) -> Result<TransferTask, ModelError> {
     let provider = input.provider.trim().to_string();
     if provider.is_empty() {
@@ -158,17 +158,39 @@ mod tests {
 
     #[test]
     fn finds_real_client_files() {
-        // 仓库里确实带了这些文件（`<repo>/clientFiles/`），顺便验证路径拼接
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("crate 目录应在上层目录下");
+        // 逻辑验证：在一个临时 root 下铺全套客户端文件，验证路径拼接与防穿越。
+        // （部署包里的 `clientFiles/` 由运维随包放置，仓库与测试环境不一定有，
+        // 所以真实目录只做「有则校验」，不作为失败条件。）
+        let root = std::env::temp_dir().join(format!("rustcms-transfer-{}", std::process::id()));
+        let base = root.join("clientFiles");
+        std::fs::create_dir_all(&base).expect("建临时 clientFiles");
         for provider in PROVIDERS {
-            let found = client_file(root, provider);
-            assert!(found.is_some(), "缺少 {provider} 的客户端文件");
-            assert!(found.unwrap().starts_with(root.join("clientFiles")));
+            let name = client_file_name(provider);
+            std::fs::write(base.join(&name), b"<?php // test").expect("写临时客户端文件");
+            let found = client_file(&root, provider).expect("应能定位到客户端文件");
+            assert_eq!(found, base.join(&name));
         }
         // 非法名字一律 None
-        assert!(client_file(root, "../config").is_none());
-        assert!(client_file(root, "notexist").is_none());
+        assert!(client_file(&root, "../config").is_none());
+        assert!(client_file(&root, "notexist").is_none());
+        // 目录在但文件名字不匹配（例如只放了其它产品的同名迁移脚本）也是 None
+        std::fs::write(base.join("legacy-migration.php"), b"<?php // x").expect("写干扰文件");
+        std::fs::remove_file(base.join("dedecms2rustcms.php")).expect("删掉 dedecms 客户端文件");
+        assert!(client_file(&root, "dedecms").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 站点根（`config.json` 所在目录）若真的带了 `clientFiles/`，顺带校验一遍
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate 目录应在上层目录下");
+        if repo_root.join("clientFiles").is_dir() {
+            for provider in PROVIDERS {
+                let found = client_file(repo_root, provider);
+                assert!(found.is_some(), "缺少 {provider} 的客户端文件");
+                assert!(found.unwrap().starts_with(repo_root.join("clientFiles")));
+            }
+            assert!(client_file(repo_root, "../config").is_none());
+            assert!(client_file(repo_root, "notexist").is_none());
+        }
     }
 }

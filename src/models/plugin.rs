@@ -1,13 +1,15 @@
 //! SEO 类插件：伪静态（rewrite）、robots.txt、sitemap。
 //!
-//! 对齐 Go 版：
-//! - `pluginRewrite.go`：配置存 `settings.rewrite`（`{mode, patten}`），字段级 merge；
-//! - `pluginRobots.go`：内容存**文件** `public/robots.txt`；
-//! - `pluginSitemap.go`：配置存 `settings.sitemap`，生成时间写
-//!   `cache/sitemap-time.log`，产物是 `public/sitemap.xml` 或 `public/sitemap.txt`。
+//! 站点级插件配置的后端实现：
+//! - 伪静态：配置存 `settings.rewrite`（`{mode, patten}`），字段级 merge；
+//! - robots：内容存**文件** `public/robots.txt`；
+//! - sitemap：配置存 `settings.sitemap`，生成时间写
+//! `cache/sitemap-time.log`，产物是 `public/sitemap.xml` 或 `public/sitemap.txt`。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sqlx::mysql::MySqlPool;
@@ -146,14 +148,14 @@ fn id_set(value: Option<&Value>) -> std::collections::HashSet<u32> {
 
 /// 生成 sitemap 分片与 index，返回写入的内容 URL 总数。
 ///
-/// 结构对齐 Go `BuildSitemap`：
+/// sitemap 结构约定：
 /// - `sitemap-category.{type}`：首页 + 栏目 / 单页；
 /// - `sitemap-archive-{N}.{type}`：文档按 `page_size` 分片；
 /// - `sitemap-tag-{N}.{type}`：标签按 `page_size` 分片（`exclude_tag` 时跳过）；
 /// - `sitemap.{type}`：index，列出上面的子文件。
 ///
-/// 与 Go 的差异：不生成空尾页；XML 暂不输出 `lastmod` 与多语言
-/// `xhtml:link`（Rust 侧多语言渲染尚未移植）。
+/// 刻意简化：不生成空尾页；XML 暂不输出 `lastmod` 与多语言
+/// `xhtml:link`（多语言渲染尚未实现）。
 pub async fn sitemap_build(
     pool: &MySqlPool,
     public_dir: &Path,
@@ -217,7 +219,7 @@ pub async fn sitemap_build(
             }
             category_urls.push(format!(
                 "{base}{}",
-                url::page_url(mode, &item.url_token, 1)
+                url::page_url_for(mode, item.id, &item.url_token, 1)
             ));
             continue;
         }
@@ -303,7 +305,7 @@ pub async fn sitemap_build(
     }
     write_sitemap_index(public_dir, &kind, &base, &children)?;
 
-    // 生成时间：内容为 Unix 秒（Go `UpdateSitemapTime`），mtime 同样被 sitemap_time 读取
+    // 生成时间：内容为 Unix 秒，mtime 同样被 sitemap_time 读取
     let _ = std::fs::create_dir_all(cache_dir);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -345,7 +347,7 @@ fn write_sitemap_urlset(
     let body = if kind == "xml" {
         let mut output = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <?xml-stylesheet type=\"text/xsl\" href=\"{}/anqi-style.xsl\" ?>\n\
+             <?xml-stylesheet type=\"text/xsl\" href=\"{}/rust-style.xsl\" ?>\n\
              <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
              xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">\n",
             xml_escape(base)
@@ -372,7 +374,7 @@ fn write_sitemap_index(
     let body = if kind == "xml" {
         let mut output = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <?xml-stylesheet type=\"text/xsl\" href=\"{}/anqi-index.xsl\" ?>\n\
+             <?xml-stylesheet type=\"text/xsl\" href=\"{}/rust-index.xsl\" ?>\n\
              <sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
             xml_escape(base)
         );
@@ -454,7 +456,7 @@ pub async fn timefactor_save(pool: &MySqlPool, patch: &Value) -> anyhow::Result<
     site_setting::save_section(pool, TIME_FACTOR, &patch).await
 }
 
-/// 结构化数据的完整默认值（对应 Go 的零值）。
+/// 结构化数据的完整默认值（零值）。
 fn default_jsonld() -> Value {
     json!({
         "open": false,
@@ -733,9 +735,9 @@ pub fn html_cache_root(cache_dir: &Path) -> std::path::PathBuf {
     cache_dir.join("html")
 }
 
-/// 把站点内链接转成缓存文件相对路径（等价 Go `transToLocalPath`）。
+/// 把站点内链接转成缓存文件相对路径。
 ///
-/// 与 Go 的差异：不区分 query 与移动端，统一落到 PC 的 `<cache>/html/<path>`。
+/// 刻意简化：不区分 query 与移动端，统一落到 PC 的 `<cache>/html/<path>`。
 pub fn html_cache_local_path(link: &str) -> String {
     let path = link.split(['?', '#']).next().unwrap_or("");
     let path = if path.starts_with('/') {
@@ -772,7 +774,7 @@ pub async fn html_cache_get(pool: &MySqlPool) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-/// 保存静态缓存配置：`storage_url` 补尾部 `/`，`keep_local` 恒定 false（与 Go 一致）。
+/// 保存静态缓存配置：`storage_url` 补尾部 `/`，`keep_local` 恒定 false。
 pub async fn html_cache_save(pool: &MySqlPool, patch: &Value) -> anyhow::Result<Value> {
     if !patch.is_object() {
         return Err(anyhow::anyhow!("配置必须是 JSON 对象"));
@@ -822,7 +824,7 @@ pub struct LimitBlock {
     pub body: &'static str,
 }
 
-/// 进程内限流运行时（对齐 Go `Website.Limiter`，重启即清空）。
+/// 进程内限流运行时（重启即清空）。
 struct LimiterRuntime {
     open: bool,
     white_ips: Vec<String>,
@@ -830,6 +832,8 @@ struct LimiterRuntime {
     allow_spider: bool,
     ban_empty_agent: bool,
     ban_empty_refer: bool,
+    /// 内存使用率阈值：0 表示不做内存限流。
+    mem_percent: i32,
     blocker: rustcms_ext::ratelimit::IpBlocker,
 }
 
@@ -842,6 +846,7 @@ impl Default for LimiterRuntime {
             allow_spider: false,
             ban_empty_agent: false,
             ban_empty_refer: false,
+            mem_percent: 0,
             blocker: rustcms_ext::ratelimit::IpBlocker::new(Default::default()),
         }
     }
@@ -884,6 +889,18 @@ pub async fn limiter_reload(pool: &MySqlPool) -> anyhow::Result<Value> {
     let config = limiter_get(pool).await?;
     let max_requests = config["max_requests"].as_i64().unwrap_or(0).max(1) as u32;
     let block_hours = config["block_hours"].as_i64().unwrap_or(0).max(1) as u64;
+    // 只有勾选「内存限制」才生效，阈值夹在 50..=100，
+    // 不合法时回落 90（默认值），未勾选时记 0 表示不做内存限流。
+    let mem_percent = if limiter_bool(&config, "mem_limit") {
+        let percent = config["mem_percent"].as_i64().unwrap_or(0);
+        if (50..=100).contains(&percent) {
+            percent as i32
+        } else {
+            90
+        }
+    } else {
+        0
+    };
     let runtime = LimiterRuntime {
         open: limiter_bool(&config, "open"),
         white_ips: limiter_string_list(&config, "white_ips"),
@@ -891,6 +908,7 @@ pub async fn limiter_reload(pool: &MySqlPool) -> anyhow::Result<Value> {
         allow_spider: limiter_bool(&config, "is_allow_spider"),
         ban_empty_agent: limiter_bool(&config, "ban_empty_agent"),
         ban_empty_refer: limiter_bool(&config, "ban_empty_refer"),
+        mem_percent,
         blocker: rustcms_ext::ratelimit::IpBlocker::new(
             rustcms_ext::ratelimit::BlockConfig {
                 threshold: max_requests,
@@ -905,7 +923,7 @@ pub async fn limiter_reload(pool: &MySqlPool) -> anyhow::Result<Value> {
     Ok(config)
 }
 
-/// 私网 / 本机地址不做频率限制（对齐 Go `Limiter.isPrivateIP`）。
+/// 私网 / 本机地址不做频率限制。
 fn is_private_ip(ip: &str) -> bool {
     ip.starts_with("10.")
         || ip.starts_with("172.")
@@ -915,7 +933,7 @@ fn is_private_ip(ip: &str) -> bool {
         || ip == "::1"
 }
 
-/// 简单蜘蛛识别（Go 侧是完整的 UA 关键字库，这里覆盖常见搜索引擎）。
+/// 简单蜘蛛识别（覆盖常见搜索引擎的 UA 关键字）。
 fn looks_like_spider(user_agent: &str) -> bool {
     let ua = user_agent.to_ascii_lowercase();
     [
@@ -964,25 +982,62 @@ fn ip_matches(ip: &str, pattern: &str) -> bool {
     address & mask == network & mask
 }
 
-/// 前台请求限流判定（对齐 Go `controller.UseLimiter`）。
+/// 内存压力限流的粘滞期限：
+/// 一旦触发，5 秒内的所有动态请求直接 429，避免高负载下继续堆积请求。
+///
+/// 取值是「相对进程启动的毫秒数」，0 表示当前没有限流期。用原子量而非互斥锁，
+/// 因为每个前台请求都要读一次。
+static MEM_LIMIT_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+/// 计算粘滞期限用的时间基准。
+static MEM_LIMIT_BASE: OnceLock<Instant> = OnceLock::new();
+/// 内存压力限流期长度（5 秒）。
+const MEM_LIMIT_WINDOW: Duration = Duration::from_secs(5);
+
+fn mem_limit_now_ms() -> u64 {
+    MEM_LIMIT_BASE
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 当前是否仍处于内存压力限流期（过期即清除）。
+fn mem_limit_sticky_active() -> bool {
+    let deadline = MEM_LIMIT_DEADLINE_MS.load(Ordering::Relaxed);
+    if deadline == 0 {
+        return false;
+    }
+    if mem_limit_now_ms() >= deadline {
+        MEM_LIMIT_DEADLINE_MS.store(0, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// 进入内存压力限流期（5 秒）。
+fn mem_limit_trigger() {
+    let deadline = mem_limit_now_ms().saturating_add(MEM_LIMIT_WINDOW.as_millis() as u64);
+    MEM_LIMIT_DEADLINE_MS.store(deadline.max(1), Ordering::Relaxed);
+}
+
+/// 清除粘滞标记（未超阈值时把标记置 0）。
+fn mem_limit_clear() {
+    // 只在有标记时写回，避免每个请求都写同一条缓存行。
+    if MEM_LIMIT_DEADLINE_MS.load(Ordering::Relaxed) != 0 {
+        MEM_LIMIT_DEADLINE_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// 前台请求限流判定。
 ///
 /// 返回 `None` 表示放行；返回 `Some` 时由调用方按 `status` / `body` 直接响应。
-/// 内存占用阈值限流（Go 的 `MemPercent`）暂未实现：Rust 标准库没有系统内存
-/// 占用 API，且不影响其余判定。
 pub fn limiter_check(
     ip: Option<&str>,
     user_agent: &str,
     referer: &str,
     path: &str,
 ) -> Option<LimitBlock> {
-    let runtime = limiter_runtime()
-        .read()
-        .unwrap_or_else(|err| err.into_inner());
-    if !runtime.open {
-        return None;
-    }
-
-    // 静态资源 / 后台 / 上传目录跳过；其中 static、uploads 可单独禁空 Referer
+    // 静态资源 / 后台 / 上传目录跳过；其中 static、uploads 可单独禁空 Referer。
+    // 这一段排在「开关 / 内存」判定之前。
     let lower_path = path.to_ascii_lowercase();
     if lower_path.starts_with("/static")
         || lower_path.starts_with("/system")
@@ -991,7 +1046,10 @@ pub fn limiter_check(
         || lower_path.ends_with("/api/import")
     {
         if (lower_path.starts_with("/static") || lower_path.starts_with("/uploads"))
-            && runtime.ban_empty_refer
+            && limiter_runtime()
+                .read()
+                .unwrap_or_else(|err| err.into_inner())
+                .ban_empty_refer
             && referer.trim().is_empty()
         {
             return Some(LimitBlock {
@@ -1002,6 +1060,36 @@ pub fn limiter_check(
         return None;
     }
 
+    // 内存压力限流（`isLimiting` + `MemPercent`）：
+    // 命中后只回 429 状态码、不带 body。
+    if mem_limit_sticky_active() {
+        return Some(LimitBlock {
+            status: 429,
+            body: "",
+        });
+    }
+    let (open, mem_percent) = {
+        let runtime = limiter_runtime()
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        (runtime.open, runtime.mem_percent)
+    };
+    if open && mem_percent > 50 && rustcms_ext::ratelimit::mem_over_threshold(mem_percent) {
+        mem_limit_trigger();
+        return Some(LimitBlock {
+            status: 429,
+            body: "",
+        });
+    }
+    mem_limit_clear();
+
+    if !open {
+        return None;
+    }
+
+    let runtime = limiter_runtime()
+        .read()
+        .unwrap_or_else(|err| err.into_inner());
     if runtime.allow_spider && looks_like_spider(user_agent) {
         return None;
     }
@@ -1029,7 +1117,7 @@ pub fn limiter_check(
             body: "Your IP is blocked.",
         });
     }
-    // Go 对私网 / 本机地址不计数，避免内网调试触发误封
+    // 既有实现对私网 / 本机地址不计数，避免内网调试触发误封
     if is_private_ip(ip) {
         return None;
     }
@@ -1043,7 +1131,7 @@ pub fn limiter_check(
     }
 }
 
-/// 当前被封禁的 IP 列表（对齐 Go `GetBlockIPs` 的 `{ip, block_time}`）。
+/// 当前被封禁的 IP 列表（遵循既有约定的 `{ip, block_time}`）。
 pub fn limiter_blocked_ips() -> Vec<Value> {
     let runtime = limiter_runtime()
         .read()
@@ -1108,6 +1196,23 @@ mod tests {
         assert!(set.contains(&2));
         assert!(id_set(None).is_empty());
         assert!(id_set(Some(&json!("nope"))).is_empty());
+    }
+
+    #[test]
+    fn mem_limit_sticky_window_expires() {
+        mem_limit_clear();
+        assert!(!mem_limit_sticky_active());
+        // 触发后进入 5 秒限流期。
+        mem_limit_trigger();
+        assert!(mem_limit_sticky_active());
+        // 把期限挪到过去，验证过期自动清除（不 sleep）。
+        let past = mem_limit_now_ms().saturating_sub(1);
+        MEM_LIMIT_DEADLINE_MS.store(past, Ordering::Relaxed);
+        assert!(!mem_limit_sticky_active());
+        assert_eq!(MEM_LIMIT_DEADLINE_MS.load(Ordering::Relaxed), 0);
+        // 幂等：反复调用仍然放行。
+        assert!(!mem_limit_sticky_active());
+        mem_limit_clear();
     }
 
     #[test]

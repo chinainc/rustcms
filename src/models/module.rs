@@ -1,10 +1,10 @@
 //! 模块（内容模型）与自定义字段定义。
 //!
-//! 对齐 Go 版：
-//! - `modules.fields` / `modules.category_fields` 存的是 `[]config.CustomField` 的 JSON；
+//! 约定：
+//! - `modules.fields` / `modules.category_fields` 存的是自定义字段数组的 JSON；
 //! - 每个自定义字段在**模块自己的表**（`modules.table_name`，如 `article`/`product`/`case`）
-//!   里对应一列，由 `Module::Migrate`（`ALTER TABLE ... ADD COLUMN`）创建；
-//! - 列类型映射见 `CustomField::column_type`（`config.CustomField.GetFieldColumn`）。
+//! 里对应一列，由 `Module::Migrate`（`ALTER TABLE ... ADD COLUMN`）创建；
+//! - 列类型映射见 `CustomField::column_type`。
 
 use std::collections::HashSet;
 
@@ -15,7 +15,7 @@ use sqlx::FromRow;
 
 use super::ModelError;
 
-/// 字段类型常量（`config/constant.go`）。
+/// 字段类型常量。
 pub const TYPE_TEXT: &str = "text";
 pub const TYPE_NUMBER: &str = "number";
 pub const TYPE_TEXTAREA: &str = "textarea";
@@ -205,7 +205,7 @@ pub async fn get_by_table(pool: &MySqlPool, table_name: &str) -> anyhow::Result<
     Ok(module)
 }
 
-/// 按 url_token 取模块（前台路由用，对齐 Go `GetModuleFromCacheByToken`）。
+/// 按 url_token 取模块（前台路由用，走进程内缓存）。
 pub async fn get_by_token(pool: &MySqlPool, url_token: &str) -> anyhow::Result<Option<Module>> {
     let module = sqlx::query_as::<_, Module>("SELECT * FROM modules WHERE url_token = ? LIMIT 1")
         .bind(url_token)
@@ -240,7 +240,7 @@ pub async fn table_exists(pool: &MySqlPool, table_name: &str) -> anyhow::Result<
 
 /// 建表 + 补齐缺失的自定义字段列（`model.Module.Migrate`）。
 ///
-/// 只做 `ADD COLUMN`，不动已有列的类型（Go 里的 MODIFY 由「重建字段」触发，
+/// 只做 `ADD COLUMN`，不动已有列的类型（既有实现里的 MODIFY 由「重建字段」触发，
 /// 那是后台高危操作，等后台模块管理做出来再补）。
 pub async fn migrate(pool: &MySqlPool, module: &Module) -> Result<(), ModelError> {
     let table = module.safe_table()?.to_string();
@@ -253,23 +253,23 @@ pub async fn migrate(pool: &MySqlPool, module: &Module) -> Result<(), ModelError
         sqlx::query(&sql).execute(pool).await?;
     }
 
-    let existing = table_columns(pool, &table).await?;
-    for field in module.field_defs() {
-        if existing.contains(&field.field_name) {
-            continue;
-        }
-        let sql = format!(
-            "ALTER TABLE `{table}` ADD COLUMN `{}` {} DEFAULT NULL",
-            field.field_name,
-            field.column_type()
-        );
-        sqlx::query(&sql).execute(pool).await?;
-    }
+    // 补列走 `rustcms_ext::tblsync`：列存在性判断用 `COLUMN_TYPE` 归一化后比较，
+    // DDL 由 `add_column_sql` 生成（表名/列名统一加反引号）。语义仍是「只补不改」。
+    let columns: Vec<rustcms_ext::tblsync::ColumnDef> = module
+        .field_defs()
+        .iter()
+        .map(|field| {
+            rustcms_ext::tblsync::ColumnDef::new(field.field_name.clone(), field.column_type())
+                .with_default("NULL")
+        })
+        .collect();
+    let migrator = rustcms_ext::tblsync::Migrator::new(pool.clone());
+    migrator.ensure_columns(&table, &columns).await?;
 
     Ok(())
 }
 
-/// 模型的新建 / 更新入参（对应 Go 版 `request.ModuleRequest`）。
+/// 模型的新建 / 更新入参（对应既有约定）。
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct ModuleInput {
     #[serde(default)]
@@ -310,12 +310,12 @@ fn valid_ident(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
-/// 字段标识合法性（Go 用 `^[a-z][0-9a-z_]+$`，即至少两个字符）。
+/// 字段标识合法性（既有实现用 `^[a-z][0-9a-z_]+$`，即至少两个字符）。
 fn valid_field_name(value: &str) -> bool {
     value.len() >= 2 && valid_ident(value)
 }
 
-/// 新建 / 更新模型（对齐 Go 版 `provider.SaveModule` 的核心语义）。
+/// 新建 / 更新模型（遵循既有约定的核心语义）。
 pub async fn save(pool: &MySqlPool, input: &ModuleInput) -> Result<Module, ModelError> {
     let update_all = input.update_all || !input.partial;
 

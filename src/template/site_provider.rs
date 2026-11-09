@@ -1,5 +1,5 @@
 //! 模板标签的真实数据源：把 `archiveList` / `archiveDetail` / `categoryDetail` /
-//! `navList` 等标签接到数据库上（对应 Go 版 `provider` 里的各 `Get*`/`kp_*`）。
+//! `navList` 等标签接到数据库上。
 //!
 //! 链接一律走 [`crate::models::url`] 的伪静态规则生成，与前台路由用的是同一套规则。
 
@@ -180,6 +180,73 @@ impl SiteProvider {
         }
 
         Ok(query)
+    }
+
+    /// 联系我们信息（`{% contact with name="Cellphone" %}`）。
+    async fn contact(&self, args: &Map<String, Value>) -> Result<Value> {
+        let name = args.get("name").map(super::as_text).unwrap_or_default();
+        let field = match name.as_str() {
+            "UserName" | "Contact" | "Contacts" | "ContactsName" => "user_name",
+            "Cellphone" | "Phone" | "Tel" => "cellphone",
+            "Wechat" => "wechat",
+            "Email" => "email",
+            "Address" => "address",
+            "Qrcode" => "qrcode",
+            _ => "",
+        };
+        if field.is_empty() {
+            return Ok(Value::String(String::new()));
+        }
+        let contact = crate::models::site_setting::get_section(
+            &self.pool,
+            crate::models::site_setting::CONTACT,
+        )
+        .await
+        .unwrap_or(Value::Null);
+        Ok(Value::String(
+            contact
+                .get(field)
+                .map(super::as_text)
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// 当前时间（`{% now "2006" %}`）。
+    fn now_value(&self, args: &Map<String, Value>) -> Value {
+        let layout = args
+            .get("__arg0")
+            .map(super::as_text)
+            .unwrap_or_else(|| "2006-01-02".into());
+        let pattern = super::go_layout_to_chrono(&layout);
+        Value::String(chrono::Local::now().format(&pattern).to_string())
+    }
+
+    /// 上一篇 / 下一篇（同模块、同栏目，按 ID 排序）。
+    async fn adjacent_archive(&self, args: &Map<String, Value>, previous: bool) -> Result<Value> {
+        let _ = args;
+        let Some(current) = self.archive.as_ref() else {
+            return Ok(Value::Null);
+        };
+        let Some(item) = archive::adjacent(
+            &self.pool,
+            current.id,
+            current.module_id,
+            current.category_id,
+            previous,
+        )
+        .await?
+        else {
+            return Ok(Value::Null);
+        };
+        let (categories, modules) = self.indexes().await?;
+        let mut map = Map::new();
+        map.insert("Id".into(), Value::from(item.id));
+        map.insert("Title".into(), Value::String(item.title.clone()));
+        map.insert(
+            "Link".into(),
+            Value::String(self.link_for(&item, &categories, &modules)),
+        );
+        Ok(Value::Object(map))
     }
 
     async fn archive_list(&self, args: &Map<String, Value>) -> Result<Value> {
@@ -718,7 +785,7 @@ impl SiteProvider {
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or(Value::Null);
         if name == "TemplateUrl" {
-            // 与 Go 版 `tags.system` 一致：模板静态资源在 `/static/{TemplateName}/` 下。
+            // 系统标签的约定：模板静态资源在 `/static/{TemplateName}/` 下。
             let template = system
                 .get("template_name")
                 .map(super::as_text)
@@ -913,6 +980,11 @@ impl Provider for SiteProvider {
                 "tdk" => self.tdk(args).await,
                 "tagList" => self.tag_list(args).await,
                 "tagDetail" => self.tag_detail(args).await,
+                "tagDataList" => self.archive_list(args).await,
+                "contact" => self.contact(args).await,
+                "prevArchive" => self.adjacent_archive(args, true).await,
+                "nextArchive" => self.adjacent_archive(args, false).await,
+                "now" => Ok(self.now_value(args)),
                 // 翻译：暂时直接返回参数本身（未接语言包），并做 %d/%s 占位替换
                 "tr" => {
                     let mut text = args.get("__arg0").map(super::as_text).unwrap_or_default();
@@ -928,8 +1000,7 @@ impl Provider for SiteProvider {
                     }
                     Ok(Value::String(text))
                 }
-                // 多语言/上下篇等标签暂未实现
-                "languages" | "prevArchive" | "nextArchive" => Ok(Value::Array(Vec::new())),
+                "languages" => Ok(Value::Array(Vec::new())),
                 _ => Ok(Value::Null),
             }
         })
@@ -944,7 +1015,7 @@ mod tests {
     use crate::template::Engine;
 
     fn template_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../template/default")
+        crate::models::test_template_dir()
     }
 
     #[tokio::test]

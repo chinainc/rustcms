@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rustcms"
-version = "0.1.0"
+version = "1.1.5"
 edition = "2021"
 description = "基于 Rust 的内容管理系统（CMS）"
 license = "AGPL-3.0"
@@ -26,7 +26,7 @@ sqlx = { version = "0.7", default-features = false, features = [
     "macros",
 ] }
 serde = { version = "1", features = ["derive"] }
-# preserve_order：JSON 键按结构体字段顺序输出，与 Go 版 struct 序列化顺序一致
+# preserve_order：JSON 键按结构体字段顺序输出，便于与接口契约逐字段比对
 serde_json = { version = "1", features = ["preserve_order"] }
 tera = "1"
 jsonwebtoken = "9"

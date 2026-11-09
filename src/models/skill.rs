@@ -1,6 +1,6 @@
 //! AI 技能（文件系统：`data/skills/<name>/SKILL.md`）。
 //!
-//! 对齐 Go 版 `controller/manageController/skill.go`：
+//! 行为约定：
 //! - 每个技能是一个目录，元信息写在 `SKILL.md` 的 YAML frontmatter 里；
 //! - 技能名只允许字母、数字、`-`、`_`（同时是目录名，防目录穿越）；
 //! - 列表附带目录文件数与 `SKILL.md` 的修改时间。
@@ -56,7 +56,7 @@ pub struct SkillInput {
     pub content: String,
 }
 
-/// 技能名合法性（与 Go 一致：字母/数字/中划线/下划线）。
+/// 技能名合法性（与既有接口契约一致：字母/数字/中划线/下划线）。
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name

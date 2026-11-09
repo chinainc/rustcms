@@ -1,10 +1,10 @@
 //! 采集配置与关键词（`settings.collector` + `keywords` 表）。
 //!
-//! 对齐 Go 版 `provider/collector.go`：
+//! 行为约定：
 //! - 配置整份存在 `settings` 的 `collector` 键里（JSON）；
 //! - `focus = true` 时整份覆盖，`false` 时只覆盖请求里出现的字段；
 //! - 「内容替换」会真正对 `archive_data.content` / `archives.title` / `description`
-//!   执行 SQL `REPLACE`（与 Go 的 `ReplaceArticles` 等价，但不做 HTML 解析）。
+//! 执行 SQL `REPLACE`（全表替换，不做 HTML 解析）。
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -54,7 +54,7 @@ pub struct ReplaceKeyword {
 
 /// 批量替换内容里的关键词，返回受影响行数合计。
 ///
-/// 与 Go 的 `ReplaceArticles` 一样做「全表替换」，但不解析 HTML。
+/// 与既有约定一样做「全表替换」，但不解析 HTML。
 pub async fn replace_content(pool: &MySqlPool, pairs: &[ReplaceKeyword]) -> anyhow::Result<usize> {
     let pairs: Vec<&ReplaceKeyword> = pairs
         .iter()
@@ -983,7 +983,7 @@ pub async fn dig_keywords(
 
 /// 用素材库里的素材组装一篇问答组合文章。
 ///
-/// 与 Go 版一致：至少需要 3 条同关键词素材，否则视为内容不足。
+/// 与既有接口契约一致：至少需要 3 条同关键词素材，否则视为内容不足。
 pub async fn combination_article(pool: &MySqlPool, keyword: &str) -> anyhow::Result<Value> {
     let keyword = keyword.trim();
     if keyword.is_empty() {

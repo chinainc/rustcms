@@ -1,0 +1,26 @@
+{% pagination pages with show="5" %}
+<!-- pagination -->
+<div class="pagnavi">
+    <a href="{{pages.FirstPage.Link}}" class="page-item{% if pages.FirstPage.IsCurrent %} is-disabled{% endif %}">首页</a>
+    {% if pages.PrevPage %}
+    <a href="{{pages.PrevPage.Link}}" class="page-item page-arrow" aria-label="上一页"><i class="fa fa-angle-left"></i></a>
+    {% else %}
+    <span class="page-item page-arrow is-disabled" aria-hidden="true"><i class="fa fa-angle-left"></i></span>
+    {% endif %}
+    {% for item in pages.Pages %}
+    {% if item.IsCurrent %}
+    <span class="page-item page-num is-current">{{item.Name}}</span>
+    {% else %}
+    <a href="{{item.Link}}" class="page-item page-num">{{item.Name}}</a>
+    {% endif %}
+    {% endfor %}
+    {% if pages.NextPage %}
+    <a href="{{pages.NextPage.Link}}" class="page-item page-arrow" aria-label="下一页"><i class="fa fa-angle-right"></i></a>
+    {% else %}
+    <span class="page-item page-arrow is-disabled" aria-hidden="true"><i class="fa fa-angle-right"></i></span>
+    {% endif %}
+    <a href="{{pages.LastPage.Link}}" class="page-item{% if pages.LastPage.IsCurrent %} is-disabled{% endif %}">尾页</a>
+    <span class="page-total">共 {{pages.TotalItems}} 条</span>
+</div>
+<!-- pagination -->
+{% endpagination %}

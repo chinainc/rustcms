@@ -1,6 +1,6 @@
 {
   "mysql": {
-    "database": "cms",
+    "database": "rustcms",
     "user": "root",
     "password": "",
     "host": "127.0.0.1",
@@ -9,10 +9,9 @@
   },
   "server": {
     "env": "production",
-    "port": 8001,
     "log_level": "error"
   },
   "api_token": "",
-  "template_dir": "../template/default",
-  "public_dir": "../public"
+  "template_dir": "./template/default",
+  "public_dir": "./public"
 }

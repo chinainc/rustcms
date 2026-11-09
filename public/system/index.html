@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="ie=edge">
+<title>RustCMS 管理后台</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="stylesheet" href="/system/umi.9a548d14.css">
+<script async src="/system/scripts/loading.js"></script>
+<script src="/system/preload_helper.c97fbd10.js"></script>
+<script>
+  (function () {
+    var token = null;
+    try { token = window.localStorage.getItem('anqi-adminToken'); } catch (e) {}
+    var path = window.location.pathname;
+    if (!token && path.indexOf('/system/login') !== 0) {
+      window.location.replace('/system/login');
+    }
+  })();
+</script>
+<style>
+  /* 隐藏暂未提供的账号绑定入口 */
+  span.site-info-item.action { display: none !important; }
+  /* 隐藏侧边栏底部的外链区 */
+  .ant-pro-sider-links { display: none !important; }
+  /* 隐藏顶部帮助（问号）图标 */
+  .ant-pro-global-header .ant-space-item > span.action:not(.account) { display: none !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="/system/umi.fbc983d5.js"></script>
+<script src="/system/header-menu-entry.js"></script>
+<script src="/system/upgrade-upload-entry.js"></script>
+</body>
+</html>

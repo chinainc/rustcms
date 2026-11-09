@@ -61,8 +61,7 @@ pub async fn touch_login(pool: &MySqlPool, id: u32) -> anyhow::Result<()> {
 
 /// 更新管理员资料（用户名 / 状态 / 用户组）。
 ///
-/// `password` 为 `None` 时保留原密码，与 Go 版 `AdminDetailForm` 的
-/// 「`Password` 为空就不改密」一致。
+/// `password` 为 `None` 时保留原密码（空即不改密）。
 pub async fn update_profile(
     pool: &MySqlPool,
     id: u32,
@@ -119,12 +118,11 @@ pub async fn create(
     Ok(result.last_insert_id() as u32)
 }
 
-/// 写一条后台登录日志（`admin_login_logs`，对应 Go 版 `model.AdminLoginLog`）。
+/// 写一条后台登录日志（`admin_login_logs`）。
 ///
 /// `admin_id` 为 0 表示用户名不存在；`status` 1=成功、0=失败。
 ///
-/// 与 Go 版的有意差异：失败日志**不落库明文密码**（Go 会把用户输入原样写进
-/// `password` 列），这里一律写空串。
+/// 失败日志**不落库明文密码**：`password` 列一律写空串。
 pub async fn record_login(
     pool: &MySqlPool,
     admin_id: u32,
@@ -152,7 +150,7 @@ pub async fn record_login(
     Ok(())
 }
 
-/// 管理员列表过滤条件（对应 Go 版 `AdminList` 的 id / group_id / user_name 三个参数）。
+/// 管理员列表过滤条件（id / group_id / user_name 三个维度）。
 #[derive(Debug, Default, Clone)]
 pub struct AdminFilter {
     /// 精确匹配 ID。
@@ -216,7 +214,7 @@ pub async fn list_page(
 
 /// 删除管理员，返回是否真的删掉了一行。
 ///
-/// 登录 / 操作日志刻意保留：审计信息不该因为账号被删就消失（Go 版也只删 `admins` 行）。
+/// 登录 / 操作日志刻意保留：审计信息不该因为账号被删就消失（只删 `admins` 行）。
 pub async fn delete(pool: &MySqlPool, id: u32) -> anyhow::Result<bool> {
     let result = sqlx::query("DELETE FROM admins WHERE id = ?")
         .bind(id)
@@ -227,8 +225,8 @@ pub async fn delete(pool: &MySqlPool, id: u32) -> anyhow::Result<bool> {
 
 /// 后台登录日志（`admin_login_logs`）。
 ///
-/// 有意不返回 `password` 列：Go 版会把登录时提交的明文密码原样存进日志，
-/// 这里历来写空串，就没必要再往回吐。
+/// 有意不返回 `password` 列：日志里的密码列历来写空串，
+/// 就没必要再往回吐。
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct AdminLoginLog {
     pub id: u32,
@@ -299,7 +297,7 @@ pub async fn list_login_logs(
 const GROUP_COLUMNS: &str = "SELECT id, created_time, updated_time, title, description, status, \
                              setting FROM admin_groups";
 
-/// 管理员用户组（`admin_groups` 表，对应 Go 版 `model.AdminGroup`）。
+/// 管理员用户组（`admin_groups` 表）。
 #[derive(Debug, Clone, FromRow)]
 pub struct AdminGroup {
     pub id: u32,
@@ -312,7 +310,7 @@ pub struct AdminGroup {
     pub setting: Option<String>,
 }
 
-/// 用户组的权限配置（Go 版 `model.GroupSetting`）。
+/// 用户组的权限配置（`setting` 列的形状）。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct GroupSetting {
     #[serde(default)]
@@ -331,7 +329,7 @@ impl AdminGroup {
     }
 }
 
-/// 序列化成 API 形状：`setting` 列输出成对象（与 Go 版 `json:"setting"` 一致）。
+/// 序列化成 API 形状：`setting` 列输出成对象。
 impl Serialize for AdminGroup {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut out = serializer.serialize_struct("AdminGroup", 7)?;
@@ -346,7 +344,7 @@ impl Serialize for AdminGroup {
     }
 }
 
-/// 全部用户组（按 ID 升序，与 Go 版 `GetAdminGroups` 的主键顺序一致）。
+/// 全部用户组（按主键 ID 升序）。
 pub async fn list_groups(pool: &MySqlPool) -> anyhow::Result<Vec<AdminGroup>> {
     let rows = sqlx::query_as::<_, AdminGroup>(&format!("{GROUP_COLUMNS} ORDER BY id ASC"))
         .fetch_all(pool)
@@ -365,7 +363,7 @@ pub async fn get_group(pool: &MySqlPool, id: u32) -> anyhow::Result<Option<Admin
 
 /// 新增 / 更新用户组，返回组 ID。
 ///
-/// 与 Go 版 `SaveAdminGroupInfo` 一样，状态恒写 1（启用）。
+/// 状态恒写 1（启用）。
 pub async fn save_group(
     pool: &MySqlPool,
     id: u32,
@@ -414,7 +412,7 @@ pub async fn count_in_group(pool: &MySqlPool, group_id: u32) -> anyhow::Result<i
     Ok(total)
 }
 
-/// 后台操作日志（`admin_logs` 表，对应 Go 版 `model.AdminLog`）。
+/// 后台操作日志（`admin_logs` 表）。
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct AdminLog {
     pub id: u32,
@@ -425,7 +423,7 @@ pub struct AdminLog {
     pub user_name: String,
 }
 
-/// 写一条操作日志（Go 版 `AddAdminLog`：日志超过 250 字符会被截断）。
+/// 写一条操作日志（日志超过 250 字符会被截断）。
 pub async fn record_action(
     pool: &MySqlPool,
     admin_id: u32,

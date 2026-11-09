@@ -1,6 +1,6 @@
 //! 可视化装修（表 `diy_pages`）。
 //!
-//! 对齐 Go 版 `provider/diy.go`：
+//! 约定：
 //! - 一个页面 = 若干「区块」(`DiyModule`)，区块类型固定，字段由 [`module_types`] 描述；
 //! - 页面数据只存一张表，`modules` 列是 JSON 数组；
 //! - 只接受已知页面 key（目前仅 `home`），防止后台被写入任意键。

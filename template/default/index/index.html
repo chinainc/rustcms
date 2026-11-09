@@ -1,0 +1,211 @@
+{% extends 'base.html' %}
+
+{% block container %}
+{% if diyHome %}
+{# 后台「可视化装修」已配置：整页由区块渲染，默认内容不再输出 #}
+{{ diyHome|safe }}
+{% else %}
+
+<!-- Hero -->
+<section class="fs-hero">
+    <div class="container fs-hero-inner">
+        <div class="fs-hero-text">
+            <div class="fs-hero-badge">RustCMS 企业数字化平台</div>
+            <h1>让企业协作与经营<br>像使用 Rust 一样简单</h1>
+            <p>一体化 ERP、协同办公、数据分析与低代码平台，帮助团队高效协作、敏捷经营。</p>
+            <div class="fs-hero-actions">
+                <a class="fs-btn fs-btn-primary" href="/products/3/">免费试用</a>
+                <a class="fs-btn fs-btn-ghost" href="/news/12/">预约演示</a>
+            </div>
+        </div>
+        <div class="fs-hero-shot">
+            <div class="fs-hero-slider">
+                <div class="fs-hero-slide is-active"><img src="/uploads/software/theme-01.png" alt="RustCMS ERP 产品界面"></div>
+                <div class="fs-hero-slide"><img src="/uploads/software/theme-03.png" alt="RustCMS 数据可视化大屏"></div>
+                <div class="fs-hero-slide"><img src="/uploads/software/theme-09.png" alt="RustCMS 数据中台"></div>
+                <button type="button" class="fs-hero-arrow fs-hero-arrow--prev" aria-label="上一张"><i class="fa fa-angle-left"></i></button>
+                <button type="button" class="fs-hero-arrow fs-hero-arrow--next" aria-label="下一张"><i class="fa fa-angle-right"></i></button>
+                <div class="fs-hero-dots">
+                    <button type="button" class="is-active" aria-label="第 1 张"></button>
+                    <button type="button" aria-label="第 2 张"></button>
+                    <button type="button" aria-label="第 3 张"></button>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 产品入口 -->
+<section class="fs-entry-bar">
+    <div class="container">
+        <div class="fs-entry-grid">
+            <a class="fs-entry-card is-active" href="/products/3/">
+                <span class="fs-entry-icon"><i class="fa fa-cubes"></i></span>
+                <div class="fs-entry-info"><strong>企业管理软件</strong><span>ERP · 财务</span></div>
+                <i class="fa fa-angle-right"></i>
+            </a>
+            <a class="fs-entry-card" href="/products/4/">
+                <span class="fs-entry-icon"><i class="fa fa-comments-o"></i></span>
+                <div class="fs-entry-info"><strong>协同办公</strong><span>审批 · 文档 · 会议</span></div>
+                <i class="fa fa-angle-right"></i>
+            </a>
+            <a class="fs-entry-card" href="/products/5/">
+                <span class="fs-entry-icon"><i class="fa fa-bar-chart"></i></span>
+                <div class="fs-entry-info"><strong>数据分析</strong><span>BI · 指标 · 大屏</span></div>
+                <i class="fa fa-angle-right"></i>
+            </a>
+            <a class="fs-entry-card" href="/products/6/">
+                <span class="fs-entry-icon"><i class="fa fa-code"></i></span>
+                <div class="fs-entry-info"><strong>定制开发</strong><span>门户 · 集成 · 迁移</span></div>
+                <i class="fa fa-angle-right"></i>
+            </a>
+            <a class="fs-entry-card" href="/cases/15/">
+                <span class="fs-entry-icon"><i class="fa fa-briefcase"></i></span>
+                <div class="fs-entry-info"><strong>客户案例</strong><span>行业落地实践</span></div>
+                <i class="fa fa-angle-right"></i>
+            </a>
+            <a class="fs-entry-card" href="/news/">
+                <span class="fs-entry-icon"><i class="fa fa-newspaper-o"></i></span>
+                <div class="fs-entry-info"><strong>新闻资讯</strong><span>产品与行业动态</span></div>
+                <i class="fa fa-angle-right"></i>
+            </a>
+        </div>
+    </div>
+</section>
+
+<!-- 能力特性 -->
+<section class="fs-section">
+    <div class="container">
+        <div class="fs-section-head">
+            <h2>一个平台，覆盖企业数字化的关键环节</h2>
+            <p>从经营管理到协同办公，从数据分析到定制开发，能力可按需组合</p>
+        </div>
+        <div class="fs-feature-grid">
+            {% archiveList products with type="list" moduleId="2" limit="8" %}
+            {% for item in products %}
+            <a class="fs-feature-card" href="{{item.Link}}">
+                <div class="fs-feature-img"><img src="{{item.Thumb}}" alt="{{item.Title}}"></div>
+                <h3>{{item.Title}}</h3>
+                <p>{{item.Description}}</p>
+            </a>
+            {% endfor %}
+            {% endarchiveList %}
+        </div>
+        <div class="fs-section-more"><a href="/products/3/" class="fs-btn fs-btn-ghost">查看全部产品</a></div>
+    </div>
+</section>
+
+<!-- 场景方案 -->
+<section class="fs-section fs-section-alt">
+    <div class="container">
+        <div class="fs-section-head">
+            <h2>覆盖核心业务场景</h2>
+            <p>按业务场景组合产品与实施服务，让系统真正贴合业务</p>
+        </div>
+
+        <div class="fs-scene-item">
+            <div class="fs-scene-text">
+                <span class="fs-tag">管理数字化</span>
+                <h3>一个视图看清企业经营</h3>
+                <p>以 ERP 为核心，打通财务、供应链、生产与销售数据，建立统一的主数据和经营看板，让管理决策有据可依。</p>
+                <a class="fs-link" href="/news/12/">了解更多 →</a>
+            </div>
+            <div class="fs-scene-img"><img src="/uploads/software/theme-03.png" alt="管理数字化"></div>
+        </div>
+
+        <div class="fs-scene-item fs-scene-reverse">
+            <div class="fs-scene-text">
+                <span class="fs-tag">协同数字化</span>
+                <h3>审批、文档、会议一站完成</h3>
+                <p>以 OA 和工作流为入口，连接组织、流程与文档，支持移动办公与多端同步，让协作不再依赖即时消息。</p>
+                <a class="fs-link" href="/products/4/">了解更多 →</a>
+            </div>
+            <div class="fs-scene-img"><img src="/uploads/software/theme-02.png" alt="协同数字化"></div>
+        </div>
+
+        <div class="fs-scene-item">
+            <div class="fs-scene-text">
+                <span class="fs-tag">数据智能化</span>
+                <h3>从数据到洞察只需几分钟</h3>
+                <p>数据中台完成采集、治理与建模，BI 可视化让业务人员自助分析，指标实时触达管理者。</p>
+                <a class="fs-link" href="/products/5/">了解更多 →</a>
+            </div>
+            <div class="fs-scene-img"><img src="/uploads/software/theme-09.png" alt="数据智能化"></div>
+        </div>
+    </div>
+</section>
+
+<!-- 客户案例 -->
+<section class="fs-section">
+    <div class="container">
+        <div class="fs-section-head">
+            <h2>客户实践</h2>
+            <p>来自制造、零售、医疗等行业的真实落地</p>
+        </div>
+        <div class="fs-case-grid">
+            {% archiveList cases with type="list" moduleId="3" limit="8" %}
+            {% for item in cases %}
+            <a class="fs-case-card" href="{{item.Link}}">
+                <div class="fs-case-img"><img src="{{item.Thumb}}" alt="{{item.Title}}"></div>
+                <div class="fs-case-body">
+                    <h3>{{item.Title}}</h3>
+                    <p>{{item.Description}}</p>
+                </div>
+            </a>
+            {% endfor %}
+            {% endarchiveList %}
+        </div>
+    </div>
+</section>
+
+<!-- 数据 -->
+<section class="fs-stats">
+    <div class="container fs-stats-grid">
+        <div class="fs-stat"><strong>500+</strong><span>服务客户</span></div>
+        <div class="fs-stat"><strong>98%</strong><span>客户满意度</span></div>
+        <div class="fs-stat"><strong>20+</strong><span>覆盖行业</span></div>
+        <div class="fs-stat"><strong>7×12</strong><span>服务响应</span></div>
+    </div>
+</section>
+
+<!-- 新闻 -->
+<section class="fs-section">
+    <div class="container">
+        <div class="fs-section-head">
+            <h2>新闻与动态</h2>
+            <p>产品发布、公司动态与行业观察</p>
+        </div>
+        <div class="fs-news-grid">
+            {% archiveList articles with type="list" moduleId="1" limit="6" %}
+            {% for item in articles %}
+            <a class="fs-news-card" href="{{item.Link}}">
+                <div class="fs-news-time">
+                    <strong>{{ stampToDate(item.CreatedTime, "02") }}</strong>
+                    <span>{{ stampToDate(item.CreatedTime, "2006/01") }}</span>
+                </div>
+                <div class="fs-news-body">
+                    <h3>{{item.Title}}</h3>
+                    <p>{{item.Description}}</p>
+                </div>
+            </a>
+            {% endfor %}
+            {% endarchiveList %}
+        </div>
+        <div class="fs-section-more"><a href="/news/" class="fs-btn fs-btn-ghost">查看全部资讯</a></div>
+    </div>
+</section>
+
+<!-- 友情链接 -->
+<section class="fs-flink">
+    <div class="container">
+        <span>友情链接：</span>
+        {% linkList friendLinks %}
+        {% for item in friendLinks %}
+        <a href="{{item.Link}}" {% if item.Nofollow==1 %} rel="nofollow" {% endif %} target="_blank">{{item.Title}}</a>
+        {% endfor %}
+        {% endlinkList %}
+    </div>
+</section>
+
+{% endif %}
+{% endblock %}

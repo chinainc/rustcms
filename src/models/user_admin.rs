@@ -1,4 +1,4 @@
-//! 后台会员管理（`pluginUser.go`）。
+//! 后台会员管理。
 //!
 //! 与前台 `models/user.rs` 分开：这里要 `users` 表的完整字段，且**不返回密码**。
 //! `status` / `subscribed` 等是 `tinyint(1)`，sqlx 按布尔解析。
@@ -165,7 +165,7 @@ fn sanitize_token(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// 字段名合法性（与 Go 的 `^[a-z][0-9a-z_]+$` 一致）。
+/// 字段名合法性（与既有接口契约一致）。
 pub fn valid_field_name(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {

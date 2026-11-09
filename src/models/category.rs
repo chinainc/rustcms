@@ -1,7 +1,6 @@
 //! 分类模型（表 `categories`）。
 //!
-//! 排序与 Go 版 `provider.GetCacheCategories` 一致：`sort ASC, id ASC`，
-//! 再按 `parent_id` 组装成树。
+//! 排序固定为 `sort ASC, id ASC`，再按 `parent_id` 组装成树。
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,7 +36,7 @@ pub struct Category {
     pub template: String,
     pub detail_template: String,
     pub is_inherit: u8,
-    /// 库里是 `{"a","b"}` 形态的文本，序列化时输出成数组（与 Go 版一致）。
+    /// 库里是 `{"a","b"}` 形态的文本，序列化时输出成数组。
     #[serde(serialize_with = "super::serialize_images")]
     pub images: Option<String>,
     pub logo: String,
@@ -161,9 +160,9 @@ pub fn self_and_sub_ids(list: &[Category], root_id: u32) -> Vec<u32> {
     ids
 }
 
-/// 分类的新建 / 更新入参（对应 Go 版 `request.Category`）。
+/// 分类的新建 / 更新入参（对应既有约定）。
 ///
-/// 全部字段都用 `Option`：`None` 等同于 Go 的零值，
+/// 全部字段都用 `Option`：`None` 等同于 既有实现的零值，
 /// `update_all = !partial` 时才会把「显式为空」也写进去。
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct CategoryInput {
@@ -283,7 +282,7 @@ async fn verify_url_token(
     }
 }
 
-/// 新建 / 更新分类（对齐 Go 版 `provider.SaveCategory` 的核心语义）。
+/// 新建 / 更新分类（遵循既有约定的核心语义）。
 pub async fn save(pool: &MySqlPool, input: &CategoryInput) -> Result<Category, ModelError> {
     let update_all = input.update_all || !input.partial;
     let mut is_new = false;
@@ -408,7 +407,7 @@ pub async fn save(pool: &MySqlPool, input: &CategoryInput) -> Result<Category, M
             token = sanitize_token(&category.title);
         }
         if token.is_empty() {
-            // 中文标题无法直接转别名（Go 走拼音），用时间戳兜底
+            // 中文标题无法直接转别名（既有实现走拼音），用时间戳兜底
             token = format!("cat-{}", chrono::Utc::now().timestamp_millis());
         }
         if !input.force {

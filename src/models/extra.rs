@@ -7,7 +7,7 @@
 //! - `timeline` → JSON 字符串
 //! - 其余 → 字符串
 //!
-//! 与 Go 版 `provider.SaveArchive` / `GetArchiveExtra` 的转换口径一致。
+//! 读写两侧的转换口径必须一致。
 
 use std::collections::HashSet;
 
@@ -78,7 +78,7 @@ fn stored_value(field: &CustomField, value: &Value) -> Stored {
     }
 }
 
-/// 必填校验：缺值 / 空串 / 空数组都算没填（文案对齐 Go 的 `%sIsRequired`）。
+/// 必填校验：缺值 / 空串 / 空数组都算没填（文案遵循既有约定）。
 pub fn check_required(module: &Module, input: &Map<String, Value>) -> Result<(), ModelError> {
     for field in module.field_defs() {
         if !field.required {
@@ -127,7 +127,7 @@ pub async fn save_in_tx(
             let empty = Value::Null;
             let raw = input.get(&field.field_name).unwrap_or(&empty);
             let stored = if matches!(raw, Value::Null) {
-                // 未提交的字段：数值补 0，其它补空串（与 Go 一致）
+                // 未提交的字段：数值补 0，其它补空串（与既有接口契约一致）
                 if field.is_numeric() {
                     Stored::Int(0)
                 } else {
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(loaded["pages"], Value::from(12));
         assert_eq!(loaded["gallery"][0], Value::from("/a.webp"));
 
-        // 覆盖写：未提交的字段被清空（与 Go 一致）
+        // 覆盖写：未提交的字段被清空（与既有接口契约一致）
         let mut second = Map::new();
         second.insert("author".into(), Value::from("李四"));
         let mut tx = pool.begin().await.unwrap();

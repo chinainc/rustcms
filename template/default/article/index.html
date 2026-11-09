@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+
+{% block container %}
+<!-- crumb -->
+<div class="crumb">
+    <div class="container">
+        <span class="crumb-label">当前位置：</span>
+        <a href="/">首页</a>
+        <span class="crumb-sep">/</span>
+        <span class="crumb-current">新闻资讯</span>
+    </div>
+</div>
+<!-- crumb -->
+<div class="page">
+    <div class="container">
+        <div class="section page-item">
+            <!-- content -->
+            <div class="page-content">
+                <div class="single-content-title">新闻资讯</div>
+                <ul class="list-blog-ul">
+                    {% archiveList articles with type="page" limit="10" %}
+                    {% for item in articles %}
+                    <li>
+                        <div class="info">
+                            <span class="info-cat"><i class="fa fa-folder-o"></i><a href="/news/">新闻资讯</a></span>
+                            <span class="info-time"><i class="fa fa-clock-o"></i>{{ stampToDate(item.CreatedTime, "2006-01-02") }}</span>
+                        </div>
+                        <h3><a href="{{item.Link}}">{{item.Title}}</a></h3>
+                        <p>{{item.Description}}</p>
+                        <a href="{{item.Link}}" class="more">阅读全文<i class="fa fa-angle-right"></i></a>
+                    </li>
+                    {% endfor %}
+                    {% endarchiveList %}
+                </ul>
+                {% include "partial/pagination.html" %}
+            </div>
+            <!-- content -->
+            <!-- sidebar -->
+            {% include "partial/sidebar.html" %}
+            <!-- sidebar -->
+        </div>
+    </div>
+</div>
+{% endblock %}

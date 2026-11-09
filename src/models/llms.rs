@@ -1,13 +1,13 @@
 //! llms.txt 插件（`settings.llms` + `public/llms.txt` / `public/llms-full.txt`）。
 //!
-//! 对齐 Go 版 `pluginLLMs.go` + `provider/llms.go`：
-//! - 配置存 `settings.llms`（`config.PluginLLMsConfig` 的 20 个字段）；
+//! 配置与构建约定：
+//! - 配置存 `settings.llms`（20 个字段）；
 //! - build 是**站内数据拼装**：单页（type=3 分类）+ 各模块分类 + 分类下的文章，
-//!   写出 `llms.txt`（链接清单）与 `llms-full.txt`（正文导出，前 1000 条），
-//!   不做任何外呼；
-//! - 构建状态在 Go 里挂在 Website 内存字段上，这里用一个进程级互斥量保存，
-//!   语义与 Go 修正版一致：无任务 = 已完成（`/status` 回 finished）；
-//! - `HtmlToMarkdown` 用简化实现（覆盖常见标签），Go 依赖第三方库做完整转换。
+//! 写出 `llms.txt`（链接清单）与 `llms-full.txt`（正文导出，前 1000 条），
+//! 不做任何外呼；
+//! - 构建状态在 既有实现里挂在 Website 内存字段上，这里用一个进程级互斥量保存，
+//! 语义与既有实现修正版一致：无任务 = 已完成（`/status` 回 finished）；
+//! - `HtmlToMarkdown` 用简化实现（覆盖常见标签），既有实现依赖第三方库做完整转换。
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -18,10 +18,10 @@ use sqlx::mysql::MySqlPool;
 
 use super::{archive, category, extra, module, setting, site_setting, url, ModelError};
 
-/// LLMs 配置键（Go `provider.LLMsSettingKey`）。
+/// LLMs 配置键。
 pub const SETTING_KEY: &str = "llms";
 
-/// 构建状态（Go `provider.LLMsBuildStatus`，去掉不可序列化的 timer）。
+/// 构建状态（既有约定，去掉不可序列化的 timer）。
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildStatus {
     /// 0 = 未开始，1 = 进行中，2 = 已完成
@@ -50,7 +50,7 @@ pub fn build_status_reset() {
     set_status(None);
 }
 
-/// 配置完整默认值（对应 Go `config.PluginLLMsConfig` 的零值）。
+/// 配置完整默认值（对应既有约定的零值）。
 fn default_config() -> Value {
     json!({
         "open": false,
@@ -76,7 +76,7 @@ fn default_config() -> Value {
 }
 
 /// 读 llms.txt 插件配置，并附上文件的生成状态 / 更新时间 / 访问地址
-/// （Go `PluginGetLLMsSetting`）。
+///。
 pub async fn setting_get(pool: &MySqlPool, public_dir: &Path) -> anyhow::Result<Value> {
     let stored = site_setting::get_section(pool, SETTING_KEY).await?;
     let mut base = default_config();
@@ -123,10 +123,10 @@ pub async fn setting_save(
     setting_get(pool, public_dir).await
 }
 
-/// 生成 llms.txt 与 llms-full.txt（Go `provider.LLMsBuild`）。
+/// 生成 llms.txt 与 llms-full.txt。
 ///
 /// 需先开启插件；生成完成后把 `last_update` / `file_status` 写回配置
-/// （Go 只改内存，落库是为了让「设置」页立即读到最新状态）。
+/// （既有实现只改内存，落库是为了让「设置」页立即读到最新状态）。
 pub async fn build(pool: &MySqlPool, public_dir: &Path) -> Result<usize, ModelError> {
     let config = setting::get_json_or_empty(pool, SETTING_KEY)
         .await
@@ -275,7 +275,10 @@ async fn build_inner(
             current,
             total,
         }));
-        let link = format!("{base_url}{}", url::page_url(mode, &page.url_token, 1));
+        let link = format!(
+            "{base_url}{}",
+            url::page_url_for(mode, page.id, &page.url_token, 1)
+        );
         let mut line = format!("- [{}]({link})", page.title);
         if !page.description.is_empty() {
             line.push_str(&format!(": {}", parse_description(&page.description, max_words)));
@@ -373,7 +376,7 @@ async fn build_inner(
                 out.push_str(&line);
                 out.push('\n');
 
-                // 前 1000 条才写入 full 导出（与 Go 一致）
+                // 前 1000 条才写入 full 导出（与既有接口契约一致）
                 if current >= 1000 {
                     continue;
                 }
@@ -444,7 +447,7 @@ async fn build_inner(
     std::fs::write(&full_file_path, &full_out)
         .map_err(|err| ModelError::invalid(format!("写入失败: {err}")))?;
 
-    // 把生成时间与文件状态写回配置（Go 改内存对象，这里落库以达到同样可见效果）
+    // 把生成时间与文件状态写回配置（既有实现改内存对象，这里落库以达到同样可见效果）
     let now = chrono::Utc::now().timestamp();
     setting::merge_json(
         pool,
@@ -476,14 +479,14 @@ fn str_or(config: &Value, key: &str) -> String {
         .to_string()
 }
 
-/// 时间戳 → `2006-01-02`（Go 版 full 导出里的日期格式）。
+/// 时间戳 → `2006-01-02`（既有实现 full 导出里的日期格式）。
 fn format_day(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|time| time.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
 }
 
-/// 截取摘要（Go `library.ParseDescription`）：按 rune 截断后，
+/// 截取摘要：按 rune 截断后，
 /// 若 50 字符窗口内有句读符号，则在最后一个句读处截断。
 pub fn parse_description(content: &str, num: i64) -> String {
     let num = num.max(0) as usize;
@@ -499,7 +502,7 @@ pub fn parse_description(content: &str, num: i64) -> String {
         let Some(last) = last else {
             return cut;
         };
-        // Go: lastIndex >= num-50（按字节下标）
+        // 既有实现: lastIndex >= num-50（按字节下标）
         if last as i64 >= num as i64 - 50 {
             cut[..last].to_string()
         } else {
@@ -510,7 +513,7 @@ pub fn parse_description(content: &str, num: i64) -> String {
     }
 }
 
-/// HTML → Markdown（简化版 Go `library.HtmlToMarkdown`）。
+/// HTML → Markdown（简化版 既有约定）。
 ///
 /// 非 HTML 内容原样返回；HTML 走「常见块级/行内标签转换 + 剩余标签剥离 +
 /// 基础实体解码」，足以覆盖 CMS 正文里最常见的结构。

@@ -1,8 +1,8 @@
 //! 后台缺口补齐的数据访问（批次 E）。
 //!
-//! 覆盖 Go 版 `controller/manageController` 里 Rust 侧还缺的几组后台动作：
+//! 覆盖既有约定里 Rust 侧还缺的几组后台动作：
 //!
-//! | 能力 | Go 入口 | 本文件函数 |
+//! | 能力 | 既有实现入口 | 本文件函数 |
 //! |------|---------|-----------|
 //! | 找回密码三步 | `FindPasswordChooseWay` / `FindPasswordVerify` / `FindPasswordReset` | `find_password_choose` / `find_password_state` / `find_password_mark_verified` / `find_password_clear` |
 //! | 文档批量删图 | `ArchiveDeleteImage` | `delete_archive_image` |
@@ -13,8 +13,8 @@
 //! | 导入用 Excel 模板 | `GetQuickImportExcelTemplate` | `build_excel_template` |
 //!
 //! 约定：
-//! - 表名 / 列名与 Go 版一致（`archives` / `archive_drafts` / `archive_data` /
-//!   `tags` / `tag_data` / `attachments`），两个实现可以共用同一个数据库；
+//! - 表名 / 列名与既有接口契约一致（`archives` / `archive_drafts` / `archive_data` /
+//! `tags` / `tag_data` / `attachments`），两个实现可以共用同一个数据库；
 //! - 动态 SQL 一律用 `sqlx::query` / `sqlx::query_as`，不用编译期宏；
 //! - 无符号整型列读出来先 `CAST(... AS SIGNED)`。
 
@@ -33,14 +33,14 @@ pub const FIND_WAY_FILE: &str = "file";
 /// 找回密码的验证方式：域名 TXT 解析。
 pub const FIND_WAY_DNS: &str = "dns";
 
-/// 文档状态：计划发布（对齐 Go 的 `config.ContentStatusPlan`）。
+/// 文档状态：计划发布（遵循既有约定）。
 const CONTENT_STATUS_PLAN: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // 找回密码
 // ---------------------------------------------------------------------------
 
-/// 找回密码的一次性状态（对齐 Go 的 `currentSite.FindPasswordInfo`）。
+/// 找回密码的一次性状态（遵循既有约定）。
 #[derive(Debug, Clone, Serialize)]
 pub struct FindPasswordInfo {
     /// 校验令牌（用户要写进文件 / DNS TXT 的内容）。
@@ -51,7 +51,7 @@ pub struct FindPasswordInfo {
     pub way: String,
     /// 过期时间（Unix 秒）。
     ///
-    /// Go 的 `FindPasswordInfo.End` 带 `json:"-"`，不对外下发；
+    /// 既有约定带 `json:"-"`，不对外下发；
     /// 这里保持一致，避免响应多出 `end` 字段。
     #[serde(skip_serializing)]
     pub end: i64,
@@ -59,7 +59,7 @@ pub struct FindPasswordInfo {
     pub verified: bool,
 }
 
-/// 全进程共享的找回密码状态（Go 版存在 `Website.FindPasswordInfo` 里，
+/// 全进程共享的找回密码状态（既有实现存在 `Website.FindPasswordInfo` 里，
 /// Rust 的 `AppState` 不方便加字段，这里用一个全局槽位代替）。
 fn find_password_slot() -> &'static tokio::sync::Mutex<Option<FindPasswordInfo>> {
     static SLOT: OnceLock<tokio::sync::Mutex<Option<FindPasswordInfo>>> = OnceLock::new();
@@ -68,7 +68,7 @@ fn find_password_slot() -> &'static tokio::sync::Mutex<Option<FindPasswordInfo>>
 
 /// 生成找回密码令牌。
 ///
-/// Go 是 `md5(站点密钥 + 纳秒时间戳)`；这里额外掺入随机数，避免同纳秒并发请求撞令牌。
+/// 既有实现是 `md5(站点密钥 + 纳秒时间戳)`；这里额外掺入随机数，避免同纳秒并发请求撞令牌。
 pub fn make_find_password_token(secret: &str) -> String {
     let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let salt: u64 = rand::random();
@@ -98,7 +98,7 @@ pub async fn find_password_choose(
         token: make_find_password_token(secret),
         host,
         way: way.to_string(),
-        // Go 是 59 分钟
+        // 既有实现是 59 分钟
         end: chrono::Utc::now().timestamp() + 59 * 60,
         verified: false,
     };
@@ -141,7 +141,7 @@ pub async fn find_password_clear() {
 
 /// 用系统 `nslookup` 查询域名的 TXT 记录。
 ///
-/// 对齐 Go 的 `net.LookupTXT`（都走系统解析器），避免引入 DNS 依赖。
+/// 遵循既有约定（都走系统解析器），避免引入 DNS 依赖。
 /// 命令不存在/启动失败单独返回错误，便于前端提示安装。
 fn lookup_txt_records(host: &str) -> Result<Vec<String>, String> {
     let output = std::process::Command::new("nslookup")
@@ -172,7 +172,7 @@ fn lookup_txt_records(host: &str) -> Result<Vec<String>, String> {
     Ok(records)
 }
 
-/// DNS 方式校验：首条 TXT 记录必须等于令牌（对齐 Go 的 `FindPasswordVerify`）。
+/// DNS 方式校验：首条 TXT 记录必须等于令牌（遵循既有约定）。
 /// 返回 `Err` 表示系统缺少命令等环境问题，`Ok(false)` 才是记录不存在/不匹配。
 pub async fn dns_txt_matches(host: &str, token: &str) -> Result<bool, String> {
     if host.is_empty() || token.is_empty() {
@@ -236,7 +236,7 @@ pub async fn site_base_url(pool: &MySqlPool) -> String {
 
 /// 删除文档相册里的第 `image_index` 张图，返回是否真的删掉了。
 ///
-/// 对齐 Go 的 `ArchiveDeleteImage`：先找草稿（`archive_drafts`），找不到再找正式表
+/// 遵循既有约定：先找草稿（`archive_drafts`），找不到再找正式表
 /// （`archives`），把该下标的图片从 `images` 里摘掉再写回。
 pub async fn delete_archive_image(
     pool: &MySqlPool,
@@ -283,7 +283,7 @@ async fn fetch_images(
 
 /// 为正文里缺失 alt 的图片补上标题，返回 `(处理过的文档数, 补上的图片数)`。
 ///
-/// 与 Go 的 `FillAllArchiveImgAlt` 的差异：Go 只从 `archive_drafts` 取标题，
+/// 与既有约定的差异：既有实现只从 `archive_drafts` 取标题，
 /// 所以已发布内容（只存在于 `archives`）会被跳过；这里正式表优先、草稿表兜底。
 pub async fn fill_all_archive_img_alt(pool: &MySqlPool) -> Result<(usize, usize), ModelError> {
     let rows: Vec<(i64, Option<String>)> =
@@ -343,7 +343,7 @@ async fn archive_title(pool: &MySqlPool, id: i64) -> Option<String> {
 
 /// 给 HTML 里没有 alt（或 alt 为空）的 `<img>` 补 alt，返回 `(新内容, 补图数量)`。
 ///
-/// 规则与 Go 的 `provider.FillContentImgAlt` 一致：
+/// 规则与既有接口契约一致：
 /// - 第 1 张图的 alt 是标题，之后依次是「标题-2」「标题-3」…
 /// - 已有非空 alt 的图不动（用户显式设置优先）
 /// - 标题做 HTML 转义，防止破坏属性引号
@@ -407,7 +407,7 @@ pub fn fill_content_img_alt(content: &str, title: &str) -> (String, usize) {
     (out.into_owned(), filled)
 }
 
-/// HTML 转义（对齐 Go 的 `html.EscapeString`）。
+/// HTML 转义（遵循既有约定）。
 pub fn escape_html(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -425,7 +425,7 @@ pub fn escape_html(raw: &str) -> String {
 
 /// 批量设置定时发布计划，返回改动的文档数。
 ///
-/// 对齐 Go 的 `UpdateArchiveReleasePlan`：
+/// 遵循既有约定：
 /// - `daily_limit <= 0` 时用文档总数当每日发布量；
 /// - `end_hour <= start_hour` 时结束时间自动 +1 小时；
 /// - 只改草稿表（`archive_drafts`）的 `created_time` / `updated_time` / `status = 2`。
@@ -503,7 +503,7 @@ fn beginning_of_day(now: DateTime<Local>) -> DateTime<Local> {
 
 /// 批量给文档打标签，返回新增的关联数。
 ///
-/// 对齐 Go 的 `UpdateArchiveTags`：标签不存在时自动创建，`tag_data` 里已有的关联不重复插入。
+/// 遵循既有约定：标签不存在时自动创建，`tag_data` 里已有的关联不重复插入。
 pub async fn set_archive_tags(
     pool: &MySqlPool,
     ids: &[i64],
@@ -630,7 +630,7 @@ async fn unique_tag_token(pool: &MySqlPool, title: &str) -> Result<String, Model
 
 /// 按远程 URL 批量登记附件，返回新增条数。
 ///
-/// 对齐 Go 的 `AddRemoteUrls`：
+/// 遵循既有约定：
 /// - 只接受 `http(s)://` 或 `//` 开头的地址；
 /// - `地址|文件名` 的写法用竖线后一段当文件名；
 /// - 同一地址（MD5 相同）只登记一次；
@@ -688,7 +688,7 @@ pub async fn add_remote_urls(
     Ok(count)
 }
 
-/// 远程地址推导出的文件名（去掉查询串与扩展名，对齐 Go 的 `filepath.Base` + `Split(".")[0]`）。
+/// 远程地址推导出的文件名（去掉查询串与扩展名，遵循既有约定 + `Split(".")[0]`）。
 fn remote_file_name(raw: &str) -> String {
     let base = raw.split('?').next().unwrap_or("");
     let base = base.rsplit('/').next().unwrap_or("");
@@ -901,6 +901,12 @@ mod tests {
     use super::*;
     use crate::models::{db_lock, test_pool};
 
+    /// 找回密码状态是进程级全局槽位，这几个用例必须串行执行。
+    fn password_test_guard() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[test]
     fn extracts_hostname() {
         assert_eq!(url_hostname("https://www.example.com/abc"), "www.example.com");
@@ -953,6 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn choose_way_is_validated() {
+        let _guard = password_test_guard().lock().await;
         let err = find_password_choose("", "sms", "https://example.com")
             .await
             .expect_err("非法验证方式应报错");
@@ -961,6 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn choose_and_clear_password_state() {
+        let _guard = password_test_guard().lock().await;
         let info = find_password_choose("secret", FIND_WAY_FILE, "https://example.com")
             .await
             .expect("文件验证方式应通过");
@@ -979,6 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn dns_way_builds_host() {
+        let _guard = password_test_guard().lock().await;
         let info = find_password_choose("secret", FIND_WAY_DNS, "https://www.example.com/")
             .await
             .expect("DNS 验证方式应通过");

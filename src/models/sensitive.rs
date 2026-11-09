@@ -1,4 +1,4 @@
-//! 敏感词（`sensitiveWords.go`）。
+//! 敏感词。
 //!
 //! 配置是**字符串数组**，存 `settings.sensitive_words`，三种写法：
 //! - `第一`：纯敏感词，命中后替换成等长的 `*`；
@@ -11,13 +11,10 @@ use regex::Regex;
 use serde_json::Value;
 use sqlx::mysql::MySqlPool;
 
-use super::{anqi, site_setting, ModelError};
+use super::{cloud, site_setting, ModelError};
 
 /// 敏感词配置键。
 pub const SETTING_KEY: &str = "sensitive_words";
-
-/// 云端服务地址（对齐 Go `provider.AnqiApi`）。
-pub const ANQI_API: &str = "https://auth.anqicms.com/auth";
 
 /// 一条规则。
 #[derive(Debug, Clone)]
@@ -123,7 +120,7 @@ pub async fn save(pool: &MySqlPool, words: &[String]) -> Result<(), ModelError> 
     Ok(())
 }
 
-/// 解析云端同步回包，返回敏感词列表（对齐 Go `AnqiSensitiveResult`）。
+/// 解析云端同步回包，返回敏感词列表（遵循既有约定）。
 fn parse_sync_result(value: &Value) -> Result<Vec<String>, ModelError> {
     let code = value.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
@@ -148,9 +145,9 @@ fn parse_sync_result(value: &Value) -> Result<Vec<String>, ModelError> {
         .unwrap_or_default())
 }
 
-/// 从云端同步敏感词：成功且带回非空列表时整份覆盖本地配置（Go `AnqiSyncSensitiveWords`）。
+/// 从云端同步敏感词：成功且带回非空列表时整份覆盖本地配置。
 pub async fn sync_from_cloud(pool: &MySqlPool) -> Result<usize, ModelError> {
-    let auth = anqi::auth_info_get(pool).await?;
+    let auth = cloud::auth_info_get(pool).await?;
     let token = auth
         .get("token")
         .and_then(Value::as_str)
@@ -159,6 +156,9 @@ pub async fn sync_from_cloud(pool: &MySqlPool) -> Result<usize, ModelError> {
     if token.is_empty() {
         return Err(ModelError::invalid("请先登录云端服务账号"));
     }
+    let base = cloud::api_base_or_error(pool)
+        .await
+        .map_err(|err| ModelError::invalid(err.message()))?;
 
     let system = site_setting::get_section(pool, site_setting::SYSTEM).await?;
     let domain = system
@@ -167,7 +167,7 @@ pub async fn sync_from_cloud(pool: &MySqlPool) -> Result<usize, ModelError> {
         .map(str::trim)
         .unwrap_or("");
 
-    let request = rustcms_ext::http::Request::post(format!("{ANQI_API}/sensitive/sync"))
+    let request = rustcms_ext::http::Request::post(format!("{base}/sensitive/sync"))
         .with_header("token", token)
         .with_header("domain", domain)
         .with_header(

@@ -1,10 +1,9 @@
 //! 后台登录失败次数限制。
 //!
-//! 对齐 Go 版 `controller/manageController/admin.go` 的 `forbidden-admin-` 计数：
 //! 同一 IP / 同一账号连续失败 [`MAX_TIMES`] 次后锁定 [`LOCK_TTL`]（每次失败重新计时）。
 //!
-//! Go 版把计数放在站点缓存里（`currentSite.Cache`），单进程的 Rust 实现直接放进程内存：
-//! 重启即清零，语义上等同于「缓存丢了也无所谓」，不引入外部依赖。
+//! 计数直接放进程内存：重启即清零，语义上等同于「缓存丢了也无所谓」，
+//! 不引入外部依赖。
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -13,7 +12,7 @@ use std::time::{Duration, Instant};
 /// 连续失败多少次后锁定。
 pub const MAX_TIMES: u32 = 5;
 
-/// 锁定（以及每次失败后重新计时）的时长，与 Go 版的 `Cache.Set(..., 600)` 一致。
+/// 锁定（以及每次失败后重新计时）的时长：10 分钟。
 pub const LOCK_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy)]

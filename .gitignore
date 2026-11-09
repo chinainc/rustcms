@@ -38,3 +38,15 @@
 *.orig
 *.rej
 *~
+
+# 本地站点配置（含数据库密码，禁止入库）
+/config.json
+
+# 本地运行时目录
+/.opencode/
+/.scheduled-workflows/
+/debug.log
+
+# 用户上传：仅保留模板演示图 uploads/software
+/public/uploads/*
+!/public/uploads/software/

@@ -1,11 +1,11 @@
 //! 锚文本（表 `anchors`，`title` 唯一）。
 //!
-//! 对齐 Go 版 `controller/manageController/pluginAnchor.go`：
+//! 行为约定：
 //! - 列表支持关键词搜索；
 //! - `title` 唯一，重复时报「锚文本关键词已存在」；
 //! - 保存时把 `link` 的前台域名前缀去掉，只存相对路径；
 //! - 配置存 `settings.anchor`（`anchor_density` / `replace_way` / `keyword_way` / `no_strong_tag`），
-//!   `anchor_density < 10` 时归一到 100；
+//! `anchor_density < 10` 时归一到 100；
 //! - 批量替换：把正文里**未被链接**的锚文本包成 `<a>`，密度控制每篇最多几处。
 
 use serde::{Deserialize, Serialize};

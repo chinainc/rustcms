@@ -1,11 +1,11 @@
 //! 站点配置（`settings` 表，`key` + `value` 两列，`value` 存 JSON 文本）。
 //!
-//! 对齐 Go 版 `provider.GetSettingValue` / `SaveSettingValue`：
-//! - `GetSettingValue` 按 key 取一条 `value`；
-//! - `SaveSettingValue` 把任意值 `json.Marshal` 后按 key upsert。
+//! 读写约定：
+//! - 读取按 key 取一条 `value`；
+//! - 保存把任意值序列化成 JSON 后按 key upsert。
 //!
 //! 插件配置几乎全部存在这张表里（`sitemap` / `rewrite` / `anchor` /
-//! `sensitive_words` / `push` / `order` …），所以它是后续所有插件移植的公共底座。
+//! `sensitive_words` / `push` / `order` …），所以它是所有插件功能的公共底座。
 //!
 //! 注意：`key` 是 MySQL 保留字，SQL 里必须写成 `` `key` ``。
 
@@ -61,10 +61,10 @@ pub async fn save_json(pool: &MySqlPool, key: &str, value: &Value) -> anyhow::Re
     save_raw(pool, key, &raw).await
 }
 
-/// 读现配置 → 用 `patch` 里的**顶层字段**覆盖（Go 版 `library.MergeJSONPayload`）。
+/// 读现配置 → 用 `patch` 里的**顶层字段**覆盖。
 ///
 /// 语义是「字段级 PATCH」：只有 `patch` 里出现的键会被替换，其余保持原值；
-/// 嵌套对象整块替换（对应 Go 把 payload 的字段值赋给 struct 字段）。
+/// 嵌套对象整块替换（对应既有实现把 payload 的字段值赋给 struct 字段）。
 /// 落库并返回合并后的完整对象。
 pub async fn merge_json(pool: &MySqlPool, key: &str, patch: &Value) -> anyhow::Result<Value> {
     let mut current = get_json_or_empty(pool, key).await?;
@@ -106,29 +106,7 @@ async fn table_exists(pool: &MySqlPool, table: &str) -> Result<bool, ModelError>
     Ok(count > 0)
 }
 
-/// 列是否存在；不存在时执行 `ddl` 补列。
-async fn ensure_column(
-    pool: &MySqlPool,
-    table: &str,
-    column: &str,
-    ddl: &str,
-) -> Result<bool, ModelError> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.columns \
-         WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(pool)
-    .await?;
-    if count > 0 {
-        return Ok(false);
-    }
-    sqlx::query(ddl).execute(pool).await?;
-    Ok(true)
-}
-
-/// 数据库自动迁移（对齐 Go `provider.AutoMigrateDB` 的可用子集）。
+/// 数据库自动迁移（遵循既有约定的可用子集）。
 ///
 /// **先整库备份再执行变更**：备份失败就直接返回，不做任何 DDL。
 /// 变更都是幂等的：补齐模块自定义字段表，并给 `users` 补上会员中心的 `api_token` 列。
@@ -149,18 +127,23 @@ pub async fn migrate_db(
         migrated_modules.push(module.table_name.clone());
     }
 
-    // 3. 会员中心新增的用户 API Token（Go `AutoMigrateMemberCenter`）
+    // 3. 会员中心新增的用户 API Token
+    //
+    // 列的比较与 DDL 生成交给 `rustcms_ext::tblsync`：它把 information_schema
+    // 的 `COLUMN_TYPE` 与定义做同一套归一化后再判缺失（`int(11)` 与 `int`
+    // 视为同类型），避免这里再写一份类型比对逻辑。`ensure_columns` 是
+    // **只补不改**语义，与「一键迁移不该动已有列定义」的约定一致。
+    let migrator = rustcms_ext::tblsync::Migrator::new(pool.clone());
     let mut added_columns = Vec::new();
     if table_exists(pool, "users").await? {
-        let added = ensure_column(
-            pool,
-            "users",
+        let api_token = rustcms_ext::tblsync::ColumnDef::typed(
             "api_token",
-            "ALTER TABLE `users` ADD COLUMN `api_token` varchar(64) NOT NULL DEFAULT ''",
+            rustcms_ext::tblsync::SqlType::Varchar(64),
         )
-        .await?;
-        if added {
-            added_columns.push("users.api_token");
+        .not_null()
+        .with_default("''");
+        for column in migrator.ensure_columns("users", &[api_token]).await? {
+            added_columns.push(format!("users.{column}"));
         }
     }
 

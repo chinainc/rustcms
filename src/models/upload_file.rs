@@ -1,4 +1,4 @@
-//! 验证文件上传（`pluginFileUpload.go`）。
+//! 验证文件上传。
 //!
 //! 用于放搜索引擎/第三方平台要求的校验文件（`BingSiteAuth.xml` 之类），
 //! 只允许 `txt / htm / html / xml`，且**必须落在 `public` 根目录**（不能带路径）。

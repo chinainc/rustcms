@@ -1,6 +1,6 @@
 //! 301 跳转（表 `redirects`，`from_url` 唯一）。
 //!
-//! 对齐 Go 版 `controller/manageController/pluginRedirect.go`：
+//! 行为约定：
 //! - 来源/目标地址都会补前导 `/`（以 `http` 开头的保持原样）；
 //! - 来源与目标不能相同；
 //! - 新增时来源已存在则复用那条记录（相当于更新目标）；
@@ -147,7 +147,7 @@ pub async fn save(pool: &MySqlPool, input: &RedirectInput) -> Result<Redirect, M
             .ok_or_else(|| ModelError::invalid("链接不存在"));
     }
 
-    // 未指定 id：来源已存在就更新它（与 Go 行为一致）
+    // 未指定 id：来源已存在就更新它（与既有接口契约一致）
     if let Some(exists) = get_by_from(pool, &from_url).await? {
         sqlx::query("UPDATE redirects SET updated_time = ?, to_url = ? WHERE id = ?")
             .bind(now)

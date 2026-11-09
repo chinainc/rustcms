@@ -1,8 +1,6 @@
 //! 后台统计与版本信息。
 //!
-//! 对应 Go 版 `manageController/common.go` 的 `Version` /
-//! `GetStatisticsSummary` / `GetStatisticsDashboard`（实体逻辑在
-//! `provider/statistics.go`）。
+//! 版本信息与两个统计视图（概览 / 仪表盘）。
 
 use serde::Serialize;
 use serde_json::Value;
@@ -10,7 +8,7 @@ use sqlx::mysql::MySqlPool;
 
 /// 当前程序版本号（暂等于 crate 版本）。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// 是否试用版（与 Go 的 `config.Trial` 对齐，当前恒为 false）。
+/// 是否试用版（与既有约定对齐，当前恒为 false）。
 pub const TRIAL: bool = false;
 
 /// `GET /system/api/version/info` 的 data。

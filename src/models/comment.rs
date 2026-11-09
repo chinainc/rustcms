@@ -1,7 +1,7 @@
-//! 评论（`comments` 表，`pluginComment.go`）。
+//! 评论（`comments` 表，既有约定）。
 //!
 //! `status`：0 = 待审核，1 = 正常。
-//! 后台改内容时会**强制置为正常**并把正文做 HTML 转义（防 XSS），与 Go 一致。
+//! 后台改内容时会**强制置为正常**并把正文做 HTML 转义（防 XSS），与既有接口契约一致。
 
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ pub struct Comment {
     pub rating: i8,
 }
 
-/// HTML 转义（对应 Go 的 `html.EscapeString`）。
+/// HTML 转义。
 pub fn escape_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -48,8 +48,6 @@ pub fn escape_html(input: &str) -> String {
 }
 
 /// 把「孤立的」`&nbsp;` 换成普通空格（连续多个保留原样）。
-///
-/// 对应 Go 的 `library.ReplaceSingleSpace`。
 pub fn replace_single_space(input: &str) -> String {
     const MARK: &str = "&nbsp;";
     let mut out = String::with_capacity(input.len());

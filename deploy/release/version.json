@@ -1,0 +1,27 @@
+{
+    "name":  "rustcms",
+    "version":  "1.1.6",
+    "date":  "2026-11-12",
+    "url":  "rustcms-v1.1.6.zip",
+    "checksum":  "sha256:89715c10d47301df75ad7720b633bf3242481654de30c0361589b3f6f9745894",
+    "note":  "RustCMS 1.1.6 发行包：编译产物、模板、静态资源与在线升级能力。",
+    "sql":  [
+                "deploy/sql/rustcms-install.sql"
+            ],
+    "packages":  {
+                     "windows":  {
+                                     "url":  "rustcms-v1.1.6-windows-upgrade.zip",
+                                     "checksum":  "sha256:89715c10d47301df75ad7720b633bf3242481654de30c0361589b3f6f9745894"
+                                 },
+                     "linux":  {
+                                   "url":  "rustcms-v1.1.6-linux-upgrade.zip",
+                                   "checksum":  "sha256:cd12092ec9f9e3f1214a71e3376d681414eb25945bd8aacba45907da6a09267f"
+                               }
+                 },
+    "install":  {
+                    "windows_file":  "rustcms-v1.1.6-windows.zip",
+                    "windows_sha256":  "766ec4a9693c6acaaca4f8c806c841eb0b51e8f7533cea6530cb16247b3cac08",
+                    "linux_amd64_file":  "rustcms-v1.1.6-linux-amd64.tar.gz",
+                    "linux_amd64_sha256":  "5fff0592aff901e789b893cca1699e734ee4fdd541f11444ff36772a231dcc70"
+                }
+}

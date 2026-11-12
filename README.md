@@ -15,6 +15,15 @@
 
 ---
 
+## 联系方式
+
+| 渠道 | 地址 |
+|---|---|
+| 官网 | [www.tma.cn/rustcms](https://www.tma.cn/rustcms) |
+| 微信 | weninc |
+
+---
+
 ## 目录结构
 
 ```

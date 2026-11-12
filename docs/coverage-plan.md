@@ -89,7 +89,7 @@ Part 2 的设置与设计体量最大、联动最多；Part 3/4/5 多为独立�
 
 | 模块 | 能力 | 已知边界 |
 |---|---|---|
-| 统计 | `statistic/spider`、`traffic`（`statistic_logs` 的 JSON 列）、`dates`（`data/statistic/*.log` 文件名）、`detail`（按行解析日志、按 `type` 过滤、倒序分页）、`include` / `include/detail`（`spider_includes`） | — |
+| 统计 | `statistic/spider`、`traffic`、`include` 支持 `days` 参数（1~365，默认 30；前端工具条切换 7/30/90 天）；`dates`（`data/statistic/*.log` 只列 `YYYYMMDD` 日期文件）、`detail`（按行解析日志、按 `type` 过滤、`q` 关键词匹配 URL/IP/域名/UA/蜘蛛/设备、倒序分页，日期参数校验防路径穿越）、`detail/export`（CSV，UTF-8 BOM）、`include/detail`（`spider_includes`，当天无快照时补采一次）、`include/collect`（POST 手动采集，互斥锁防重复）。采集链路：前台请求写 `data/statistic/<日期>.log`（蜘蛛/设备/URL/UA 截 250 字节）→ 后台每 10 分钟聚合到 `statistic_logs` → 每天 8 点（服务启动时补一次）抓取五大引擎收录数到 `spider_includes`，并清理 31 天前明细日志。前端增强见 `public/system/statistic-entry.js`（天数切换/关键词搜索/CSV 导出/手动更新收录工具条，通过 hook XHR/fetch 给接口附带参数） | — |
 | 设置 | 23 个动作：`system` / `content` / `index` / `contact` / `safe` / `ai` 读写（字段级 merge）、`cache`（读清理时间 + 切换 `cache_type`）、`diyfield`（数组整份覆盖）、`favicon` 上传 / 删除、`banner` 增改删 | 缩略图重建未做；`AutoMigrateDB` 由 2.9 的 `ensure_columns` 承接 |
 | 会员认证 | `plugin/userauth/{list,detail,audit}`（`user_auths` 表，`0/1/-1` 状态，驳回必填原因，记 `audit_time` / `audit_admin_id`） | — |
 | 站点 | `website/{list,info,save,delete}` + `siteinfo`（`websites` 表 CRUD，站点 1 的 mysql 取 `config.json` 且抹掉密码） | `website/login`（子站切换登录）与真正的多站点数据隔离未实现——当前单连接池 |
@@ -253,6 +253,7 @@ Rust 侧字段改名 `kind` 且要同时 `#[serde(rename = "type")] #[sqlx(renam
 | 会员令牌解析 | header `token` > `Authorization: Bearer` > cookie `token`；JWT 有效且会员启用时注入 `userId/userInfo/userGroup` 到模板上下文；过期前 1 小时回 `update-token` 续签头；JWT 无效回退 `users.api_token`；**账号被禁用直接回 `{"code":1001,"msg":"ThisAccountHasBeenDisabled"}` 并中断** |
 | 整管线超时 | `tokio::time::timeout(30s)`，超时 408 |
 | 静态文件服务 | `public_dir`（`config.json`，默认 `../public`）下的真实文件按扩展名回 Content-Type；逐段防路径穿越；`favicon.ico` 缺文件回 400；`robots.txt` 缺文件回默认内容。**放在 DB 检查之前**（静态资源不依赖库） |
+| 商家工作台 | 精确路由 `/business`（301 到 `/business/`）、`/business/`（出 `public/business/index.html`）、`/business/*rest`（转 `serve_file` 直出子资源，缺失 404）。页面与静态资源都在 `public/business/` 下，随完整安装包分发（对齐 anqicms 3.6.9；axum 0.7 的 catch-all 不命中 `/business/`，须显式注册） |
 | 闭站 / 屏蔽判定 | `settings.system.site_close`（1=全关，2=仅蜘蛛可见）、`ban_spider`、`safe.ua_forbidden`、`safe.ip_forbidden`（前缀匹配、去掩码与 `.0`、放行 127.0.0.1）；闭站页渲染 `errors/close.html` 或纯提示，403 |
 | 路由解析 | 规则顺序：search → archiveIndex → peopleIndex/people → tagIndex → tag → page → category → archive；每条命中都做存在性校验（module 按 `url_token`、category 按 type/status、archive 校验 module/catname 对应关系，对不上直接 404）；固化链接 `archives.fixed_link` 优先 |
 | 404 / 500 | `errors/404.html` / `errors/500.html` 渲染失败时退回内联 HTML 提示页 |
@@ -356,7 +357,8 @@ Rust 侧字段改名 `kind` 且要同时 `#[serde(rename = "type")] #[sqlx(renam
   - `sitemap-archive-{N}.{type}`：文档按 `page_size` 分片；
   - `sitemap-tag-{N}.{type}`：标签按 `page_size` 分片，`exclude_tag` 时整体跳过；
   - `sitemap.{type}`：index（xml 为 `<sitemapindex>`，txt 每行一个子文件 URL）。
-- txt 子文件为 CRLF 连接的 loc（无末尾换行）；xml 子文件与 index 带样式表引用。
+- txt 子文件为 CRLF 连接的 loc（无末尾换行）；xml 子文件与 index **不再带 xsl 样式表引用**
+  （对齐 anqicms 的 e203813，`public/rust-index.xsl` / `rust-style.xsl` 已删除）。
 - 生成前清理同类型旧分片，避免分页减少后残留。
 - `cache/sitemap-time.log` 内容为 Unix 秒，mtime 继续被 `sitemap_time` 读取。
 - 前台 `sitemap*` 文件缺失时自动重建并返回（含子文件请求）。

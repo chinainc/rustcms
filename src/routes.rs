@@ -33,6 +33,12 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/preview/list/:cid", get(preview_list))
+        // 商家工作台：页面与资源都在 public/business/ 下，子资源在处理器里转 FileServe，
+        // 这里只兜目录地址（`/business` 301 到 `/business/`，`/business/` 出 index.html）。
+        // ⚠️ axum 0.7 的 catch-all 不命中 `/business/`（落到 fallback 变 404），必须显式注册。
+        .route("/business", get(crate::front::business_page))
+        .route("/business/", get(crate::front::business_page))
+        .route("/business/*rest", get(crate::front::business_page))
         .nest("/api", api_router())
         // 后台接口的真实前缀是 `/system/api/...`
         .nest("/system/api", manage_router())
@@ -1266,6 +1272,14 @@ fn manage_router() -> Router<AppState> {
             "/statistic/include/detail",
             get(manage_statistic_include_detail),
         )
+        .route(
+            "/statistic/detail/export",
+            get(manage_statistic_detail_export),
+        )
+        .route(
+            "/statistic/include/collect",
+            post(manage_statistic_include_collect),
+        )
         .route("/captcha", get(manage_captcha))
         .route("/module/list", get(manage_module_list))
         .route(
@@ -1329,9 +1343,6 @@ fn manage_router() -> Router<AppState> {
         .route("/anqi/skill/edit", post(manage_skill_edit))
         .route("/anqi/skill/delete", post(manage_skill_delete))
         .route("/anqi/skill/reload", post(manage_skill_reload))
-        .route("/anqi/info", get(manage_cloud_info))
-        .route("/anqi/check", get(manage_cloud_check))
-        .route("/anqi/login", post(manage_cloud_login))
         .route("/anqi/upload", post(manage_cloud_upload))
         .route("/anqi/template/share", post(manage_cloud_template_share))
         .route("/anqi/template/download", post(manage_cloud_template_download))
@@ -1367,6 +1378,10 @@ fn manage_router() -> Router<AppState> {
         .route(
             "/setting/content",
             get(manage_setting_content).post(manage_setting_content_save),
+        )
+        .route(
+            "/setting/front",
+            get(manage_setting_front).post(manage_setting_front_save),
         )
         .route("/setting/thumb/rebuild", post(manage_setting_thumb_rebuild))
         .route(
@@ -1902,6 +1917,13 @@ struct ExactQuery {
     exact: Option<String>,
 }
 
+/// 统计图表通用参数：`days` 回看天数（1~365，默认 30）。
+#[derive(Debug, Deserialize, Default)]
+struct StatisticChartQuery {
+    #[serde(default)]
+    days: Option<i64>,
+}
+
 fn query_bool(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
@@ -1941,30 +1963,62 @@ async fn manage_statistic_dashboard(State(state): State<AppState>, headers: Head
     }
 }
 
-/// `GET /system/api/statistic/spider`
-async fn manage_statistic_spider(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `GET /system/api/statistic/spider?days=30`
+async fn manage_statistic_spider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StatisticChartQuery>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match statistic::chart_spider(pool).await {
-        Ok(data) => ok(data),
+    match statistic::chart_spider(pool, query.days.unwrap_or(30)).await {
+        Ok(data) if !data.is_empty() => ok(data),
+        Ok(_) => {
+            // 图表无数据：先聚合一次访问日志再取（口径同 anqicms 首次访问现算）
+            let dir = statistic_dir(&state);
+            statistic::ensure_dir(&dir);
+            if let Err(err) = statistic::calc_statistics(pool, &dir).await {
+                tracing::warn!("访问统计聚合失败：{err:#}");
+            }
+            match statistic::chart_spider(pool, query.days.unwrap_or(30)).await {
+                Ok(data) => ok(data),
+                Err(err) => failed(err),
+            }
+        }
         Err(err) => failed(err),
     }
 }
 
-/// `GET /system/api/statistic/traffic`
-async fn manage_statistic_traffic(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `GET /system/api/statistic/traffic?days=30`
+async fn manage_statistic_traffic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StatisticChartQuery>,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match statistic::chart_traffic(pool).await {
-        Ok(data) => ok(data),
+    match statistic::chart_traffic(pool, query.days.unwrap_or(30)).await {
+        Ok(data) if !data.is_empty() => ok(data),
+        Ok(_) => {
+            // 图表无数据：先聚合一次访问日志再取（口径同 anqicms 首次访问现算）
+            let dir = statistic_dir(&state);
+            statistic::ensure_dir(&dir);
+            if let Err(err) = statistic::calc_statistics(pool, &dir).await {
+                tracing::warn!("访问统计聚合失败：{err:#}");
+            }
+            match statistic::chart_traffic(pool, query.days.unwrap_or(30)).await {
+                Ok(data) => ok(data),
+                Err(err) => failed(err),
+            }
+        }
         Err(err) => failed(err),
     }
 }
@@ -1992,6 +2046,9 @@ struct StatisticDetailQuery {
     date: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    /// 关键词：按 URL/IP/域名/UA/蜘蛛/设备模糊匹配
+    #[serde(default)]
+    q: Option<String>,
 }
 
 /// `GET /system/api/statistic/detail`
@@ -2008,6 +2065,7 @@ async fn manage_statistic_detail(
         &dir,
         query.date.as_deref().unwrap_or(""),
         query.kind.as_deref().unwrap_or(""),
+        query.q.as_deref().unwrap_or(""),
         query.current.unwrap_or(1),
         query.page_size.unwrap_or(20),
     );
@@ -2020,16 +2078,142 @@ async fn manage_statistic_detail(
     .into_response()
 }
 
-/// `GET /system/api/statistic/include`
-async fn manage_statistic_include(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `GET /system/api/statistic/detail/export?date=&type=&q=`
+///
+/// 按当前筛选导出全天明细为 CSV（带 UTF-8 BOM，Excel 可直接打开）。
+async fn manage_statistic_detail_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StatisticDetailQuery>,
+) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let dir = statistic_dir(&state);
+    let records = statistic::collect_detail(
+        &dir,
+        query.date.as_deref().unwrap_or(""),
+        query.kind.as_deref().unwrap_or(""),
+        query.q.as_deref().unwrap_or(""),
+    );
+
+    // 日期已校验为 8 位数字，文件名只需 ASCII 安全字符
+    let date = query
+        .date
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| statistic::is_date_stem(v))
+        .unwrap_or("");
+    let filename = format!("statistic-detail-{date}.csv");
+    let mut csv = String::new();
+    csv.push('\u{feff}');
+    csv.push_str(statistic::DETAIL_CSV_HEADER);
+    csv.push('\n');
+    for item in &records {
+        let field = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .replace('"', "\"\"")
+        };
+        let time = item
+            .get("created_time")
+            .and_then(Value::as_i64)
+            .map(|ts| {
+                chrono::DateTime::from_timestamp(ts, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let code = item
+            .get("http_code")
+            .and_then(Value::as_i64)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        csv.push_str(&format!(
+            "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
+            time,
+            field("host"),
+            field("url"),
+            field("ip"),
+            field("device"),
+            field("spider"),
+            code,
+            field("user_agent"),
+        ));
+    }
+
+    let disposition = format!(
+        "attachment; filename=\"rustcms-detail.csv\"; filename*=UTF-8''{}",
+        filename
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, disposition.as_str()),
+        ],
+        csv,
+    )
+        .into_response()
+}
+
+/// 收录手动采集的互斥锁：避免同时点多次按钮重复请求搜索引擎。
+fn include_collect_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// `POST /system/api/statistic/include/collect`
+///
+/// 立即采集一次搜索引擎收录量（口径同每天 8 点的定时任务），完成后前端刷新页面。
+async fn manage_statistic_include_collect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(res) = require_admin(&state, &headers).await {
         return *res;
     }
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    match statistic::chart_include(pool).await {
-        Ok(data) => ok(data),
+    let _guard = include_collect_lock().lock().await;
+    match statistic::query_spider_include(pool).await {
+        Ok(()) => ok(json!({"collected": true})),
+        Err(err) => failed(err),
+    }
+}
+
+/// `GET /system/api/statistic/include?days=30`
+async fn manage_statistic_include(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StatisticChartQuery>,
+) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    match statistic::chart_include(pool, query.days.unwrap_or(30)).await {
+        Ok(data) if !data.is_empty() => ok(data),
+        Ok(_) => {
+            // 当天还没有收录快照：补采一次再取（口径同 anqicms 每天 8 点任务；
+            // 服务刚启动、任务失败或数据库晚于定时任务连上时都能兜底）。
+            // 单次请求最多等 12 秒，外网不可达时仍回空列表，不把接口拖死。
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                statistic::ensure_daily_include(pool),
+            )
+            .await;
+            if let Ok(Err(err)) = fetched {
+                tracing::warn!("搜索引擎收录量采集失败：{err:#}");
+            }
+            match statistic::chart_include(pool, query.days.unwrap_or(30)).await {
+                Ok(data) => ok(data),
+                Err(err) => failed(err),
+            }
+        }
         Err(err) => failed(err),
     }
 }
@@ -2256,6 +2440,39 @@ struct ManageCategoryQuery {
     title: Option<String>,
 }
 
+/// 给分类行/树补 `link`（前台地址）与 `spacer`（每层一个 `└－`）。
+///
+/// 后台分类列表的标题链接直接读 `row.link`（`<a href={row.link} target="_blank">`），
+/// 树形缩进读 `row.spacer`；缺失时链接会变成 `undefined`（相对解析到 /system 下）、
+/// 层级也拉平。口径同 anqicms：`GetUrl("category", ...)` + `getTreeNodeRecursive` 的
+/// `Spacer = 父级 add + "└－"`。
+fn decorate_category_rows(
+    value: &mut Value,
+    depths: &std::collections::HashMap<u32, usize>,
+    links: &std::collections::HashMap<u32, String>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(id) = map.get("id").and_then(Value::as_u64).map(|id| id as u32) {
+                if let Some(link) = links.get(&id) {
+                    map.insert("link".to_string(), Value::String(link.clone()));
+                }
+                let spacer = "└－".repeat(depths.get(&id).copied().unwrap_or(0));
+                map.insert("spacer".to_string(), Value::String(spacer));
+            }
+            if let Some(children) = map.get_mut("children") {
+                decorate_category_rows(children, depths, links);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                decorate_category_rows(item, depths, links);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `GET /system/api/category/list`
 async fn manage_category_list(
     State(state): State<AppState>,
@@ -2315,10 +2532,47 @@ async fn manage_category_list(
     } else {
         query.show_type.unwrap_or(0)
     };
+
+    // 标题链接与缩进：link = 前台地址（kind=3 单页走单页地址），spacer = "└－" × 层级。
+    let builder =
+        crate::models::front_content::LinkBuilder::load(pool).await.unwrap_or_default();
+    let by_id: std::collections::HashMap<u32, &Category> =
+        all.iter().map(|item| (item.id, item)).collect();
+    let mut depths: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for item in &all {
+        let mut depth = 0usize;
+        let mut parent = Some(item.parent_id);
+        while let Some(pid) = parent {
+            if pid == 0 || depth > 20 {
+                break;
+            }
+            depth += 1;
+            parent = by_id.get(&pid).map(|row| row.parent_id);
+        }
+        depths.insert(item.id, depth);
+    }
+    let links: std::collections::HashMap<u32, String> = all
+        .iter()
+        .map(|item| {
+            let link =
+                if item.kind == 3 { builder.page(item) } else { builder.category(item) };
+            (item.id, link)
+        })
+        .collect();
+
     if show_type == 0 {
-        ok(category::tree(&list))
+        let mut tree = serde_json::to_value(category::tree(&list)).unwrap_or_else(|_| json!([]));
+        decorate_category_rows(&mut tree, &depths, &links);
+        ok(tree)
     } else {
-        ok(list)
+        let mut rows: Vec<Value> = match serde_json::to_value(&list) {
+            Ok(Value::Array(items)) => items,
+            _ => Vec::new(),
+        };
+        for row in &mut rows {
+            decorate_category_rows(row, &depths, &links);
+        }
+        ok(rows)
     }
 }
 
@@ -3072,14 +3326,98 @@ async fn manage_archive_list(
     let order = archive::Order::parse(params.order.as_deref().unwrap_or_default());
 
     match archive::list(pool, &query, order, page, page_size).await {
-        Ok(result) => Json(json!({
-            "code": 0,
-            "msg": "",
-            "total": result.total,
-            "limit": page_size,
-            "data": result.list,
-        }))
-        .into_response(),
+        Ok(result) => {
+            // SPA 列表页的标题链接读 `row.link`（`<a href={row.link} target="_blank">`），
+            // 缺失时 href 变成 `undefined`（未发布行还会拼 `undefined?preview=true`），
+            // 相对解析到 /system 下点进去就是错地址。这里按前台口径补上：
+            // fixed_link 非空优先（与模板渲染 site_provider::link_for 同口径），否则按
+            // 伪静态模式 + 栏目/模型别名生成详情页地址。
+            let builder =
+                crate::models::front_content::LinkBuilder::load(pool).await.unwrap_or_default();
+            // SPA 列表页的「缩略图 / 所属模型 / 分类」三列读
+            // `row.thumb` / `row.module_name` / `row.category_titles`，
+            // 库表行没有这三个派生字段，缺了列就显示空白 —— 这里按展示口径补齐。
+            let categories = category::list_all(pool).await.unwrap_or_default();
+            let cat_map: std::collections::HashMap<u32, (&str, u32)> = categories
+                .iter()
+                .map(|item| (item.id, (item.title.as_str(), item.parent_id)))
+                .collect();
+            let module_names: std::collections::HashMap<u32, String> =
+                crate::models::module::list(pool)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|item| (item.id, item.title))
+                    .collect();
+            let public_dir = state.with_config(|config| config.public_dir());
+            let rows: Vec<Value> = result
+                .list
+                .iter()
+                .map(|item| {
+                    let mut value = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
+                    let link = item
+                        .fixed_link
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|link| !link.is_empty())
+                        .map(|link| link.to_string())
+                        .unwrap_or_else(|| builder.archive(item));
+                    if let Value::Object(map) = &mut value {
+                        map.insert("link".to_string(), Value::String(link));
+                        // 正式表都是已发布（SPA 用 status 判断是否拼 ?preview=true，
+                        // 缺字段会让每条链接都带上它，且状态列显示空白）
+                        map.insert("status".to_string(), Value::from(1));
+                        // 所属模型：modules.title
+                        map.insert(
+                            "module_name".to_string(),
+                            json!(module_names.get(&item.module_id).cloned().unwrap_or_default()),
+                        );
+                        // 分类标题链（父级在前、自身在后），SPA 逐行渲染
+                        let mut titles: Vec<String> = Vec::new();
+                        let mut cursor = item.category_id;
+                        let mut depth = 0;
+                        while cursor > 0 && depth < 8 {
+                            match cat_map.get(&cursor) {
+                                Some((title, parent)) => {
+                                    titles.push((*title).to_string());
+                                    cursor = *parent;
+                                }
+                                None => break,
+                            }
+                            depth += 1;
+                        }
+                        titles.reverse();
+                        map.insert("category_titles".to_string(), json!(titles));
+                        // 缩略图：同目录 `thumb_` 前缀的缩略图（存在才用），否则原图；
+                        // 外链图片原样返回
+                        let cover = item.cover();
+                        let thumb = if cover.is_empty() {
+                            String::new()
+                        } else if cover.starts_with("http://") || cover.starts_with("https://") {
+                            cover
+                        } else {
+                            let thumb = thumb_path_of(&cover);
+                            let rel = thumb.trim_start_matches('/');
+                            if public_dir.join(rel).exists() {
+                                thumb
+                            } else {
+                                cover
+                            }
+                        };
+                        map.insert("thumb".to_string(), Value::String(thumb));
+                    }
+                    value
+                })
+                .collect();
+            Json(json!({
+                "code": 0,
+                "msg": "",
+                "total": result.total,
+                "limit": page_size,
+                "data": rows,
+            }))
+            .into_response()
+        }
         Err(err) => failed(err),
     }
 }
@@ -3887,60 +4225,6 @@ fn fail_ai(msg: impl Into<String>) -> Response {
     Json(json!({ "code": -1, "msg": msg.into() })).into_response()
 }
 
-/// 回云端服务登录态（`valid` 在 `cloud::auth_info_get` 里现算）。
-async fn cloud_info_body(pool: &sqlx::MySqlPool) -> Response {
-    match cloud::auth_info_get(pool).await {
-        Ok(value) => ok(value),
-        Err(err) => failed(err),
-    }
-}
-
-/// `GET /system/api/anqi/info`
-///
-/// 按 `GetCloudInfo` 的语义：**异步**触发一次云端校验，
-/// 立刻返回站内已存的登录态，不等外呼结果。
-async fn manage_cloud_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(res) = require_admin(&state, &headers).await {
-        return *res;
-    }
-    let Some(pool) = state.db() else {
-        return fail(NO_DB);
-    };
-    let check_pool = pool.clone();
-    tokio::spawn(async move {
-        if let Err(err) = cloud::auth_check(&check_pool, false).await {
-            // 网络问题不该让管理页报错：只留日志后照常返回
-            tracing::warn!("云端服务登录态异步校验失败：{err}");
-        }
-    });
-    cloud_info_body(pool).await
-}
-
-/// `GET /system/api/anqi/check`
-///
-/// 按 `CheckCloudInfo` 的语义：**同步**校验后再返回登录态；
-/// 校验失败同样不报错，仍回当前站内状态。
-async fn manage_cloud_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(res) = require_admin(&state, &headers).await {
-        return *res;
-    }
-    let Some(pool) = state.db() else {
-        return fail(NO_DB);
-    };
-    if let Err(err) = cloud::auth_check(pool, true).await {
-        tracing::warn!("云端服务登录态校验失败：{err}");
-    }
-    cloud_info_body(pool).await
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct CloudLoginBody {
-    #[serde(default)]
-    user_name: String,
-    #[serde(default)]
-    password: String,
-}
-
 // ---------------------------- 云端服务客户端 ---------------------------------
 //
 // 请求全部打到云端服务 API 根地址，统一带
@@ -3975,12 +4259,6 @@ async fn cloud_cloud_headers(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
             format!("rustcms/{}", env!("CARGO_PKG_VERSION")),
         ),
     ]
-}
-
-/// 云端账号绑定校验：`ai/chat` 与 AI 写作/流式入口共用，文案保持一致。
-async fn ensure_cloud_bound(_pool: &sqlx::MySqlPool) -> Result<(), String> {
-    // 本地版不再限制云端账号绑定
-    Ok(())
 }
 
 /// 解析云端信封（解析与错误码口径统一交给 `cloud::parse_envelope`）。
@@ -4068,12 +4346,6 @@ async fn cloud_cloud_upload(
         .await
         .map_err(|err| format!("云端服务请求失败：{err}"))?;
     cloud_cloud_envelope(&response)
-}
-
-/// 云端账号登录态校验（`AuthId == 0` → 提示先登录）。
-async fn cloud_require_login(_pool: &sqlx::MySqlPool) -> CloudResult<()> {
-    // 本地版不再限制云端账号登录
-    Ok(())
 }
 
 /// 递归收集目录下所有文件。
@@ -4284,28 +4556,6 @@ async fn cloud_translate_strings(
     Ok(out)
 }
 
-/// `POST /system/api/anqi/login`
-///
-/// 按 `CloudLogin` 的语义：账号密码提交云端 `/login`，成功后把云端返回的
-/// `CloudUserConfig` 落到 `settings.anqi`（含 `login_time` / `check_time`），
-/// 失败时本地登录态已被清空（不留上一个账号的 token）。
-async fn manage_cloud_login(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<CloudLoginBody>,
-) -> Response {
-    if let Err(res) = require_admin(&state, &headers).await {
-        return *res;
-    }
-    let Some(pool) = state.db() else {
-        return fail(NO_DB);
-    };
-    match cloud::login(pool, &body.user_name, &body.password).await {
-        Ok(info) => ok(info),
-        Err(msg) => fail_ai(msg),
-    }
-}
-
 /// `POST /system/api/anqi/upload`
 async fn manage_cloud_upload(
     State(state): State<AppState>,
@@ -4342,9 +4592,6 @@ async fn manage_cloud_upload(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = cloud_require_login(pool).await {
-        return fail_ai(msg);
-    }
     match cloud_cloud_upload(pool, &file_name, &data).await {
         Ok(value) => Json(json!({
             "code": 0,
@@ -4380,9 +4627,6 @@ async fn manage_cloud_template_share(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = cloud_require_login(pool).await {
-        return fail_ai(msg);
-    }
     let store = design_store(&state);
     // 先确认模板存在并读出现有配置（`GetDesignInfo(package)` 的语义）
     let info = match store.get(&package, true) {
@@ -4531,9 +4775,6 @@ async fn manage_cloud_feedback(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = cloud_require_login(pool).await {
-        return fail_ai(msg);
-    }
     // `CloudSendFeedback`：补上版本 / 平台 / 域名后透传
     let mut payload = body.clone();
     if let Value::Object(map) = &mut payload {
@@ -4864,9 +5105,6 @@ async fn manage_cloud_ai_stream(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = ensure_cloud_bound(pool).await {
-        return fail_ai(msg);
-    }
     let demand = body
         .get("demand")
         .and_then(Value::as_str)
@@ -5081,7 +5319,6 @@ async fn resolve_ai_provider(
         .unwrap_or("")
         .trim()
         .to_string();
-    ensure_cloud_bound(pool).await?;
     // 没有 token 时网关必然 401：本地就拦下，别白发一次 300 秒超时的请求
     if token.is_empty() {
         return Err("请先登录云端服务账号后再使用云端 AI 模型".to_string());
@@ -6065,6 +6302,32 @@ async fn manage_setting_content_save(
     Json(body): Json<Value>,
 ) -> Response {
     write_setting_section(&state, &headers, site_setting::CONTENT, &body).await
+}
+
+/// `GET /system/api/setting/front`：前台展示配置，未配置时返回默认值（可直接改后保存）。
+async fn manage_setting_front(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(res) = require_admin(&state, &headers).await {
+        return *res;
+    }
+    let Some(pool) = state.db() else {
+        return fail(NO_DB);
+    };
+    match site_setting::get_front_ui(pool).await {
+        Ok(value) => ok(value),
+        Err(err) => failed(err),
+    }
+}
+
+/// `POST /system/api/setting/front`：字段级合并保存前台展示配置。
+async fn manage_setting_front_save(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !body.is_object() {
+        return fail("配置格式错误");
+    }
+    write_setting_section(&state, &headers, site_setting::FRONT, &body).await
 }
 
 /// 缩略图文件路径（与原图同目录，文件名前加 `thumb_`）。
@@ -14674,9 +14937,6 @@ async fn manage_aigenerate_article_collect(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = ensure_cloud_bound(pool).await {
-        return fail(msg);
-    }
     let keyword = if !body.title.trim().is_empty() {
         let title = body.title.trim();
         match collector::ensure_keyword(pool, title).await {
@@ -14727,9 +14987,6 @@ async fn manage_aigenerate_article_start(
     let Some(pool) = state.db() else {
         return fail(NO_DB);
     };
-    if let Err(msg) = ensure_cloud_bound(pool).await {
-        return fail(msg);
-    }
     let pool = pool.clone();
     tokio::spawn(async move {
         let keywords = match collector::pending_keywords(&pool, 5).await {
@@ -19519,6 +19776,13 @@ mod tests {
         let list = body["data"].as_array().unwrap();
         assert!(!list.is_empty(), "库里应有内容分类");
         assert!(list.iter().all(|item| item["type"] == 1), "{body}");
+        // 每行必须带 `link`（SPA 标题链接直接用它）与 `spacer`（树形缩进）
+        assert!(
+            list.iter()
+                .all(|item| { item["link"].as_str().map(|s| !s.is_empty()).unwrap_or(false) }),
+            "分类列表行应带非空 link：{body}"
+        );
+        assert!(list[0]["spacer"].is_string(), "分类列表行应带 spacer：{body}");
 
         // 模型详情
         let res = app
@@ -19670,6 +19934,99 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0, "分类应已删除");
 
+        drop_temp_admin(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn front_ui_setting_drives_home_template() {
+        let _guard = crate::models::db_lock().await;
+        let Some(pool) = crate::models::test_pool().await else {
+            return;
+        };
+        let name = "rustcms_front_admin";
+        seed_temp_admin(&pool, 990007, name, "front-pass-123").await;
+        let Some(app) = test_app().await else {
+            return;
+        };
+        let token = login_admin(&app, "10.9.9.4", name, "front-pass-123").await;
+
+        let backup = crate::models::setting::get_raw(&pool, site_setting::FRONT).await.unwrap();
+        crate::models::setting::remove(&pool, site_setting::FRONT).await.unwrap();
+
+        // 1) 未配置：GET 返回默认值（blocks / hero 齐全）
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "GET",
+                "/system/api/setting/front",
+                &token,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["blocks"]["home_news"], json!(true), "{body}");
+        assert_eq!(
+            body["data"]["hero"]["badge"],
+            json!("RustCMS 企业数字化平台"),
+            "{body}"
+        );
+
+        // 2) 保存：隐藏新闻区块 + 改首页角标（字段级 merge）
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "POST",
+                "/system/api/setting/front",
+                &token,
+                json!({
+                    "blocks": {"home_news": false},
+                    "hero": {"badge": "前台设置测试角标"}
+                }),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 0, "{body}");
+
+        // 3) 首页渲染生效：角标替换、新闻区消失、未改的默认区块保留
+        let res = app.clone().oneshot(request("GET", "/")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let html = body_text(res).await;
+        assert!(html.contains("前台设置测试角标"), "front 配置未生效");
+        assert!(!html.contains("新闻与动态"), "home_news=false 未生效");
+        assert!(html.contains("覆盖核心业务场景"), "默认场景区块不应受影响");
+        assert!(html.contains("fs-foot-col"), "页脚栏目不应受影响");
+
+        // 4) 回读：保存值与默认值合并
+        let res = app
+            .clone()
+            .oneshot(bearer_request(
+                "GET",
+                "/system/api/setting/front",
+                &token,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["hero"]["badge"], json!("前台设置测试角标"), "{body}");
+        assert!(
+            body["data"]["hero"]["subtitle"].as_str().unwrap_or("").len() > 0,
+            "默认 subtitle 不应被覆盖：{body}"
+        );
+
+        // 清理
+        match backup {
+            Some(raw) => crate::models::setting::save_raw(&pool, site_setting::FRONT, &raw)
+                .await
+                .unwrap(),
+            None => crate::models::setting::remove(&pool, site_setting::FRONT)
+                .await
+                .unwrap(),
+        }
         drop_temp_admin(&pool).await;
     }
 
@@ -20036,6 +20393,21 @@ mod tests {
         let body = body_json(res).await;
         assert_eq!(body["code"], 0, "{body}");
         assert!(body["total"].as_i64().unwrap() >= 1, "{body}");
+        // 列表行必须带 `link`（SPA 标题链接直接用它），未发布草稿才拼 preview 参数
+        let row = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"].as_i64() == Some(id))
+            .unwrap_or_else(|| panic!("列表应包含新文档 {id}：{body}"));
+        let link = row["link"].as_str().unwrap_or_default();
+        assert!(!link.is_empty(), "列表行应带 link 字段：{row}");
+        assert!(link.starts_with('/') || link.starts_with("http"), "link 应是前台地址：{link}");
+        // 「缩略图 / 所属模型 / 分类」三列的派生字段（缺了列就显示空白）
+        assert!(row.get("thumb").is_some(), "列表行应带 thumb 字段：{row}");
+        assert!(row.get("module_name").is_some(), "列表行应带 module_name 字段：{row}");
+        let titles = row["category_titles"].as_array().cloned().unwrap_or_default();
+        assert!(!titles.is_empty(), "列表行应带 category_titles 字段：{row}");
 
         // 详情
         let res = app
@@ -27041,79 +27413,6 @@ mod tests {
         seed_temp_admin(&pool, 990002, "rustcms_cloud_admin", "cloud-pass-123").await;
         let token = login_admin(&app, "10.13.13.1", "rustcms_cloud_admin", "cloud-pass-123").await;
 
-        let cloud_backup = crate::models::setting::get_raw(&pool, "anqi").await.unwrap();
-        crate::models::setting::remove(&pool, "anqi").await.unwrap();
-
-        // 未登录
-        let res = app
-            .clone()
-            .oneshot(request("GET", "/system/api/anqi/info"))
-            .await
-            .unwrap();
-        assert_eq!(body_json(res).await["code"], 1);
-
-        // info：默认配置 + valid 现算
-        let res = app
-            .clone()
-            .oneshot(bearer_request(
-                "GET",
-                "/system/api/anqi/info",
-                &token,
-                Value::Null,
-            ))
-            .await
-            .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["code"], 0, "{body}");
-        assert_eq!(body["data"]["user_name"], "");
-        assert_eq!(body["data"]["valid"], false);
-
-        // 已过期的登录态 → valid=false
-        crate::models::setting::save_json(
-            &pool,
-            "anqi",
-            &json!({"user_name": "tester", "expire_time": 1}),
-        )
-        .await
-        .unwrap();
-        let res = app
-            .clone()
-            .oneshot(bearer_request(
-                "GET",
-                "/system/api/anqi/check",
-                &token,
-                Value::Null,
-            ))
-            .await
-            .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["code"], 0, "{body}");
-        assert_eq!(body["data"]["user_name"], "tester");
-        assert_eq!(body["data"]["valid"], false);
-
-        // 登录：缺账号 / 缺密码都在本地拦下（不发任何云端请求）
-        for payload in [
-            json!({"user_name": "", "password": ""}),
-            json!({"user_name": "  ", "password": "p"}),
-            json!({"user_name": "u", "password": ""}),
-        ] {
-            let res = app
-                .clone()
-                .oneshot(bearer_request(
-                    "POST",
-                    "/system/api/anqi/login",
-                    &token,
-                    payload.clone(),
-                ))
-                .await
-                .unwrap();
-            let body = body_json(res).await;
-            assert_eq!(body["code"], -1, "{payload}：{body}");
-            assert_eq!(body["msg"], "请输入云端服务账号和密码", "{payload}：{body}");
-        }
-        // 账号密码齐全时会真的外呼云端（auth.本项目.com）：测试不连真网，
-        // 该分支由 `cloud::parse_envelope` / `api_base_from` / `cloud_translate` 的纯逻辑用例覆盖。
-
         // restart：测试构建里必须直接拒绝，绝不能在用例里拉起进程再 `exit(0)`
         let res = app
             .clone()
@@ -27189,10 +27488,6 @@ mod tests {
         assert_eq!(body["msg"], "finished");
         assert_eq!(body["data"], "");
 
-        match cloud_backup {
-            Some(raw) => crate::models::setting::save_raw(&pool, "anqi", &raw).await.unwrap(),
-            None => crate::models::setting::remove(&pool, "anqi").await.unwrap(),
-        }
         drop_temp_admin(&pool).await;
     }
 

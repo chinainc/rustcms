@@ -27,6 +27,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: ServerJson, db: Option<MySqlPool>) -> Self {
         let templates = Engine::new(&config.template_dir);
+        // 记录模板目录：`tr` 标签按它定位语言包（locales/<lang>/default.yml）
+        crate::template::set_template_dir(std::path::Path::new(&config.template_dir));
         Self {
             inner: Arc::new(Inner {
                 config: RwLock::new(config),

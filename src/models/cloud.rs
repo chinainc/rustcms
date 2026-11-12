@@ -2,9 +2,8 @@
 //! `ai_agents` / `ai_agent_logs` / `ai_chat_messages`）。
 //!
 //! 云端服务与 AI 对话的数据访问层：
-//! - 云端服务登录态存 `settings.anqi`。**登录与校验已实现外呼**：
-//! `login` 打云端登录接口并按约定回写 token/过期时间，`auth_check` 支持 force 强校验、
-//! 失败不覆盖本地态；`auth_info_get` 仍保留「读站内已存态并现算 `valid`」的快速路径；
+//! - 云端服务登录态存 `settings.anqi`：`auth_info_get` 读站内已存态并现算 `valid`；
+//! 登录/校验接口已移除（本地版不再绑定云端账号），AI/翻译继续共用 token 等字段；
 //! - 云端通用请求：`cloud_post` / `cloud_post_raw`（地址由 `api_base` 决定，可被
 //! `settings.anqi.api_url` 覆盖），`parse_envelope` 统一解信封；
 //! - 翻译/伪原创走 `cloud_translate`；自建引擎优先时由 `translate` 模块负责；
@@ -55,8 +54,7 @@ fn default_cloud_user() -> Value {
 
 /// 读取站内已存的云端服务登录态，并现算 `valid`。
 ///
-/// 这是**不发起外呼**的快速路径：`GET /anqi/info` 用它。
-/// 需要与云端对账的场景请用 `auth_check(pool, true)`（`GET /anqi/check`）。
+/// 这是**不发起外呼**的快速路径：仅读取站内已存态（AI/翻译等共用 token 字段）。
 pub async fn auth_info_get(pool: &MySqlPool) -> anyhow::Result<Value> {
     let stored = setting::get_json(pool, SETTING_KEY).await?;
     let mut base = default_cloud_user();
@@ -257,104 +255,6 @@ pub async fn cloud_post(pool: &MySqlPool, path: &str, payload: &Value) -> Result
     cloud_post_raw(pool, path, payload)
         .await
         .map_err(|err| err.message())
-}
-
-/// 云端账号登录：先清空本地登录态，成功后再落盘云端返回的账号信息。
-pub async fn login(pool: &MySqlPool, user_name: &str, password: &str) -> Result<Value, String> {
-    let user_name = user_name.trim();
-    if user_name.is_empty() || password.is_empty() {
-        return Err("请输入云端服务账号和密码".to_string());
-    }
-    // 先重置，避免登录失败时还挂着上一个账号的 token
-    setting::save_json(pool, SETTING_KEY, &json!({}))
-        .await
-        .map_err(|err| format!("保存登录态失败：{err}"))?;
-
-    let payload = json!({ "user_name": user_name, "password": password });
-    let value = cloud_post(pool, "/login", &payload).await?;
-
-    let now = chrono::Utc::now().timestamp();
-    let mut stored = value.get("data").cloned().unwrap_or_else(|| json!({}));
-    if !stored.is_object() {
-        stored = json!({});
-    }
-    if let Value::Object(map) = &mut stored {
-        map.insert("login_time".to_string(), json!(now));
-        map.insert("check_time".to_string(), json!(now));
-    }
-    setting::save_json(pool, SETTING_KEY, &stored)
-        .await
-        .map_err(|err| format!("保存登录态失败：{err}"))?;
-    auth_info_get(pool)
-        .await
-        .map_err(|err| format!("读取登录态失败：{err}"))
-}
-
-/// 云端登录态校验。
-///
-/// - `auth_id == 0`（从未登录）直接返回，不发请求；
-/// - `force = false` 且一小时内校验过则跳过（3600 秒节流）；
-/// - 网络失败只更新 `check_time` 并回错误；云端 `code != 0` 清空登录态。
-pub async fn auth_check(pool: &MySqlPool, force: bool) -> Result<(), String> {
-    let info = auth_info_get(pool)
-        .await
-        .map_err(|err| format!("读取云端服务登录态失败：{err}"))?;
-    let auth_id = info.get("auth_id").and_then(Value::as_i64).unwrap_or(0);
-    if auth_id == 0 {
-        return Ok(());
-    }
-    let now = chrono::Utc::now().timestamp();
-    let check_time = info.get("check_time").and_then(Value::as_i64).unwrap_or(0);
-    if !force && check_time > now - 3600 {
-        return Ok(());
-    }
-
-    match cloud_post_raw(pool, "/check", &info).await {
-        Ok(value) => {
-            let mut current = info.clone();
-            if let (Value::Object(map), Some(data)) =
-                (&mut current, value.get("data").filter(|data| data.is_object()))
-            {
-                // 只覆盖云端给了的字段（缺字段保持原值）
-                for key in [
-                    "auth_id",
-                    "user_name",
-                    "expire_time",
-                    "integral",
-                    "status",
-                    "free_token",
-                    "total_token",
-                    "un_pay_token",
-                    "is_owe_fee",
-                    "token",
-                ] {
-                    if let Some(field) = data.get(key) {
-                        map.insert(key.to_string(), field.clone());
-                    }
-                }
-            }
-            if let Value::Object(map) = &mut current {
-                map.insert("check_time".to_string(), json!(now));
-                map.remove("valid"); // valid 永远现算
-            }
-            let _ = setting::save_json(pool, SETTING_KEY, &current).await;
-            Ok(())
-        }
-        Err(CloudError::Rejected { .. }) => {
-            // 云端明确说登录态无效：清空本地登录态
-            let _ = setting::save_json(pool, SETTING_KEY, &json!({})).await;
-            Ok(())
-        }
-        Err(err @ CloudError::Network(_)) => {
-            // 网络问题不代表账号失效：只记一次校验时间，保留登录态
-            let mut current = info;
-            if let Value::Object(map) = &mut current {
-                map.insert("check_time".to_string(), json!(now));
-            }
-            let _ = setting::save_json(pool, SETTING_KEY, &current).await;
-            Err(err.message())
-        }
-    }
 }
 
 /// 云端翻译（云端分支）：整段文本一次性提交。

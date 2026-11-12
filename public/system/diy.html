@@ -410,11 +410,26 @@
             }, 2200);
         }
 
+        // 与后台 SPA 同口径：从 localStorage/sessionStorage 的 `anqi-adminToken`
+        // 读令牌放进 `admin` 请求头（后端 require_admin 只认 admin/Bearer 头，没有会话 cookie）。
+        function adminToken() {
+            try {
+                var raw = window.sessionStorage.getItem('anqi-adminToken')
+                    || window.localStorage.getItem('anqi-adminToken') || '';
+                if (!raw) { return ''; }
+                try {
+                    var v = JSON.parse(raw);
+                    return typeof v === 'string' ? v : '';
+                } catch (e) { return raw; }
+            } catch (e) { return ''; }
+        }
+
         function api(url, options) {
             options = options || {};
             options.credentials = 'same-origin';
+            options.headers = Object.assign({ 'admin': adminToken() }, options.headers || {});
             if (options.body && typeof options.body !== 'string' && !(options.body instanceof FormData)) {
-                options.headers = { 'Content-Type': 'application/json' };
+                options.headers['Content-Type'] = 'application/json';
                 options.body = JSON.stringify(options.body);
             }
             return fetch(url, options).then(function (res) {

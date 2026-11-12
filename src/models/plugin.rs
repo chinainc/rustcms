@@ -290,20 +290,20 @@ pub async fn sitemap_build(
 
     let mut children: Vec<String> = Vec::new();
     let category_name = format!("sitemap-category.{kind}");
-    write_sitemap_urlset(public_dir, &category_name, &kind, &base, &category_urls)?;
+    write_sitemap_urlset(public_dir, &category_name, &kind, &category_urls)?;
     children.push(format!("{base}/{category_name}"));
 
     for (index, chunk) in archive_urls.chunks(page_size).enumerate() {
         let name = format!("sitemap-archive-{}.{kind}", index + 1);
-        write_sitemap_urlset(public_dir, &name, &kind, &base, chunk)?;
+        write_sitemap_urlset(public_dir, &name, &kind, chunk)?;
         children.push(format!("{base}/{name}"));
     }
     for (index, chunk) in tag_urls.chunks(page_size).enumerate() {
         let name = format!("sitemap-tag-{}.{kind}", index + 1);
-        write_sitemap_urlset(public_dir, &name, &kind, &base, chunk)?;
+        write_sitemap_urlset(public_dir, &name, &kind, chunk)?;
         children.push(format!("{base}/{name}"));
     }
-    write_sitemap_index(public_dir, &kind, &base, &children)?;
+    write_sitemap_index(public_dir, &kind, &children)?;
 
     // 生成时间：内容为 Unix 秒，mtime 同样被 sitemap_time 读取
     let _ = std::fs::create_dir_all(cache_dir);
@@ -336,21 +336,18 @@ fn remove_old_sitemap_files(public_dir: &Path, kind: &str) {
     }
 }
 
-/// 写一个 `urlset` 子文件（xml 带 stylesheet；txt 为 CRLF 连接的 loc 列表）。
+/// 写一个 `urlset` 子文件（xml；txt 为 CRLF 连接的 loc 列表）。
 fn write_sitemap_urlset(
     public_dir: &Path,
     name: &str,
     kind: &str,
-    base: &str,
     urls: &[String],
 ) -> Result<(), ModelError> {
     let body = if kind == "xml" {
         let mut output = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <?xml-stylesheet type=\"text/xsl\" href=\"{}/rust-style.xsl\" ?>\n\
              <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
-             xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">\n",
-            xml_escape(base)
+             xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">\n"
         );
         for link in urls {
             output.push_str(&format!("  <url><loc>{}</loc></url>\n", xml_escape(link)));
@@ -368,15 +365,12 @@ fn write_sitemap_urlset(
 fn write_sitemap_index(
     public_dir: &Path,
     kind: &str,
-    base: &str,
     children: &[String],
 ) -> Result<(), ModelError> {
     let body = if kind == "xml" {
         let mut output = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <?xml-stylesheet type=\"text/xsl\" href=\"{}/rust-index.xsl\" ?>\n\
-             <sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
-            xml_escape(base)
+             <sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
         );
         for link in children {
             output.push_str(&format!(
@@ -1257,30 +1251,32 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let urls = vec!["https://a/1".to_string(), "https://a/2".to_string()];
 
-        write_sitemap_urlset(&dir, "sitemap-archive-1.txt", "txt", "https://a", &urls).unwrap();
+        write_sitemap_urlset(&dir, "sitemap-archive-1.txt", "txt", &urls).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("sitemap-archive-1.txt")).unwrap(),
             "https://a/1\r\nhttps://a/2"
         );
 
         let children = vec!["https://a/sitemap-archive-1.txt".to_string()];
-        write_sitemap_index(&dir, "txt", "https://a", &children).unwrap();
+        write_sitemap_index(&dir, "txt", &children).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("sitemap.txt")).unwrap(),
             "https://a/sitemap-archive-1.txt"
         );
 
-        write_sitemap_urlset(&dir, "sitemap-archive-1.xml", "xml", "https://a", &urls[..1])
-            .unwrap();
+        write_sitemap_urlset(&dir, "sitemap-archive-1.xml", "xml", &urls[..1]).unwrap();
         let xml = std::fs::read_to_string(dir.join("sitemap-archive-1.xml")).unwrap();
         assert!(xml.contains("<urlset"), "{xml}");
         assert!(xml.contains("<loc>https://a/1</loc>"), "{xml}");
+        // 对齐 anqicms：sitemap 不再挂 xsl 样式表（e203813）
+        assert!(!xml.contains("xml-stylesheet"), "{xml}");
 
         let children = vec!["https://a/sitemap-archive-1.xml".to_string()];
-        write_sitemap_index(&dir, "xml", "https://a", &children).unwrap();
+        write_sitemap_index(&dir, "xml", &children).unwrap();
         let index = std::fs::read_to_string(dir.join("sitemap.xml")).unwrap();
         assert!(index.contains("<sitemapindex"), "{index}");
         assert!(index.contains("<sitemap><loc>"), "{index}");
+        assert!(!index.contains("xml-stylesheet"), "{index}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

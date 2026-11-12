@@ -51,6 +51,18 @@ async fn main() {
                 eprintln!("安装模式启动失败：{err:#}");
                 std::process::exit(1);
             }
+            // 安装完成：重新加载配置，同一进程直接进入正式服务，无需重启。
+            match ServerJson::load_for_start() {
+                Ok(LoadOutcome::Ready(config)) => run_server(config).await,
+                Ok(LoadOutcome::NeedsInstall(_)) => {
+                    eprintln!("安装未完成：config.json 仍缺少数据库配置，请访问 /install 完成安装");
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    eprintln!("启动失败：{err:#}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

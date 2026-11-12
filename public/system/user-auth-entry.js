@@ -5,12 +5,31 @@
  * 无法直接加页面。所以这里在右下角放一个入口按钮（带待审核数量角标），
  * 点击后用全屏 iframe 打开独立审核页 /system/user-auth.html。
  *
- * 登录态用后台下发的 admin_token cookie（middleware 已支持 cookie 兜底）。
+ * 登录态与 SPA 一致：从 localStorage/sessionStorage 的 `anqi-adminToken`
+ * 读取令牌放进 `admin` 请求头（后端 require_admin 只认 admin/Bearer 头，没有会话 cookie）。
  */
 (function () {
     'use strict';
 
     var BTN_ID = 'rustcms-user-auth-btn';
+
+    function adminToken() {
+        try {
+            var raw = window.sessionStorage.getItem('anqi-adminToken')
+                || window.localStorage.getItem('anqi-adminToken') || '';
+            if (!raw) {
+                return '';
+            }
+            try {
+                var v = JSON.parse(raw);
+                return typeof v === 'string' ? v : '';
+            } catch (e) {
+                return raw;
+            }
+        } catch (e) {
+            return '';
+        }
+    }
     var MASK_ID = 'rustcms-user-auth-mask';
     var PAGE_URL = '/system/user-auth.html';
     var POLL_MS = 60000;
@@ -138,7 +157,8 @@
     // 拉一次待审核数量，显示角标
     function refreshBadge() {
         fetch('/system/api/plugin/userauth/list?status=0&page=1&pageSize=1', {
-            credentials: 'same-origin'
+            credentials: 'same-origin',
+            headers: { 'admin': adminToken() }
         }).then(function (res) {
             return res.json();
         }).then(function (res) {

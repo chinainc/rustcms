@@ -3,18 +3,18 @@
 //! 没有 `config.json` 或 `mysql.database` 为空时，主程序不再直接退出，
 //! 而是监听端口并只提供 `/install`：
 //! 填数据库信息 → 测试连接 →（空库时）导入 `deploy/sql/rustcms-install.sql`
-//! → 写入 `config.json` → 提示重启。
+//! → 写入 `config.json` → 安装模式服务优雅关闭，由 main 自动进入正式服务。
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use axum::extract::{Form, State};
+use axum::extract::{Extension, Form, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+use tokio::sync::watch;
 
 use crate::config::{default_config_path, MysqlConfig, ServerConfig, ServerJson};
 use crate::state::AppState;
@@ -56,18 +56,25 @@ fn default_form() -> InstallForm {
 }
 
 /// 安装模式入口：只暴露 `/install`，其它路径一律跳过去。
+///
+/// 安装提交成功后发送关闭信号，`run` 返回，由 main 重新加载配置进入正式服务。
 pub async fn run(state: AppState) -> Result<()> {
     let port = state.with_config(|cfg| cfg.port());
     let port = if port == 0 { default_server_port() } else { port };
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let app = Router::new()
         .route("/install", get(page).post(submit))
         .fallback(|| async { Redirect::to("/install") })
+        .layer(Extension(shutdown_tx))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
-        .await
-        .with_context(|| format!("安装模式端口 {port} 监听失败（可能已被占用）"))?;
+    let listener = crate::server::bind_with_hint(port).await?;
     eprintln!("[!] 未配置数据库，已进入安装模式：http://127.0.0.1:{port}/install");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+        })
+        .await
+        .context("安装模式服务异常退出")?;
     Ok(())
 }
 
@@ -78,9 +85,17 @@ async fn page(State(state): State<AppState>) -> Html<String> {
     Html(render_form(Some(&form), None))
 }
 
-async fn submit(State(state): State<AppState>, Form(form): Form<InstallForm>) -> Response {
+async fn submit(
+    State(state): State<AppState>,
+    Extension(shutdown): Extension<watch::Sender<bool>>,
+    Form(form): Form<InstallForm>,
+) -> Response {
     match install(&state, &form).await {
-        Ok(message) => Html(render_done(&message, form.port)).into_response(),
+        Ok(message) => {
+            // 安装成功：通知安装模式服务优雅关闭，main 随后自动进入正式服务。
+            let _ = shutdown.send(true);
+            Html(render_done(&message, form.port)).into_response()
+        }
         Err(err) => {
             let text = format!("{err:#}");
             (
@@ -277,7 +292,7 @@ h1{margin:0 0 12px;font-size:22px}
 <body><div class="wrap"><div class="card">
 <h1>安装完成</h1>
 <div class="ok">{{MSG}}</div>
-<p class="tip">请关闭当前进程并重新启动 rustcms，然后访问 <b>http://服务器IP:{{PORT}}/</b>（后台 /system/）。</p>
+<p class="tip">本进程将自动切换到正式服务（无需手动重启），稍候即可访问 <b>http://服务器IP:{{PORT}}/</b>（后台 /system/）。</p>
 </div></div></body></html>"#;
 
 fn render_done(message: &str, port: u16) -> String {
@@ -295,9 +310,11 @@ mod tests {
 
     fn app() -> Router {
         let state = AppState::new(ServerJson::default(), None);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         Router::new()
             .route("/install", get(page).post(submit))
             .fallback(|| async { Redirect::to("/install") })
+            .layer(Extension(shutdown_tx))
             .with_state(state)
     }
 

@@ -1,7 +1,7 @@
 //! 站点设置（`settings` 表里的各个配置段）。
 //!
 //! 行为约定：
-//! - `system` / `content` / `index` / `contact` / `safe` / `ai_setting` 存在
+//! - `system` / `content` / `index` / `contact` / `safe` / `ai_setting` / `front` 存在
 //! `settings` 表，值是 JSON 对象，保存走「字段级 merge」；
 //! - `diy_fields` 是 JSON **数组**，保存整份覆盖；
 //! - `banner` 形如 `{"banner":[{"type":"default","list":[{...}]}]}`；
@@ -21,6 +21,8 @@ pub const BANNER: &str = "banner";
 pub const DIY_FIELDS: &str = "diy_fields";
 pub const CACHE_TYPE: &str = "cache_type";
 pub const AI: &str = "ai_setting";
+/// 前台展示配置（导航/区块开关、页脚栏目、首页内容）。
+pub const FRONT: &str = "front";
 
 /// 读一个对象型配置段；不存在或不是对象时返回 `{}`。
 pub async fn get_section(pool: &MySqlPool, key: &str) -> anyhow::Result<Value> {
@@ -53,6 +55,159 @@ pub async fn save_section(
 /// 整份覆盖（数组 / 标量配置用）。
 pub async fn save_value(pool: &MySqlPool, key: &str, value: &Value) -> anyhow::Result<()> {
     setting::save_json(pool, key, value).await
+}
+
+// ---------------------------- 前台展示配置（front） ---------------------------
+
+/// 读前台展示配置：`settings.front` 与默认值合并（缺字段用默认，数组整体覆盖）。
+pub async fn get_front_ui(pool: &MySqlPool) -> anyhow::Result<Value> {
+    let stored = get_section(pool, FRONT).await?;
+    Ok(merge_front_ui(front_defaults(), stored))
+}
+
+/// 前台展示配置默认值（与默认模板的硬编码内容一致，未配置时前台外观不变）。
+pub fn front_defaults() -> Value {
+    json!({
+        "blocks": {
+            "topbar": true,
+            "search": true,
+            "header_cta": true,
+            "home_entries": true,
+            "home_features": true,
+            "home_scenes": true,
+            "home_cases": true,
+            "home_stats": true,
+            "home_news": true,
+            "flink": true,
+            "footer_columns": true,
+            "footer_contact": true,
+            "beian": true,
+        },
+        "header": { "cta_text": "免费试用", "cta_url": "/products/3/" },
+        "hero": {
+            "badge": "RustCMS 企业数字化平台",
+            "title": "让企业协作与经营<br>像使用 Rust 一样简单",
+            "subtitle": "一体化 ERP、协同办公、数据分析与低代码平台，帮助团队高效协作、敏捷经营。",
+            "btn1_text": "免费试用",
+            "btn1_url": "/products/3/",
+            "btn2_text": "预约演示",
+            "btn2_url": "/news/12/",
+        },
+        "slides": [
+            { "image": "/uploads/software/theme-01.png", "title": "RustCMS ERP 产品界面" },
+            { "image": "/uploads/software/theme-03.png", "title": "RustCMS 数据可视化大屏" },
+            { "image": "/uploads/software/theme-09.png", "title": "RustCMS 数据中台" },
+        ],
+        "home_cards": [
+            { "icon": "fa-cubes", "title": "企业管理软件", "desc": "ERP · 财务", "url": "/products/3/" },
+            { "icon": "fa-comments-o", "title": "协同办公", "desc": "审批 · 文档 · 会议", "url": "/products/4/" },
+            { "icon": "fa-bar-chart", "title": "数据分析", "desc": "BI · 指标 · 大屏", "url": "/products/5/" },
+            { "icon": "fa-code", "title": "定制开发", "desc": "门户 · 集成 · 迁移", "url": "/products/6/" },
+            { "icon": "fa-briefcase", "title": "客户案例", "desc": "行业落地实践", "url": "/cases/15/" },
+            { "icon": "fa-newspaper-o", "title": "新闻资讯", "desc": "产品与行业动态", "url": "/news/" },
+        ],
+        "stats": [
+            { "num": "500+", "text": "服务客户" },
+            { "num": "98%", "text": "客户满意度" },
+            { "num": "20+", "text": "覆盖行业" },
+            { "num": "7×12", "text": "服务响应" },
+        ],
+        "scenes": [
+            {
+                "tag": "管理数字化",
+                "title": "一个视图看清企业经营",
+                "desc": "以 ERP 为核心，打通财务、供应链、生产与销售数据，建立统一的主数据和经营看板，让管理决策有据可依。",
+                "link_text": "了解更多 →",
+                "url": "/news/12/",
+                "image": "/uploads/software/theme-03.png",
+                "reverse": false,
+            },
+            {
+                "tag": "协同数字化",
+                "title": "审批、文档、会议一站完成",
+                "desc": "以 OA 和工作流为入口，连接组织、流程与文档，支持移动办公与多端同步，让协作不再依赖即时消息。",
+                "link_text": "了解更多 →",
+                "url": "/products/4/",
+                "image": "/uploads/software/theme-02.png",
+                "reverse": true,
+            },
+            {
+                "tag": "数据智能化",
+                "title": "从数据到洞察只需几分钟",
+                "desc": "数据中台完成采集、治理与建模，BI 可视化让业务人员自助分析，指标实时触达管理者。",
+                "link_text": "了解更多 →",
+                "url": "/products/5/",
+                "image": "/uploads/software/theme-09.png",
+                "reverse": false,
+            },
+        ],
+        "footer_columns": [
+            {
+                "title": "产品",
+                "links": [
+                    { "text": "企业管理软件", "url": "/products/3/" },
+                    { "text": "协同办公", "url": "/products/4/" },
+                    { "text": "数据分析", "url": "/products/5/" },
+                    { "text": "制造执行", "url": "/products/8/" },
+                    { "text": "客户关系", "url": "/products/9/" },
+                ],
+            },
+            {
+                "title": "解决方案",
+                "links": [
+                    { "text": "数字化转型总览", "url": "/news/12/" },
+                    { "text": "制造企业数字化", "url": "/news/17.html" },
+                    { "text": "智能客服与知识库", "url": "/news/18.html" },
+                    { "text": "供应链协同", "url": "/news/20.html" },
+                    { "text": "低代码应用", "url": "/news/67.html" },
+                ],
+            },
+            {
+                "title": "资源中心",
+                "links": [
+                    { "text": "新闻资讯", "url": "/news/" },
+                    { "text": "技术分享", "url": "/news/14/" },
+                    { "text": "客户案例", "url": "/cases/15/" },
+                    { "text": "网站地图", "url": "/sitemap.xml" },
+                ],
+            },
+            {
+                "title": "关于我们",
+                "links": [
+                    { "text": "公司介绍", "url": "/1.html" },
+                    { "text": "联系我们", "url": "/2.html" },
+                    { "text": "生态伙伴", "url": "/news/64.html" },
+                ],
+            },
+        ],
+        "footer_copyright": "",
+    })
+}
+
+/// 把后台保存的前台配置合并到默认值上：
+/// 对象逐层合并（缺字段用默认），数组与标量整体覆盖。
+pub fn merge_front_ui(mut base: Value, over: Value) -> Value {
+    match (&mut base, over) {
+        (Value::Object(base_map), Value::Object(over_map)) => {
+            for (key, value) in over_map {
+                match base_map.get_mut(&key) {
+                    // 两边都是对象：再合并一层（blocks / hero / header）
+                    Some(Value::Object(inner)) if value.is_object() => {
+                        if let Value::Object(over_inner) = value {
+                            for (k, v) in over_inner {
+                                inner.insert(k, v);
+                            }
+                        }
+                    }
+                    _ => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+            base
+        }
+        _ => base,
+    }
 }
 
 /// 读缓存类型（纯字符串，非 JSON）。

@@ -27,6 +27,112 @@ pub mod site_provider;
 /// 模板上下文（变量表）。
 pub type Scope = Map<String, Value>;
 
+// ---------------------------- 多语言（语言包 / 语言切换） ---------------------
+
+/// 运行中的模板目录（`state` 初始化时写入，供 `tr` 标签定位语言包）。
+static TEMPLATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// 记录运行中的模板目录（应用启动时调用一次）。
+pub fn set_template_dir(dir: &Path) {
+    let _ = TEMPLATE_DIR.set(dir.to_path_buf());
+}
+
+/// 运行中的模板目录；未初始化时回退 `template/default`。
+fn template_dir() -> PathBuf {
+    TEMPLATE_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("template/default"))
+}
+
+/// 语言代码归一：`zh` / `zh_CN` / `zh-CN` → `zh-cn`，`en` / `en_US` → `en-us`。
+pub fn normalize_language(lang: &str) -> String {
+    let lowered = lang.trim().to_lowercase().replace('_', "-");
+    match lowered.as_str() {
+        "zh" | "zh-hans" => "zh-cn".to_string(),
+        "en" | "en-gb" => "en-us".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 语言显示名（语言切换器里的 `LanguageName`）。
+pub fn language_display_name(lang: &str) -> String {
+    match normalize_language(lang).as_str() {
+        "zh-cn" => "简体中文".to_string(),
+        "en-us" => "English".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 语言国旗 emoji（语言切换器里的 `LanguageEmoji`）。
+pub fn language_emoji(lang: &str) -> String {
+    match normalize_language(lang).as_str() {
+        "zh-cn" => "🇨🇳".to_string(),
+        "en-us" => "🇬🇧".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 语言包缓存：（模板目录, 语言代码）→ 词条表。
+static LANGUAGE_PACKS: std::sync::OnceLock<RwLock<HashMap<(PathBuf, String), Arc<HashMap<String, String>>>>> =
+    std::sync::OnceLock::new();
+
+/// 取当前站点语言对应的语言包（`locales/<lang>/default.yml`，进程内缓存）。
+pub fn language_pack(lang: &str) -> Arc<HashMap<String, String>> {
+    let dir = template_dir();
+    let lang = normalize_language(lang);
+    let caches = LANGUAGE_PACKS.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(hit) = caches
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&(dir.clone(), lang.clone()))
+    {
+        return hit.clone();
+    }
+    let path = dir.join("locales").join(&lang).join("default.yml");
+    let pack = std::fs::read_to_string(&path)
+        .map(|source| parse_language_pack(&source))
+        .unwrap_or_default();
+    let pack = Arc::new(pack);
+    caches
+        .write()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert((dir, lang), pack.clone());
+    pack
+}
+
+/// 解析语言包（`"词条": "译文"` 行式 YAML，不支持的行忽略）。
+fn parse_language_pack(source: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = unquote_yaml(key.trim());
+        let value = unquote_yaml(value.trim());
+        if !key.is_empty() {
+            map.insert(key, value);
+        }
+    }
+    map
+}
+
+fn unquote_yaml(text: &str) -> String {
+    let text = text.trim();
+    if text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('\'') && text.ends_with('\'')))
+    {
+        text[1..text.len() - 1].to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 /// 异步数据提供者：按标签名取数据，供模板标签使用。
 pub trait Provider: Send + Sync {
     /// `tag` 是标签名（如 `archiveList`），`args` 是解析后的参数。
@@ -1062,6 +1168,46 @@ pub async fn render_str(source: &str, scope: Scope, provider: &dyn Provider) -> 
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn normalizes_language_codes() {
+        assert_eq!(normalize_language("zh"), "zh-cn");
+        assert_eq!(normalize_language("zh_CN"), "zh-cn");
+        assert_eq!(normalize_language("zh-CN"), "zh-cn");
+        assert_eq!(normalize_language("en"), "en-us");
+        assert_eq!(normalize_language("en_US"), "en-us");
+        assert_eq!(normalize_language("ja-JP"), "ja-jp");
+    }
+
+    #[test]
+    fn language_display_and_emoji() {
+        assert_eq!(language_display_name("zh"), "简体中文");
+        assert_eq!(language_display_name("en-us"), "English");
+        assert_eq!(language_emoji("zh-cn"), "🇨🇳");
+        assert_eq!(language_emoji("en"), "🇬🇧");
+        assert_eq!(language_emoji("ja-jp"), "");
+    }
+
+    #[test]
+    fn parses_language_pack_yaml() {
+        let pack = parse_language_pack(
+            "# 注释行\n\"welcome%s\": \"欢迎来到 %s 官方网站!\"\n\"total-items%d\": \"共 %d 条\"\nplain: value\n\nbroken line without colon",
+        );
+        assert_eq!(pack.get("welcome%s").map(String::as_str), Some("欢迎来到 %s 官方网站!"));
+        assert_eq!(pack.get("total-items%d").map(String::as_str), Some("共 %d 条"));
+        assert_eq!(pack.get("plain").map(String::as_str), Some("value"));
+        assert_eq!(pack.len(), 3);
+    }
+
+    #[test]
+    fn loads_real_language_pack_from_template_dir() {
+        // 测试进程未调 set_template_dir：language_pack 回退 template/default（仓库内模板）
+        let pack = language_pack("zh");
+        assert_eq!(pack.get("welcome%s").map(String::as_str), Some("欢迎来到 %s 官方网站!"));
+        assert_eq!(pack.get("SearchPlaceholder").map(String::as_str), Some("搜索产品、新闻…"));
+        // 语言包缺失时是空表（tr 回退词条名）
+        assert!(language_pack("fr-fr").is_empty());
+    }
 
     struct StubProvider {
         archives: Vec<Value>,

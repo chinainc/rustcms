@@ -239,6 +239,20 @@
 
 <script>
     (function () {
+        // 与后台 SPA 同口径：从 localStorage/sessionStorage 的 `anqi-adminToken`
+        // 读令牌放进 `admin` 请求头（后端 require_admin 只认 admin/Bearer 头，没有会话 cookie）。
+        function adminToken() {
+            try {
+                var raw = window.sessionStorage.getItem('anqi-adminToken')
+                    || window.localStorage.getItem('anqi-adminToken') || '';
+                if (!raw) { return ''; }
+                try {
+                    var v = JSON.parse(raw);
+                    return typeof v === 'string' ? v : '';
+                } catch (e) { return raw; }
+            } catch (e) { return ''; }
+        }
+
         var fileInput = document.getElementById('file');
         var fileName = document.getElementById('file-name');
         var pickBtn = document.getElementById('pick');
@@ -266,7 +280,7 @@
                     fetch('/system/api/anqi/restart', {
                         method: 'POST',
                         credentials: 'same-origin',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: { 'Content-Type': 'application/json', 'admin': adminToken() },
                         body: '{}'
                     }).then(function () {
                         btn.textContent = '已发送重启指令，5 秒后刷新';
@@ -288,7 +302,10 @@
             return (size / 1024).toFixed(0) + ' KB';
         }
 
-        fetch('/system/api/version/env', { credentials: 'same-origin' })
+        fetch('/system/api/version/env', {
+            credentials: 'same-origin',
+            headers: { 'admin': adminToken() }
+        })
             .then(function (res) { return res.json(); })
             .then(function (res) {
                 var data = (res && res.data) || {};
@@ -355,6 +372,10 @@
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '/system/api/version/upload-upgrade', true);
             xhr.withCredentials = true;
+            var adminTk = adminToken();
+            if (adminTk) {
+                xhr.setRequestHeader('admin', adminTk);
+            }
             xhr.upload.onprogress = function (e) {
                 if (e.lengthComputable) {
                     var percent = Math.floor(e.loaded / e.total * 100);
@@ -396,6 +417,18 @@
 </script>
 <script>
     (function () {
+        function adminToken() {
+            try {
+                var raw = window.sessionStorage.getItem('anqi-adminToken')
+                    || window.localStorage.getItem('anqi-adminToken') || '';
+                if (!raw) { return ''; }
+                try {
+                    var v = JSON.parse(raw);
+                    return typeof v === 'string' ? v : '';
+                } catch (e) { return raw; }
+            } catch (e) { return ''; }
+        }
+
         var urlInput = document.getElementById('remote-url');
         var serviceInput = document.getElementById('remote-service');
         var autoCheck = document.getElementById('remote-auto-check');
@@ -413,7 +446,9 @@
         }
 
         function api(path, options) {
-            return fetch(path, Object.assign({ credentials: 'same-origin' }, options || {}))
+            options = Object.assign({ credentials: 'same-origin' }, options || {});
+            options.headers = Object.assign({ 'admin': adminToken() }, options.headers || {});
+            return fetch(path, options)
                 .then(function (res) { return res.json(); });
         }
 

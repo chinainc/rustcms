@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use sqlx::mysql::MySqlPool;
 
 use super::Provider;
-use crate::models::{archive, category, tag, url, Category, Module};
+use crate::models::{archive, category, multilang, site_setting, tag, url, website, Category, Module};
 
 /// 模板数据源：既可以代表「某个栏目页」，也可以代表「某篇内容详情页」。
 pub struct SiteProvider {
@@ -33,6 +33,8 @@ pub struct SiteProvider {
     pub tag: Option<tag::Tag>,
     /// 标签列表页（`/tags/`）
     pub tag_index: bool,
+    /// 当前站点语言（`tr` 翻译用；一次渲染只读一次库）
+    language: tokio::sync::OnceCell<String>,
 }
 
 impl SiteProvider {
@@ -51,6 +53,7 @@ impl SiteProvider {
             keyword: String::new(),
             tag: None,
             tag_index: false,
+            language: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -80,6 +83,7 @@ impl SiteProvider {
             keyword: String::new(),
             tag: None,
             tag_index: false,
+            language: tokio::sync::OnceCell::new(),
         }))
     }
 
@@ -985,9 +989,13 @@ impl Provider for SiteProvider {
                 "prevArchive" => self.adjacent_archive(args, true).await,
                 "nextArchive" => self.adjacent_archive(args, false).await,
                 "now" => Ok(self.now_value(args)),
-                // 翻译：暂时直接返回参数本身（未接语言包），并做 %d/%s 占位替换
+                // 翻译：按当前站点语言查语言包（`locales/<lang>/default.yml`），
+                // 缺词条回退词条名本身，并做 %d/%s 占位替换
                 "tr" => {
-                    let mut text = args.get("__arg0").map(super::as_text).unwrap_or_default();
+                    let key = args.get("__arg0").map(super::as_text).unwrap_or_default();
+                    let lang = self.current_language().await;
+                    let pack = super::language_pack(&lang);
+                    let mut text = pack.get(&key).cloned().unwrap_or(key);
                     let mut index = 1usize;
                     while let Some(value) = args.get(&format!("__arg{index}")) {
                         let value = super::as_text(value);
@@ -1000,10 +1008,114 @@ impl Provider for SiteProvider {
                     }
                     Ok(Value::String(text))
                 }
-                "languages" => Ok(Value::Array(Vec::new())),
+                // 多语言子站列表（语言切换器 / alternate 链接）
+                "languages" => self.languages_list().await,
                 _ => Ok(Value::Null),
             }
         })
+    }
+}
+
+impl SiteProvider {
+    /// 当前站点语言（`settings.system.language`，归一到 `zh-cn` / `en-us` 等）。
+    async fn current_language(&self) -> String {
+        self.language
+            .get_or_init(|| async {
+                let system = site_setting::get_section(&self.pool, site_setting::SYSTEM)
+                    .await
+                    .unwrap_or_default();
+                let lang = system
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .unwrap_or("zh-cn");
+                super::normalize_language(lang)
+            })
+            .await
+            .clone()
+    }
+
+    /// 多语言子站列表（对齐 `GetLanguages` 的语义）：
+    /// 主站（id=1）永远第一条且 `IsCurrent = true`，子站链接按部署形态生成。
+    async fn languages_list(&self) -> Result<Value> {
+        let config = multilang::config_get(&self.pool).await?;
+        let open = config.get("open").and_then(Value::as_bool).unwrap_or(false);
+        if !open {
+            // 既有实现：多语言未开启时语言切换器不渲染（空数组）
+            return Ok(Value::Array(Vec::new()));
+        }
+        let site_type = config
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("directory")
+            .to_string();
+        let default_language = config
+            .get("default_language")
+            .and_then(Value::as_str)
+            .unwrap_or("zh-cn")
+            .to_string();
+
+        let mut items: Vec<Value> = Vec::new();
+        // 主站条目（切换回主站）
+        let main_icon = website::get(&self.pool, 1)
+            .await
+            .ok()
+            .flatten()
+            .map(|site| site.language_icon)
+            .unwrap_or_default();
+        items.push(serde_json::json!({
+            "LanguageName": super::language_display_name(&default_language),
+            "LanguageEmoji": super::language_emoji(&default_language),
+            "LanguageIcon": main_icon,
+            "Link": "/",
+            "IsCurrent": true,
+        }));
+
+        // 子站条目
+        let subs = config
+            .get("sub_sites")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for sub in subs {
+            let language = sub
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if language.is_empty() {
+                continue;
+            }
+            let id = sub.get("id").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let (root_path, site_icon) = match website::get(&self.pool, id).await {
+                Ok(Some(site)) => (site.root_path, site.language_icon),
+                _ => (String::new(), String::new()),
+            };
+            let icon = sub
+                .get("language_icon")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or(site_icon);
+            // directory 部署：`/{root_path}/`；domain 部署：子站域名由部署侧解析，回退主站链接
+            let link = if site_type == "domain" {
+                "/".to_string()
+            } else {
+                let root = root_path.trim().trim_matches('/');
+                if root.is_empty() {
+                    format!("/{}/", language)
+                } else {
+                    format!("/{root}/")
+                }
+            };
+            items.push(serde_json::json!({
+                "LanguageName": super::language_display_name(&language),
+                "LanguageEmoji": super::language_emoji(&language),
+                "LanguageIcon": icon,
+                "Link": link,
+                "IsCurrent": false,
+            }));
+        }
+        Ok(Value::Array(items))
     }
 }
 
@@ -1016,6 +1128,75 @@ mod tests {
 
     fn template_dir() -> std::path::PathBuf {
         crate::models::test_template_dir()
+    }
+
+    #[tokio::test]
+    async fn languages_tag_follows_multilang_config() {
+        let _guard = db_lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let backup = crate::models::setting::get_raw(&pool, "multilang").await.unwrap();
+        crate::models::setting::remove(&pool, "multilang").await.unwrap();
+        let provider = SiteProvider::new(pool.clone(), 0).await.unwrap();
+
+        // 多语言未开启：空数组（语言切换器不渲染）
+        let data = provider
+            .data("languages", &Map::new())
+            .await
+            .unwrap();
+        assert!(data.as_array().unwrap().is_empty(), "{data}");
+
+        // 开启（无子站）：主站条目 IsCurrent=true
+        crate::models::setting::save_json(
+            &pool,
+            "multilang",
+            &serde_json::json!({"open": true, "type": "directory", "sub_sites": []}),
+        )
+        .await
+        .unwrap();
+        let data = provider
+            .data("languages", &Map::new())
+            .await
+            .unwrap();
+        let list = data.as_array().unwrap();
+        assert_eq!(list.len(), 1, "{data}");
+        assert_eq!(list[0]["IsCurrent"], serde_json::json!(true));
+        assert_eq!(list[0]["Link"], serde_json::json!("/"));
+        assert!(!list[0]["LanguageName"].as_str().unwrap_or("").is_empty());
+
+        // 带子站：directory 部署按 root_path 生成链接
+        crate::models::setting::save_json(
+            &pool,
+            "multilang",
+            &serde_json::json!({
+                "open": true,
+                "type": "directory",
+                "sub_sites": [
+                    {"id": 999999, "language": "en-us", "language_icon": ""}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let data = provider
+            .data("languages", &Map::new())
+            .await
+            .unwrap();
+        let list = data.as_array().unwrap();
+        assert_eq!(list.len(), 2, "{data}");
+        // 子站 id 不存在：root_path 为空 → 回退语言代码目录
+        assert_eq!(list[1]["Link"], serde_json::json!("/en-us/"));
+        assert_eq!(list[1]["IsCurrent"], serde_json::json!(false));
+        assert_eq!(list[1]["LanguageName"], serde_json::json!("English"));
+
+        // 恢复
+        match backup {
+            Some(raw) => crate::models::setting::save_raw(&pool, "multilang", &raw)
+                .await
+                .unwrap(),
+            None => crate::models::setting::remove(&pool, "multilang").await.unwrap(),
+        }
     }
 
     #[tokio::test]

@@ -6,7 +6,9 @@
  *   1. 只在 /system/tool/upgrade（系统升级）这一页注入，插在「当前版本」卡片之后；
  *   2. 卡片样式复用 antd 的类名 + 少量自绘，视觉与原生页面一致；
  *   3. React 重新渲染可能抹掉注入节点，用 MutationObserver 兜底补回；
- *   4. 登录态沿用后台下发的 admin_token cookie（middleware 已支持 cookie 兜底）。
+ *   4. 登录态与 SPA 一致：从 localStorage/sessionStorage 的 `anqi-adminToken`
+ *      读取令牌，放进 `admin` 请求头（后端 require_admin 只认 admin/Bearer 头，
+ *      管理端没有会话 cookie，仅带 credentials 是不够的）。
  *
  * 上传逻辑对应后端 /system/api/version/upload-upgrade（src/routes.rs 的 manage_version_upload_upgrade），
  * 纯本地上传升级包，服务器不需要访问外网。
@@ -19,6 +21,26 @@
     var STYLE_ID = 'rustcms-upgrade-upload-style';
     // 后台 SPA 的历史路由：/system/tool/upgrade
     var ROUTE_SUFFIX = '/tool/upgrade';
+
+    // 与 SPA 的请求拦截器同口径：sessionStorage 优先，其次 localStorage；
+    // 值是 JSON.stringify 过的，解析失败按原串用。
+    function adminToken() {
+        try {
+            var raw = window.sessionStorage.getItem('anqi-adminToken')
+                || window.localStorage.getItem('anqi-adminToken') || '';
+            if (!raw) {
+                return '';
+            }
+            try {
+                var v = JSON.parse(raw);
+                return typeof v === 'string' ? v : '';
+            } catch (e) {
+                return raw;
+            }
+        } catch (e) {
+            return '';
+        }
+    }
 
     var state = {
         envLoaded: false,
@@ -137,7 +159,7 @@
                 fetch('/system/api/anqi/restart', {
                     method: 'POST',
                     credentials: 'same-origin',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'admin': adminToken() },
                     body: '{}'
                 }).then(function () {
                     btn.textContent = '已发送重启指令，5 秒后刷新';
@@ -214,6 +236,10 @@
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '/system/api/version/upload-upgrade', true);
             xhr.withCredentials = true;
+            var adminTk = adminToken();
+            if (adminTk) {
+                xhr.setRequestHeader('admin', adminTk);
+            }
             xhr.upload.onprogress = function (e) {
                 if (e.lengthComputable) {
                     var percent = Math.floor(e.loaded / e.total * 100);
@@ -259,7 +285,10 @@
         // 环境信息（主程序名/平台），失败不影响上传
         if (!state.envLoaded) {
             state.envLoaded = true;
-            fetch('/system/api/version/env', { credentials: 'same-origin' })
+            fetch('/system/api/version/env', {
+                credentials: 'same-origin',
+                headers: { 'admin': adminToken() }
+            })
                 .then(function (res) { return res.json(); })
                 .then(function (res) {
                     var data = (res && res.data) || {};

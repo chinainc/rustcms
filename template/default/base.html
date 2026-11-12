@@ -31,6 +31,7 @@
 
 <body>
     <!-- top -->
+    {% if front_ui.blocks.topbar %}
     <div class="top">
         <div class="container">
             <div class="top-item">
@@ -69,6 +70,7 @@
             </div>
         </div>
     </div>
+    {% endif %}
     <!-- top -->
     <!-- header -->
     <header id="header">
@@ -121,7 +123,9 @@
                         <p><i class="fa fa-phone"></i> {% tr 'service-hotline' %}</p>
                         <a href="tel:{% contact with name='Cellphone' %}" title="{% tr 'cellphone' %}">{% contact with name="Cellphone" %}</a>
                     </div>
-                    <a class="fs-cta" href="/products/3/">免费试用</a>
+                    {% if front_ui.blocks.header_cta %}
+                    <a class="fs-cta" href="{{ front_ui.header.cta_url }}">{{ front_ui.header.cta_text }}</a>
+                    {% endif %}
                 </div>
                 <i class="fa fa-bars m-menu-open"></i>
                 <i class="fa fa-close m-menu-close"></i>
@@ -130,7 +134,7 @@
     </header>
     <!-- header -->
     <!-- search -->
-    {% block search %}{% include "partial/search.html" %}{% endblock %}
+    {% block search %}{% if front_ui.blocks.search %}{% include "partial/search.html" %}{% endif %}{% endblock %}
     <!-- search -->
     <!-- layout -->
     <div>
@@ -147,35 +151,17 @@
     <div class="footer">
         <div class="container">
             <div class="fs-footer-grid">
+                {% if front_ui.blocks.footer_columns %}
+                {% for col in front_ui.footer_columns %}
                 <div class="fs-foot-col">
-                    <h4>产品</h4>
-                    <a href="/products/3/">企业管理软件</a>
-                    <a href="/products/4/">协同办公</a>
-                    <a href="/products/5/">数据分析</a>
-                    <a href="/products/8/">制造执行</a>
-                    <a href="/products/9/">客户关系</a>
+                    <h4>{{ col.title }}</h4>
+                    {% for link in col.links %}
+                    <a href="{{ link.url }}">{{ link.text }}</a>
+                    {% endfor %}
                 </div>
-                <div class="fs-foot-col">
-                    <h4>解决方案</h4>
-                    <a href="/news/12/">数字化转型总览</a>
-                    <a href="/news/17.html">制造企业数字化</a>
-                    <a href="/news/18.html">智能客服与知识库</a>
-                    <a href="/news/20.html">供应链协同</a>
-                    <a href="/news/67.html">低代码应用</a>
-                </div>
-                <div class="fs-foot-col">
-                    <h4>资源中心</h4>
-                    <a href="/news/">新闻资讯</a>
-                    <a href="/news/14/">技术分享</a>
-                    <a href="/cases/15/">客户案例</a>
-                    <a href="/sitemap.xml">网站地图</a>
-                </div>
-                <div class="fs-foot-col">
-                    <h4>关于我们</h4>
-                    <a href="/1.html">公司介绍</a>
-                    <a href="/2.html">联系我们</a>
-                    <a href="/news/64.html">生态伙伴</a>
-                </div>
+                {% endfor %}
+                {% endif %}
+                {% if front_ui.blocks.footer_contact %}
                 <div class="fs-foot-col fs-foot-contact">
                     <h4>联系我们</h4>
                     <p><i class="fa fa-phone"></i> 电话：{% contact with name="Cellphone" %}</p>
@@ -183,14 +169,21 @@
                     <p><i class="fa fa-home"></i> 地址：{% contact with name="Address" %}</p>
                     <p><i class="fa fa-clock-o"></i> 服务时间：9:00 - 18:00</p>
                 </div>
+                {% endif %}
             </div>
             <div class="footer-bottom">
+                {% if front_ui.footer_copyright %}
+                <span>{{ front_ui.footer_copyright|safe }}</span>
+                {% else %}
                 <span>Copyright © {% now "2006" %} {% system with name="SiteName" %}. Created By <a href="https://www.rustcms.com/" target="_blank">RustCMS</a></span>
+                {% endif %}
+                {% if front_ui.blocks.beian %}
                 {% system siteIcp with name="SiteIcp" %}
                 {% if siteIcp %}
                 <a href="https://beian.miit.gov.cn/" rel="nofollow" target="_blank">{{siteIcp}}</a>
                 {% endif %}
                 <a href="http://www.beian.gov.cn/portal/registerSystemInfo?recordcode=11000002000001" rel="nofollow" target="_blank">京公网安备 11000002000001号</a>
+                {% endif %}
             </div>
         </div>
     </div>

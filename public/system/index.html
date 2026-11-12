@@ -20,18 +20,27 @@
   })();
 </script>
 <style>
-  /* 隐藏暂未提供的账号绑定入口 */
+  /* “绑定安企账号”入口已从 umi 主包移除（渲染点改为 null），此规则兜底 */
   span.site-info-item.action { display: none !important; }
   /* 隐藏侧边栏底部的外链区 */
   .ant-pro-sider-links { display: none !important; }
   /* 隐藏顶部帮助（问号）图标 */
   .ant-pro-global-header .ant-space-item > span.action:not(.account) { display: none !important; }
+  /* 侧边栏滚动条细化：默认滚动条粗且颜色突兀 */
+  .ant-layout-sider ::-webkit-scrollbar { width: 6px; height: 6px; }
+  .ant-layout-sider ::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, .16); border-radius: 3px; }
+  .ant-layout-sider ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, .3); }
+  .ant-layout-sider ::-webkit-scrollbar-track { background: transparent; }
+  /* 子菜单项：选中/悬停圆角背景，层级更清晰 */
+  .ant-pro-sider .ant-menu-inline .ant-menu-item { border-radius: 4px; }
+  .ant-pro-sider .ant-menu-inline .ant-menu-item-selected { background: rgba(22, 119, 255, .08); }
 </style>
 </head>
 <body>
 <div id="root"></div>
 <script src="/system/umi.fbc983d5.js"></script>
 <script src="/system/header-menu-entry.js"></script>
+<script src="/system/statistic-entry.js"></script>
 <script src="/system/upgrade-upload-entry.js"></script>
 </body>
 </html>

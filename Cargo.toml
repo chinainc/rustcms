@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rustcms"
-version = "1.1.5"
+version = "1.1.6"
 edition = "2021"
 description = "基于 Rust 的内容管理系统（CMS）"
 license = "AGPL-3.0"

@@ -3,7 +3,7 @@
 //! 处理顺序：
 //! 1. [`check_301`]：查 `redirects` 表做 301 跳转；
 //! 2. [`parse_user_token`]：解析会员 JWT / API Key，账号被禁用时直接回 JSON；
-//! 3. [`FrontCtx::serve_file`]：public/ 静态文件、默认 robots.txt、favicon 缺省 400；
+//! 3. [`FrontCtx::serve_file`]：public/ 静态文件、默认 robots.txt、favicon 缺文件回内置缺省图标；
 //! 4. [`FrontCtx::check_close_site`]：闭站 / 禁蜘蛛 / UA、IP 黑名单；
 //! 5. [`parse_route`]：伪静态规则按固定顺序
 //! （search → archiveIndex → people → tag → page → category → archive）
@@ -38,6 +38,14 @@ const MAX_PAGE: u32 = 1000;
 /// 单次请求的处理超时：30 秒。
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 内置缺省 favicon。
+///
+/// 升级清单会跳过 `favicon.ico`（不覆盖站点自传的图标），而该文件是 1.1.5 才进发行
+/// 产物的——老站点升级后页头引用 `/favicon.ico` 但磁盘上没有文件。缺文件时回内置
+/// 图标（200），而不是 400；站点上传了自己的 favicon 时仍以文件为准（serve_file
+/// 的文件直出分支先于这里命中）。
+static DEFAULT_FAVICON: &[u8] = include_bytes!("../public/favicon.ico");
+
 /// 前台兜底入口（301 检查 → 会员令牌解析 → 超时 → 路由分发）。
 pub async fn reroute(State(state): State<AppState>, req: Request) -> Response {
     // 客户端 IP 只从代理头取（直连场景拿不到 SocketAddr 时跳过 IP 黑名单检查）
@@ -63,6 +71,46 @@ pub async fn reroute(State(state): State<AppState>, req: Request) -> Response {
     match tokio::time::timeout(HANDLER_TIMEOUT, pipeline(state, req, ip)).await {
         Ok(res) => res,
         Err(_) => (StatusCode::REQUEST_TIMEOUT, "Request Timeout").into_response(),
+    }
+}
+
+/// 商家工作台 `/business`（对齐 anqicms 3.6.9 的 `controller.BusinessPage`）。
+///
+/// 页面本体与静态资源都放在 `public/business/` 下：
+/// - 子资源（`/business/assets/...`）转交 [`FrontCtx::serve_file`] 按 public/ 文件直出，
+///   未命中按 404 处理；
+/// - 目录地址统一 301 到带尾斜杠的形式：页面里的静态资源是相对路径
+///   （`assets/css/style.css`），不带尾斜杠时浏览器会按站点根解析而 404；
+/// - `/business/` 输出 `public/business/index.html`。
+pub async fn business_page(State(state): State<AppState>, req: Request) -> Response {
+    let path = req.uri().path().to_string();
+    let rest = path.strip_prefix("/business").unwrap_or("");
+    if !rest.is_empty() && rest != "/" {
+        return match FrontCtx::serve_file(&state, &path).await {
+            Some(res) => res,
+            None => (StatusCode::NOT_FOUND, "404 page not found").into_response(),
+        };
+    }
+
+    if !path.ends_with('/') {
+        return (
+            StatusCode::MOVED_PERMANENTLY,
+            [(header::LOCATION, format!("{path}/"))],
+        )
+            .into_response();
+    }
+
+    let base = state.with_config(|c| c.public_dir());
+    match std::fs::read(base.join("business").join("index.html")) {
+        Ok(bytes) => (
+            [(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "404 page not found").into_response(),
     }
 }
 
@@ -139,7 +187,33 @@ async fn pipeline(state: AppState, req: Request, ip: Option<String>) -> Response
 
     // controller.ReRouteContext：解析 + 渲染
     let res = ctx.dispatch().await;
-    with_renew(res, &renew_token)
+    let res = with_renew(res, &renew_token);
+    // 访问统计采集（口径同 anqicms LogAccess）：蜘蛛分析/流量分析/访问记录的数据源。
+    // 只覆盖前台管线（静态文件与 /system 后台在上方提前返回，不计入）。
+    let status = res.status().as_u16();
+    let user_agent = ctx
+        .headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let host = ctx
+        .headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let record = crate::models::statistic::access_record(
+        &uri,
+        ctx.ip.as_deref().unwrap_or_default(),
+        host,
+        &user_agent,
+        status,
+    );
+    let stat_dir = ctx.state.with_config(|config| config.data_dir()).join("statistic");
+    tokio::spawn(async move {
+        crate::models::statistic::log_access(&stat_dir, &record);
+    });
+    res
 }
 
 /// 登录过期前 1 小时内下发续签令牌（`update-token` 响应头）。
@@ -373,7 +447,7 @@ async fn auto_build_sitemap(state: &AppState, path: &str) -> Option<Response> {
 
 impl FrontCtx {
     /// `controller.FileServe`：public/ 下的静态文件直接回；未命中继续路由。
-    async fn serve_file(state: &AppState, path: &str) -> Option<Response> {
+    pub(crate) async fn serve_file(state: &AppState, path: &str) -> Option<Response> {
         // 旧 sitemap 路径先改写（/archive*.xml|txt → /sitemap-archive*.xml|txt）
         let rewritten = rewrite_legacy_sitemap_path(path);
         let path = rewritten.as_deref().unwrap_or(path);
@@ -406,9 +480,19 @@ impl FrontCtx {
             }
         }
 
-        // 避开 favicon.ico（文件不存在时 400）
+        // favicon.ico：站点上传的文件已在上面直出；缺文件时回内置缺省图标
+        // （升级跳过 favicon.ico，老站点磁盘上没有这个文件，回 400 会让图标加载失败）
         if path.ends_with("favicon.ico") {
-            return Some(StatusCode::BAD_REQUEST.into_response());
+            return Some(
+                (
+                    [(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("image/x-icon"),
+                    )],
+                    DEFAULT_FAVICON.to_vec(),
+                )
+                    .into_response(),
+            );
         }
         // robots.txt 缺省内容（遵循既有约定自动生成；Sitemap 行依赖 base_url，略）
         if path == "/robots.txt" {
@@ -853,6 +937,8 @@ impl FrontCtx {
             .to_ascii_lowercase();
         scope.insert("isMobile".into(), Value::Bool(ua.contains("mobile")));
         scope.insert("urlParams".into(), query_params(&self.query));
+        // 前台展示配置兜底值：错误页等不经过 render_with 的路径也能渲染 base.html
+        scope.insert("front_ui".into(), site_setting::front_defaults());
         if let Some(member) = &self.front_user {
             scope.insert("userId".into(), Value::from(member.id));
             scope.insert("userInfo".into(), member.info.clone());
@@ -862,7 +948,12 @@ impl FrontCtx {
     }
 
     async fn render_with(&self, template: &str, scope: &Scope, provider: &SiteProvider) -> Response {
-        match self.state.templates().render(template, scope, provider).await {
+        // 用后台保存的前台展示配置覆盖 base_scope 里的兜底默认值
+        let mut scope = scope.clone();
+        if let Ok(value) = site_setting::get_front_ui(&self.pool).await {
+            scope.insert("front_ui".into(), value);
+        }
+        match self.state.templates().render(template, &scope, provider).await {
             Ok(html) => html_response(html),
             // 渲染失败 → 500 页
             Err(err) => internal_error(&self.state, &self.pool, &format!("{err:#}")).await,
@@ -1264,6 +1355,8 @@ async fn internal_error(state: &AppState, pool: &MySqlPool, message: &str) -> Re
     if let Ok(provider) = SiteProvider::new(pool.clone(), 0).await {
         let mut scope = Scope::new();
         scope.insert("errMessage".into(), Value::String(message.to_string()));
+        // 500 页也可能 extends base.html：注入前台展示配置兜底值
+        scope.insert("front_ui".into(), site_setting::front_defaults());
         if let Ok(html) = state
             .templates()
             .render("errors/500.html", &scope, &provider)
@@ -1474,6 +1567,49 @@ mod tests {
         assert_eq!(content_type("/a/unknown"), "application/octet-stream");
     }
 
+    #[tokio::test]
+    async fn business_page_redirects_and_serves_index() {
+        // 临时 public 目录按进程共享，跟会整删该目录的用例串行
+        let _guard = crate::models::db_lock().await;
+        let state = test_state(None);
+        let public_dir = state.with_config(|c| c.public_dir());
+        let dir = public_dir.join("business");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>business workbench</html>").unwrap();
+        std::fs::write(dir.join("assets").join("x.css"), "body{}").unwrap();
+
+        let app = crate::routes::router(state);
+
+        // /business → 301 /business/（页面里的静态资源是相对路径）
+        let res = get(app.clone(), "/business").await.unwrap();
+        assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(res.headers()["location"], "/business/");
+
+        // /business/ → index.html
+        let res = get(app.clone(), "/business/").await.unwrap();
+        let status = res.status();
+        let body = body_text(res).await;
+        assert_eq!(status, StatusCode::OK, "/business/ body: {body}");
+
+        // 子资源由 FileServe 直出（utf8_charset 中间件会给 text/* 追加 charset）
+        let res = get(app.clone(), "/business/assets/x.css").await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            res.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/css"),
+            "{}",
+            res.headers()["content-type"].to_str().unwrap()
+        );
+
+        // 缺失的子资源 404
+        let res = get(app.clone(), "/business/assets/nope.css").await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rewrites_legacy_sitemap_paths() {
         assert_eq!(
@@ -1511,6 +1647,8 @@ mod tests {
 
     #[tokio::test]
     async fn serves_static_files_safely() {
+        // 结尾会整删共享的临时 public 目录，与其它用到该目录的用例串行
+        let _guard = crate::models::db_lock().await;
         let state = test_state(None);
         let base = state.with_config(|c| c.public_dir());
         std::fs::create_dir_all(base.join("css")).unwrap();
@@ -1528,9 +1666,16 @@ mod tests {
         let res = get(app.clone(), "/css/../../secret.txt").await.unwrap();
         assert_ne!(res.status(), StatusCode::OK);
 
-        // favicon.ico 缺省 400
+        // favicon.ico 缺文件时回内置缺省图标（升级清单跳过该文件，老站点没有）
         let res = get(app.clone(), "/favicon.ico").await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "image/x-icon");
+        // 站点上传的 favicon 优先于内置缺省
+        std::fs::write(base.join("favicon.ico"), b"custom-ico").unwrap();
+        let res = get(app.clone(), "/favicon.ico").await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "custom-ico");
+        let _ = std::fs::remove_file(base.join("favicon.ico"));
 
         // robots.txt 缺省内容
         let res = get(app.clone(), "/robots.txt").await.unwrap();
